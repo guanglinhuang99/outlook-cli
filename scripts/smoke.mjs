@@ -88,7 +88,7 @@ for (const type of ['http', 'stdio']) {
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 8);
+    assert.equal(tools.tools.length, 9);
     const result = await client.callTool({ name: 'outlook_health', arguments: {} });
     assert.equal(result.structuredContent.connected, true);
     const mail = await client.callTool({ name: 'outlook_messages', arguments: { limit: 1 } });

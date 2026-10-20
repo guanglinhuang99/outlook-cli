@@ -1,8 +1,33 @@
 # Outlook Local Service
 
-Windows Outlook 的本机只读服务，提供 **CLI、MCP stdio、MCP Streamable HTTP**。不内置 AI，不需要模型 API Key，不使用 Graph OAuth。Outlook 运行时通过 COM 读取；未运行时自动读取本地 OST/PST 缓存。邮箱登录及同步仍由 Outlook 完成。
+Windows 和 macOS Outlook 的本机只读服务，共用 **CLI、MCP stdio、MCP Streamable HTTP**。不内置 AI，不需要模型 API Key，不使用 Graph OAuth。邮箱登录及同步仍由 Outlook 完成。
 
-## Outlook 未打开时读取本地数据（v0.2.0）
+源码 v0.3.0 按平台自动选择读取器，共享 9 个 `outlook_*` 工具。已有 Windows COM / OST/PST 用法保持兼容；Mac 的 HxStore 格式由独立 Python 读取器处理，邮件 ID 不跨后端通用。
+
+| 平台 | 默认后端 | 日期筛选依据 | 目录范围 |
+|---|---|---|---|
+| Windows | 已运行的经典 Outlook COM；不可用时读本地 OST/PST | `received_at` | 原有 Outlook / 文件后端范围 |
+| macOS | `mac-cache`，只读本地 HxStore 和 Osa 目录证据 | 已验证的 `sent_at`，`received_at` 返回 null | 已确认的收件箱、已发送及其全部已知子目录；排除已删除及归属不明邮件 |
+
+### Mac 从源码使用
+
+需要 Node.js 22+、Python 3.11+，以及已在本机同步邮件的 Outlook。无需安装 Windows 解析器。
+
+```sh
+git clone https://github.com/guanglinhuang99/outlook-cli.git
+cd outlook-cli
+npm ci --ignore-scripts
+node bin/outlook.mjs start
+node bin/outlook.mjs health
+node bin/outlook.mjs today --folder inbox --limit 25
+node bin/outlook.mjs today --folder sent --limit 25
+node bin/outlook.mjs stores
+node bin/outlook.mjs mcp-config
+```
+
+Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 说明](docs/macos.md)。共享命令每次查询一个文件夹；用 `stores` → `folders` 逐级遍历子目录。Mac 缓存无法验证的已读状态、HTML 正文和正文搜索会明确报错。首次建索引可能需要几十秒，索引和附件副本仅写入服务自己的缓存目录，原始邮件只读。
+
+## Windows：Outlook 未打开时读取本地数据
 
 默认 `auto` 模式：先尝试连接已运行的经典 Outlook；仅当 COM 返回 `OUTLOOK_UNAVAILABLE` 时转到本地文件解析。不会为了读取而启动 Outlook，也不会在 Outlook 忙、权限错误或某封邮件读取失败时悄悄换数据源。每次响应包含 `backend`（`com` / `local`）及 `data_scope`。
 
@@ -16,7 +41,7 @@ Windows Outlook 的本机只读服务，提供 **CLI、MCP stdio、MCP Streamabl
 .\outlook.cmd messages --backend com --limit 10
 ```
 
-所有 MCP 邮箱工具也接受 `backend: "auto" | "com" | "local"`。可用服务环境变量 `OUTLOOK_LOCAL_BACKEND` 设置默认值。使用本地文件 ID 的请求在 auto 模式下仍路由到本地后端，因此 Outlook 重新打开后可以继续处理同一 ID。**COM 和本地文件的 ID 不互通**；Outlook 关闭后若继续传 COM ID，会返回 `BACKEND_ID_MISMATCH`，应重新列出邮件获取本地 ID。
+所有 MCP 邮箱工具也接受 `backend: "auto" | "com" | "local" | "mac-cache"`。可用服务环境变量 `OUTLOOK_LOCAL_BACKEND` 设置默认值。Windows 的 `local` 读取 OST/PST，Mac 的 `local` 是 `mac-cache` 别名。使用本地文件 ID 的请求在 Windows auto 模式下仍路由到本地后端，因此 Outlook 重新打开后可以继续处理同一 ID。**各后端的 ID 不互通**；Outlook 关闭后若继续传 COM ID，会返回 `BACKEND_ID_MISMATCH`，应重新列出邮件获取本地 ID。
 
 文件由 `ost-mcp` 从 Outlook 配置注册表和默认缓存目录发现，第一个文件作为内置文件夹别名的默认存储。需要手动指定文件或默认顺序时，在安装目录创建 **`local-stores.json`**：
 
@@ -41,7 +66,7 @@ Windows Outlook 的本机只读服务，提供 **CLI、MCP stdio、MCP Streamabl
 
 现有源码部署可先运行 `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-reader.ps1` 安装解析器，然后安装新依赖并 `restart`。一键安装器已经包含这一步。
 
-## 在另一台电脑上一键安装
+## Windows：在另一台电脑上一键安装
 
 1. 从 [GitHub Releases](https://github.com/guanglinhuang99/outlook-cli/releases/latest) 下载 `outlook-local-0.2.1-setup.zip`，复制到目标 Windows 电脑，**先解压全部文件**。
 2. 确认已配置经典 Outlook 邮箱，或有可读取的本地 OST/PST。双击解压目录中的 **`install.cmd`**，无需管理员身份。
@@ -49,7 +74,7 @@ Windows Outlook 的本机只读服务，提供 **CLI、MCP stdio、MCP Streamabl
 4. 在 Agent 的 MCP 设置中导入配置，或只合并 `mcpServers.outlook-local` 条目，保留已有设置。使用配置表单的客户端，按说明填写 stdio 的 command、args、env。
 5. 保存并重新连接 Agent，然后双击 **`Test-MCP.cmd`** 验证 MCP 连接和邮箱后端。
 
-**MCP 服务端随一键安装器一起安装，不需要额外执行 npm install。** 安装器自动检查 stdio 握手和 8 个只读工具；中文 `MCP-SETUP.txt` 包含实际安装路径、手动填写字段、验证方法和常见错误处理。`Setup-MCP.cmd` 打开说明与配置供你接入客户端，不会自动修改客户端配置。`Test-MCP.cmd` 检查实际配置、协议和邮箱健康状态，不读取邮件正文；使用 `-NoStart` 安装时，请先运行 `Start-Outlook.cmd` 再测试。
+**MCP 服务端随一键安装器一起安装，不需要额外执行 npm install。** 已发布的 v0.2.1 安装包提供 8 个工具；本分支源码增加 `outlook_today`，重新打包后检查 9 个工具。中文 `MCP-SETUP.txt` 包含实际安装路径、手动填写字段、验证方法和常见错误处理。`Setup-MCP.cmd` 打开说明与配置供你接入客户端，不会自动修改客户端配置。`Test-MCP.cmd` 检查实际配置、协议和邮箱健康状态，不读取邮件正文；使用 `-NoStart` 安装时，请先运行 `Start-Outlook.cmd` 再测试。
 
 默认安装到当前用户的 `%LOCALAPPDATA%\OutlookLocal`，自动安装专用便携 Node.js 24.22.0、按 `package-lock.json` 安装生产依赖和固定版本 OST/PST 解析器、生成启动/停止入口及本机 MCP 配置，并启动服务验证后端。Node/COM 支持 Windows x64/ARM64；文件解析器提供 x64 程序，ARM64 需 Windows x64 仿真支持。可用 `-SkipLocalReader` 只安装 COM 功能。不会修改全局 Node.js、系统 PATH 或系统 PowerShell 执行策略。
 
@@ -90,12 +115,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-installe
                          │
                 127.0.0.1:17379
                          │
-             单个 PowerShell STA 工作进程
-                         │ COM
-           经典 Outlook / 本地 OST、PST 文件
+                 按平台选择工作进程
+                  ┌──────┴──────┐
+               Windows        macOS
+          COM / 本地 OST、PST  Python HxStore 缓存
 ```
 
-## 本机快速使用
+## Windows 源码快速使用
 
 推荐使用上述一键安装包。开发者也可克隆源码（需要 Node.js 22 或更新版本），在普通桌面终端运行：
 
@@ -142,17 +168,17 @@ COM 模式下，服务应在与 Outlook **相同的 Windows 用户、交互式�
 }
 ```
 
-**先执行 `start`。** 每个 Agent 启动自己的轻量 stdio 适配器，共享后台服务和一个 COM 工作进程。适配器不写非协议文本到 stdout。
+**先执行 `start`。** 每个 Agent 启动自己的轻量 stdio 适配器，共享后台服务和按平台选择的读取进程。Mac 将示例中的命令换成 `node bin/outlook.mjs mcp-config`，它会输出本机的绝对路径。适配器不写非协议文本到 stdout。
 
 ### Streamable HTTP
 
 - URL：`http://127.0.0.1:17379/mcp`
 - 请求头：`Authorization: Bearer <token>`
-- `<token>` 从 `.runtime/service/service.json` 读取，不要将这个文件提交到代码仓库或复制进公共配置。
+- `<token>` 从服务状态目录的 `service.json` 读取；Windows 默认为 `.runtime/service`，Mac 为 `~/Library/Caches/outlook-cli/service`。不要将这个文件提交到代码仓库或复制进公共配置。
 - 使用无会话状态的 Streamable HTTP，POST 请求；不提供旧版独立 SSE 端点。
 - 令牌在服务重启时更换。stdio 适配器会自动读取新令牌，使用固定 HTTP 配置的客户端需更新请求头。
 
-只监听 IPv4 回环地址，不接受局域网连接。HTTP 检查 Host、拒绝带 Origin 的浏览器请求，并要求令牌。本机令牌目录使用 Windows ACL 仅授予当前用户和 SYSTEM 访问权。此鉴权不隔离同一用户下已能读取配置的进程。
+只监听 IPv4 回环地址，不接受局域网连接。HTTP 检查 Host、拒绝带 Origin 的浏览器请求，并要求令牌。本机令牌目录在 Windows 使用 ACL 仅授予当前用户和 SYSTEM 访问权；Mac 创建目录使用 0700、令牌文件使用 0600。此鉴权不隔离同一用户下已能读取配置的进程。
 
 ## 工具和参数
 
@@ -164,6 +190,7 @@ CLI 命令与 MCP 工具一一对应，MCP 工具名增加 `outlook_` 前缀。
 | `stores` | `outlook_stores` | 邮件存储及各自的 `root_id` |
 | `folders` | `outlook_folders` | 指定文件夹的直接子文件夹及数量 |
 | `messages` | `outlook_messages` | 新到旧排列的邮件元数据 |
+| `today` | `outlook_today` | 按新加坡时区列出今天在指定文件夹的邮件 |
 | `search` | `outlook_search` | 一个文件夹内按主题、发件人匹配，可选搜索正文 |
 | `read` | `outlook_read` | 单封邮件及分页正文 |
 | `attachments` | `outlook_attachments` | 附件名称、类型、大小、序号 |
@@ -173,9 +200,9 @@ CLI 命令与 MCP 工具一一对应，MCP 工具名增加 `outlook_` 前缀。
 
 ### 文件夹和邮件 ID
 
-默认文件夹是 `inbox`。内置别名还有 `sent`、`drafts`、`deleted`、`junk`、`outbox`，均针对默认存储。其他账户和文件夹先调用 `stores`，用返回的 `root_id` 调用 `folders`，逐级取得文件夹 `id`。
+默认文件夹是 `inbox`。`sent` 表示已发送。Windows 还支持 `drafts`、`deleted`、`junk`、`outbox`；Mac 拒绝这些目录。别名针对默认存储，Mac 多个账户无法唯一确定默认值时会要求显式选择。其他账户和文件夹先调用 `stores`，用返回的 `root_id` 调用 `folders`，逐级取得文件夹 `id`。
 
-ID 编码了 EntryID、StoreID 和对象类型，调用方应原样传回。邮件移动、存储变化可能导致 ID 失效，需要重新列出获取。它们不是全局永久 ID。
+ID 编码了后端和对象身份，Mac ID 还绑定缓存快照；调用方应原样传回。邮件移动、目录权限范围或存储变化可能导致 ID 失效，需要重新列出获取。它们不是全局永久 ID。
 
 ```powershell
 .\outlook.cmd stores
@@ -194,20 +221,21 @@ ID 编码了 EntryID、StoreID 和对象类型，调用方应原样传回。邮�
 .\outlook.cmd search --query '预算' --folder inbox --search-body true --scan-limit 500 --limit 25
 ```
 
-- 日期范围是 `[after, before)`，须带时区。服务处理 Windows 区域格式及 Outlook 分钟精度限制，并在返回前按精确时间再次检查。
+- 日期范围是 `[after, before)`，须带时区。Windows 按接收时间筛选；Mac 按缓存中已验证的发送时间筛选，结果用 `date_basis` 标明，不把发送时间冒充接收时间。
+- `today` 使用 `Asia/Singapore` 的当天零点至次日零点。 显式 `date` 支持 `1970-01-01` 至 `9999-12-30`，按历史时区规则计算零点。翻页时传回第一页返回的 `date` 和 `next_offset`，防止跨午夜后切换日期。例如 `node bin/outlook.mjs today --date 2026-10-20 --offset 25`。默认只查收件箱根目录；已发送用 `--folder sent`，子目录传对应 ID。
 - 每页默认 25，最多 200。每次最多检查 `scan_limit` 个项目，默认 500，上限 2,000。
 - **搜索只覆盖指定文件夹。** 查询是大小写不敏感的字面子串，不是 SQL 或正则表达式。`search_body` 默认 false。
 - 返回 `next_offset` 非空时，用相同筛选参数、该 offset 再请求。**本页没有结果不代表搜索完成**，应检查 `next_offset` 或 `complete`。
 - offset 是经过日期/未读粗筛后检查的项目位置，不是匹配结果数量。`filtered_item_count` 包含非邮件项目及精确日期复核前的候选项目，不是最终命中数。
 - 邮箱是实时变化的，分页不是快照。新邮件、移动、删除可能使不同页之间重复或遗漏；抓取时按 `id` 去重，重要批量导出应选择稳定时间窗口。
-- `read` 默认返回最多 20,000 个正文字符，上限 200,000。跟随 `body.next_offset` 读取后续内容，单位为 UTF-16 字符。可使用 `--format html`；服务不渲染 HTML、不加载邮件中的远程图片。
+- `read` 默认返回最多 20,000 个正文字符，上限 200,000。跟随 `body.next_offset` 读取后续内容，单位为 UTF-16 字符。Windows 可使用 `--format html`；Mac 返回提取的纯文本，并保留缺失正文的状态。服务不渲染 HTML、不加载邮件中的远程图片。
 - Exchange 发件人尽量解析为 `smtp_address`；无法解析时保留原始 `address` 和 `address_type`，SMTP 地址返回 null。`to`、`cc` 是 Outlook 的显示文本。
 
 ### 附件分块读取
 
 `outlook_read_attachment` 参数：`id`、1 起始的 `index`、可选 `byte_offset`、`chunk_bytes`（默认 64 KiB，上限 1 MiB）、`max_bytes`（整个附件大小上限，最高 10 MiB）。返回 base64 `data`、`offset`、`chunk_size`、`next_offset`、整个文件的 `size_bytes` 和 `sha256`。
 
-跟随 `next_offset` 合并各块，最后校验整个文件的 SHA-256。CLI `download` 自动完成这个过程。每块都会通过 Outlook 重新读取附件；若附件在读取期间变化，CLI 会报错。仅支持普通 by-value 文件附件；内嵌 Outlook 邮件、OLE 对象和超过 10 MiB 的附件会明确报错。
+跟随 `next_offset` 合并各块，最后校验整个文件的 SHA-256。CLI `download` 自动完成这个过程。Windows 每块通过后端重新读取附件；Mac 从经过指纹检查的缓存附件复制到服务导出目录再分块。若附件在读取期间变化，CLI 会报错。仅支持普通文件附件；内嵌 Outlook 邮件、OLE 对象和超过 10 MiB 的附件会明确报错。Mac 缓存可能缺少部分附件，返回 `attachments_complete: false`。
 
 ## 本地 JSON API
 
@@ -220,29 +248,32 @@ $body = @{ method = 'health'; params = @{} } | ConvertTo-Json
 Invoke-RestMethod "http://127.0.0.1:$($state.port)/rpc" -Method Post -Headers $headers -ContentType 'application/json' -Body $body
 ```
 
-也可以用 CLI 传完整 JSON 参数：`outlook.cmd rpc messages --json '{"limit":5}'`，注意所用 shell 的引号规则。请求体上限 64 KiB。最多排队 32 个调用，执行超时 45 秒；超时会重建工作进程，等待中的请求返回错误，由调用方决定重试。
+也可以用 CLI 传完整 JSON 参数：`outlook.cmd rpc messages --json '{"limit":5}'`，注意所用 shell 的引号规则。请求体上限 64 KiB。最多排队 32 个调用，Windows 工作进程执行超时 45 秒，Mac 因首次索引需要更久，超时为 180 秒。超时会重建工作进程，等待中的请求返回错误，由调用方决定重试。
 
 常见错误：`OUTLOOK_UNAVAILABLE`（经典 Outlook 未运行或会话不匹配）、`OUTLOOK_TIMEOUT`（Outlook 忙或弹窗）、`INVALID_ARGUMENT`、`INVALID_ID`、`ATTACHMENT_TOO_LARGE`、`UNSUPPORTED_ATTACHMENT`、`BUSY`。
 
 ## 安装、开发和验证
 
-运行环境：Windows、Node.js 22+、系统自带 Windows PowerShell 5.1，以及已配置的经典 Outlook 或受支持的本地 OST/PST。新版 Outlook 不支持 COM 后端。PowerShell COM 工作进程使用 STA，仅在该进程中允许执行项目脚本，不修改系统执行策略。
+共享入口需要 Node.js 22+。Windows 需要系统自带 Windows PowerShell 5.1，以及已配置的经典 Outlook 或受支持的本地 OST/PST；新版 Outlook 不支持 COM。Mac 需要 Python 3.11+ 和可解析的 Outlook HxStore 本地缓存，支持范围见 [macOS 说明](docs/macos.md)。Windows PowerShell COM 工作进程使用 STA，仅在该进程中允许执行项目脚本，不修改系统执行策略。
 
 标准 Node 环境使用：
 
 ```powershell
-npm install
+npm ci --ignore-scripts
 npm test
-npm run smoke
+# macOS / Linux 上运行合成缓存测试，不访问真实邮箱
+python3 -m unittest discover -s macos -p 'test*.py'
 ```
 
 仓库提供 `pnpm-lock.yaml`；可用 `pnpm install --frozen-lockfile` 复现锁定版本。本机使用 Codex 附带的 Node/pnpm 安装；`outlook.cmd` 会优先使用 PATH 中的 Node，否则尝试当前用户的 Codex 运行时路径。
 
 - `test/*.test.mjs`：参数边界、拒绝写操作、HTTP 鉴权、官方 SDK MCP 交互、并发串行化、超时恢复。
-- `scripts/smoke.mjs`：需要运行中的服务和真实邮箱。只输出计数/布尔值，检查文件夹分页、日期和未读筛选、正文分页、附件分块/哈希、CLI 下载及拒绝覆盖、MCP HTTP/stdio、未读状态。下载测试使用受保护状态目录内的临时文件，测试后删除。不会在输出中显示主题、地址、正文或令牌。
+- `macos/test*.py`：合成 HxStore 解析、中文主题与正文关联、目录范围和已删除排除、附件指纹、纯 Python MCP、共享协议兼容性；无需邮件账户。
+- `.github/workflows/ci.yml`：Windows、macOS、Linux 运行 Node 测试，macOS 和 Linux 另跑合成缓存测试。Linux 仅用于协议和解析测试，实际邮箱后端只支持 Windows/macOS。
+- `scripts/smoke.mjs`：Windows 真实邮箱检查；`scripts/smoke-mac.mjs`：Mac 真实缓存检查。只输出计数/布尔值。两者检查 CLI/MCP、正文和附件分页/哈希及拒绝覆盖；Mac 还检查发送日期口径和目录限制。下载测试使用服务状态目录内的临时文件，测试后删除。不显示主题、地址、正文或令牌。
 - `Test-OutlookRead.ps1`：最初的独立可行性探测脚本，服务不依赖它。
 - `scripts/smoke-offline.mjs`：真实 OST 文件的正文/附件/筛选/MCP 验证，以及模拟 COM 不可用时自动调用真实文件后端的测试；不会关闭 Outlook。
-- `.runtime/service/service.log`：只记录启动/服务错误，不记录邮件内容。正常使用不建立邮件副本或全文索引。
+- 服务状态目录的 `service.log` 只记录启动/服务错误。Windows 正常使用不建立邮件副本或全文索引；Mac 在独立服务缓存中保存本地索引、可恢复正文和按需导出的附件，不写回原始缓存。
 
 服务端口可通过 `OUTLOOK_LOCAL_PORT` 设置；状态目录可通过 `OUTLOOK_LOCAL_STATE_DIR` 设置。变更后应在服务端和客户端使用一致的状态目录。MCP SDK 的确切依赖版本记录在 package.json 和锁文件中。
 

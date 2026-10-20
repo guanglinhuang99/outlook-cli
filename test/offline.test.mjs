@@ -11,17 +11,21 @@ const stub = call => ({ call, queue: [], active: false, close() {} });
 test('auto falls back only for unavailable Outlook, explicit COM never falls back', async () => {
   let calls = 0;
   const local = stub(async () => { calls++; return { backend: 'local' }; });
-  const router = new BackendRouter({ com: stub(async () => { throw localError('OUTLOOK_UNAVAILABLE', 'closed'); }), local });
-  assert.equal((await router.call('health')).fallback_reason, 'OUTLOOK_UNAVAILABLE');
+  const router = new BackendRouter({ platform: 'win32', com: stub(async () => { throw localError('OUTLOOK_UNAVAILABLE', 'closed'); }), local });
+  const fallback = await router.call('health');
+  assert.equal(fallback.fallback_reason, 'OUTLOOK_UNAVAILABLE');
+  assert.equal(fallback.date_basis, 'received_at');
   await assert.rejects(router.call('health', { backend: 'com' }), { code: 'OUTLOOK_UNAVAILABLE' });
   router.com = stub(async () => { throw localError('OUTLOOK_TIMEOUT', 'busy'); });
   await assert.rejects(router.call('health'), { code: 'OUTLOOK_TIMEOUT' });
   assert.equal(calls, 1);
 });
 test('local IDs retain local routing; COM IDs fail clearly after Outlook closes', async () => {
-  const router = new BackendRouter({ com: stub(async () => { throw localError('OUTLOOK_UNAVAILABLE', 'closed'); }), local: stub(async () => ({ backend: 'local' })) });
+  const router = new BackendRouter({ platform: 'win32', com: stub(async () => { throw localError('OUTLOOK_UNAVAILABLE', 'closed'); }), local: stub(async () => ({ backend: 'local' })) });
   const id = encodeLocalId('message', 'test', 42);
-  assert.equal((await router.call('read', { id })).backend, 'local');
+  const localResult = await router.call('read', { id });
+  assert.equal(localResult.backend, 'local');
+  assert.equal(localResult.date_basis, 'received_at');
   await assert.rejects(router.call('read', { id, backend: 'com' }), { code: 'BACKEND_ID_MISMATCH' });
   const oldId = Buffer.from(JSON.stringify({ v: 1, kind: 'message', entry: 'AA', store: 'BB' })).toString('base64url');
   await assert.rejects(router.call('read', { id: oldId }), { code: 'BACKEND_ID_MISMATCH' });

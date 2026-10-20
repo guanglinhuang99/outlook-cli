@@ -41,7 +41,8 @@ try {
       else item.resolve(response.result);
     } catch { fail(new Error('MCP stdout contains invalid JSON.')); }
   });
-  deadline = setTimeout(() => fail(new Error('MCP check timed out after 60 seconds.')), 60000);
+  const timeout = process.platform === 'darwin' ? 190000 : 60000;
+  deadline = setTimeout(() => fail(new Error('MCP check timed out.')), timeout);
   function send(message) { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', ...message }) + '\n'); }
   function request(method, params = {}) {
     if (failure) return Promise.reject(failure);
@@ -59,13 +60,18 @@ try {
   send({ method: 'notifications/initialized' });
   const list = await request('tools/list');
   const expected = Object.keys(definitions).map(name => `outlook_${name}`);
-  if (!expected.every(name => list.tools?.some(tool => tool.name === name && tool.annotations?.readOnlyHint === true))) {
-    throw new Error('MCP tools/list is missing an expected read-only Outlook tool.');
+  const cacheWrites = process.platform !== 'win32';
+  if (list.tools?.length !== expected.length || !expected.every(name => list.tools.some(tool => (
+    tool.name === name
+      && tool.annotations?.readOnlyHint === !cacheWrites
+      && tool.annotations?.destructiveHint === cacheWrites
+  )))) {
+    throw new Error('MCP tools/list does not match the expected platform-aware Outlook annotations.');
   }
   const report = { mcp: 'ready', transport: 'stdio', protocol: initialized.protocolVersion, tools: list.tools.map(tool => tool.name) };
   if (process.argv.includes('--health')) {
     const health = await request('tools/call', { name: 'outlook_health', arguments: {} });
-    if (health.isError) throw new Error('MCP protocol works, but outlook_health failed. Run Start-Outlook.cmd, then outlook.cmd health for details.');
+    if (health.isError) throw new Error('MCP protocol works, but outlook_health failed. Start the service and run its health command for details.');
     if (!health.structuredContent?.connected) throw new Error('MCP health returned no connected mailbox backend.');
     report.backend = health.structuredContent.backend;
   }

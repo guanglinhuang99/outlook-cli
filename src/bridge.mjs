@@ -16,7 +16,7 @@ export class OutlookBridge {
   }
   call(method, params) {
     if (this.closed) return Promise.reject(Object.assign(new Error('Service is stopping'), { code: 'STOPPING' }));
-    if (this.queue.length >= 32) return Promise.reject(Object.assign(new Error('Outlook queue is full; retry later'), { code: 'BUSY' }));
+    if (this.queue.length >= 32) return Promise.reject(Object.assign(new Error('Reader queue is full; retry later'), { code: 'BUSY' }));
     return new Promise((resolve, reject) => {
       this.queue.push({ id: ++this.sequence, method, params, resolve, reject });
       this.pump();
@@ -39,14 +39,14 @@ export class OutlookBridge {
         else active.resolve(message.result);
         this.pump();
       } catch {
-        this.failWorker(worker, 'WORKER_PROTOCOL', 'Invalid Outlook worker response');
+        this.failWorker(worker, 'WORKER_PROTOCOL', 'Invalid reader worker response');
       }
     });
     // Consume but do not log raw worker diagnostics: they can include mailbox data.
     worker.stderr.resume();
-    worker.stdin.on('error', () => this.failWorker(worker, 'WORKER_EXIT', 'Outlook worker input closed'));
-    worker.on('error', () => this.failWorker(worker, 'WORKER_START', 'Could not start Windows PowerShell'));
-    worker.on('exit', () => { lines.close(); this.failWorker(worker, 'WORKER_EXIT', 'Outlook worker exited; retry the request'); });
+    worker.stdin.on('error', () => this.failWorker(worker, 'WORKER_EXIT', 'Reader worker input closed'));
+    worker.on('error', () => this.failWorker(worker, 'WORKER_START', 'Could not start reader worker'));
+    worker.on('exit', () => { lines.close(); this.failWorker(worker, 'WORKER_EXIT', 'Reader worker exited; retry the request'); });
   }
   pump() {
     if (this.active || !this.queue.length || this.closed) return;
@@ -54,12 +54,12 @@ export class OutlookBridge {
     try {
       this.ensureWorker();
       const worker = this.worker;
-      this.active.timer = setTimeout(() => this.failWorker(worker, 'OUTLOOK_TIMEOUT', 'Outlook timed out. Check for a dialog or restart Outlook, then retry.'), this.timeoutMs);
+      this.active.timer = setTimeout(() => this.failWorker(worker, 'OUTLOOK_TIMEOUT', 'Reader timed out; retry the request.'), this.timeoutMs);
       worker.stdin.write(JSON.stringify({ id: this.active.id, method: this.active.method, params: this.active.params }) + '\n');
     } catch {
       const active = this.active;
       this.active = null;
-      active.reject(Object.assign(new Error('Could not start Outlook worker'), { code: 'WORKER_START' }));
+      active.reject(Object.assign(new Error('Could not start reader worker'), { code: 'WORKER_START' }));
       this.pump();
     }
   }

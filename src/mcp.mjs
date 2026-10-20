@@ -1,13 +1,14 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { definitions } from './tools.mjs';
 
-export function createMcp(call) {
-  const server = new McpServer({ name: 'outlook-local', version: '0.2.1' });
+export function createMcp(call, { platform = process.platform } = {}) {
+  const server = new McpServer({ name: 'outlook-local', version: '0.3.0' });
+  const cacheWrites = platform !== 'win32';
   for (const [name, definition] of Object.entries(definitions)) {
     server.registerTool(`outlook_${name}`, {
-      description: definition.description,
+      description: `${definition.description} Original mail is never modified.${cacheWrites ? ' Private cache files may be refreshed and pruned.' : ''}`,
       inputSchema: definition.schema,
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false }
+      annotations: { readOnlyHint: !cacheWrites, destructiveHint: cacheWrites, idempotentHint: false, openWorldHint: false }
     }, async args => {
       try {
         const data = await call(name, args);

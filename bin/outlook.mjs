@@ -1,21 +1,40 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { open, writeFile } from 'node:fs/promises';
+import { writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
-import { prepareRuntime, runtimeDir, root, statePath, readState, request, call } from '../src/runtime.mjs';
+import { openRuntimeLog, prepareRuntime, runtimeDir, root, statePath, readState, request, call } from '../src/runtime.mjs';
+import { assertSafeMacPath } from '../src/mac-paths.mjs';
 import { validateCall, definitions } from '../src/tools.mjs';
 
 const print = value => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+function sameDownloadState(left, right) {
+  const leftRoots = left.protected_mail_roots;
+  const rightRoots = right.protected_mail_roots;
+  return left.port === right.port
+    && left.token === right.token
+    && ((leftRoots === undefined && rightRoots === undefined)
+      || (Array.isArray(leftRoots) && Array.isArray(rightRoots)
+        && leftRoots.length === rightRoots.length
+        && leftRoots.every((root, index) => root === rightRoots[index])));
+}
+
+function downloadStateChanged() {
+  return Object.assign(new Error('Service state changed during download; refusing to write attachment'), {
+    code: 'SERVICE_RESTART_REQUIRED'
+  });
+}
+
 const help = `Outlook Local Service — read-only, no AI
 
   outlook-local start | stop | restart | status | health
   outlook-local stores
   outlook-local folders [--folder inbox|<folder-id>] [--limit 25] [--offset 0]
   outlook-local messages [--folder inbox] [--limit 25] [--unread true]
+  outlook-local today [--folder inbox|sent] [--limit 25] [--date YYYY-MM-DD]
   outlook-local search --query text [--search-body true] [--scan-limit 500]
   outlook-local read --id <message-id> [--max-chars 20000] [--body-offset 0]
   outlook-local attachments --id <message-id>
@@ -27,17 +46,19 @@ const help = `Outlook Local Service — read-only, no AI
 
 Messages/search: --after/--before ISO time with timezone, --offset,
 --limit, --scan-limit. Search covers one folder per call; follow next_offset.
-All mailbox commands accept --backend auto|com|local (default auto).
-auto uses COM while Outlook runs and local OST/PST when it is unavailable.
+All mailbox commands accept --backend auto|com|local|mac-cache (default auto).
+auto uses Windows COM/local OST/PST or the macOS HxStore cache by platform.
+Windows date filters use received_at; macOS uses verified sent_at.
+On macOS, Python 3.11+ is required; unread/body-search/HTML are unsupported.
 Local reads contain cached data only; COM and local IDs are different.
 Use stores -> root_id -> folders to discover other folders.
 All output is JSON, except help. Errors go to stderr with nonzero exit status.
 `;
 
 async function start() {
-  try { return { ...(await request('/status', undefined, { timeoutMs: 1500 })), already_running: true }; } catch { }
   await prepareRuntime();
-  const log = await open(path.join(runtimeDir, 'service.log'), 'a');
+  try { return { ...(await request('/status', undefined, { timeoutMs: 1500 })), already_running: true }; } catch { }
+  const log = await openRuntimeLog(path.join(runtimeDir, 'service.log'));
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve'], {
     cwd: root, detached: true, windowsHide: true, stdio: ['ignore', log.fd, log.fd], env: process.env
   });
@@ -92,7 +113,7 @@ async function main() {
   const operation = command === 'download' ? 'read_attachment' : command === 'rpc' ? args.shift() : command;
   if (!Object.hasOwn(definitions, operation)) throw new Error(`Unknown command: ${command}`);
   const parsed = parseArgs({ args, options: Object.fromEntries([
-    'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'scan-limit', 'query', 'search-body', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json'
+    'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'date', 'scan-limit', 'query', 'search-body', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json'
   ].map(key => [key, { type: 'string' }])), strict: true, allowPositionals: false });
   const values = { ...parsed.values };
   const outputPath = values.out;
@@ -117,11 +138,18 @@ async function main() {
   if (command !== 'download' && outputPath) throw new Error('--out is only supported for download');
   if (command === 'download') {
     if (params.byte_offset) throw new Error('download saves a complete attachment; byte-offset must be zero');
-    const result = await call(operation, { ...params, chunk_bytes: 1048576 });
+    const destination = path.resolve(outputPath);
+    const initialState = await readState({ requireMacProtectedRoots: process.platform === 'darwin' });
+    let writeDestination = destination;
+    if (process.platform === 'darwin') {
+      writeDestination = await assertSafeMacPath(destination, { protectedRoots: initialState.protected_mail_roots });
+    }
+    const requestOptions = { state: initialState };
+    const result = await call(operation, { ...params, chunk_bytes: 1048576 }, requestOptions);
     const chunks = [Buffer.from(result.data, 'base64')];
     let next = result.next_offset;
     while (next !== null) {
-      const part = await call(operation, { ...params, chunk_bytes: 1048576, byte_offset: next });
+      const part = await call(operation, { ...params, chunk_bytes: 1048576, byte_offset: next }, requestOptions);
       if (part.sha256 !== result.sha256 || part.size_bytes !== result.size_bytes || part.offset !== next || (part.next_offset !== null && part.next_offset <= next)) throw new Error('Attachment changed during download');
       chunks.push(Buffer.from(part.data, 'base64'));
       next = part.next_offset;
@@ -129,9 +157,16 @@ async function main() {
     const bytes = Buffer.concat(chunks);
     const sha256 = createHash('sha256').update(bytes).digest('hex');
     if (sha256 !== result.sha256 || bytes.length !== result.size_bytes) throw new Error('Attachment integrity verification failed');
-    const destination = path.resolve(outputPath);
-    await writeFile(destination, bytes, { flag: 'wx', mode: 0o600 });
-    return print({ path: destination, size_bytes: bytes.length, sha256 });
+    const currentState = await readState({ requireMacProtectedRoots: process.platform === 'darwin' });
+    if (!sameDownloadState(initialState, currentState)) throw downloadStateChanged();
+    if (process.platform === 'darwin') {
+      const initialDestination = await assertSafeMacPath(destination, { protectedRoots: initialState.protected_mail_roots });
+      if (initialDestination !== writeDestination) throw downloadStateChanged();
+      const currentDestination = await assertSafeMacPath(destination, { protectedRoots: currentState.protected_mail_roots });
+      if (currentDestination !== writeDestination) throw downloadStateChanged();
+    }
+    await writeFile(writeDestination, bytes, { flag: 'wx', mode: 0o600 });
+    return print({ path: writeDestination, size_bytes: bytes.length, sha256 });
   }
   print(await call(operation, params));
 }
