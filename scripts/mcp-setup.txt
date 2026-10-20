@@ -1,0 +1,49 @@
+Outlook Local：MCP 安装和接入
+
+安装目录：__INSTALL_DIR__
+
+一、服务端已经安装完成
+install.cmd 已安装专用 Node.js、MCP 服务端依赖和 Outlook 读取程序，
+并生成这台电脑的 MCP 配置。无需另外安装 npm 包，也不需要 AI API Key。
+安装器自动验证 stdio 握手和 8 个只读工具是否可用。
+这里只安装邮件服务；调用它的 Agent 客户端由你自行选择。
+
+二、把 MCP 添加到 Agent
+1. 双击安装目录中的 Start-Outlook.cmd，启动本机后台服务。
+   重复启动会复用已有服务；重启电脑后需要再次启动，或安装时使用 -AutoStart。
+2. 打开 Agent 客户端的 MCP / Tools / Servers 设置。
+3. 如果客户端支持导入 mcpServers JSON，导入：
+   __INSTALL_DIR__\mcp-config.json
+   如果需要编辑现有 JSON，只合并 mcpServers 下的 outlook-local 条目，
+   保留原有服务器和其他设置，不要用本文件替换整个客户端配置。
+4. 如果客户端通过表单配置 stdio，按下列字段填写：
+   名称：outlook-local
+   传输方式：stdio（本地命令）
+   Command / 可执行程序：__NODE_PATH__
+   Arguments / 参数（两个独立参数，不要手工添加引号）：
+     __INSTALL_DIR__\bin\outlook.mjs
+     mcp
+   Environment / 环境变量：
+     OUTLOOK_LOCAL_STATE_DIR=__INSTALL_DIR__\.runtime\service
+5. 保存后重新连接 MCP；客户端如有要求，重启客户端。
+   TOML、YAML 或其他配置格式的客户端，请使用其 MCP 设置界面，
+   将上述 command、args、env 填入对应字段，不能直接粘贴 JSON。
+
+三、验证安装
+双击安装目录中的 Test-MCP.cmd。
+它会使用生成的配置启动 stdio 适配器，验证协议握手、工具列表，
+并通过 outlook_health 检查真实后台服务和邮箱后端，不读取邮件正文。
+成功时显示 "mcp": "ready"，backend 为 com 或 local。
+工具列表应包含 outlook_health、outlook_stores、outlook_folders、
+outlook_messages、outlook_search、outlook_read、outlook_attachments、
+outlook_read_attachment。可让 Agent 调用 outlook_health 做首次检查。
+
+四、常见问题
+- “后台服务不可用”：先运行 Start-Outlook.cmd，再运行 Test-MCP.cmd。
+- “找不到本地文件”：打开经典 Outlook 同步缓存，或按 README.md 设置 local-stores.json。
+- “找不到可执行程序”：使用本机安装生成的配置，不要复制另一台电脑的路径。
+- 已关闭 Outlook：服务自动读取支持的本地 OST/PST，只包含已缓存的数据。
+- 不要在客户端中把 Start-Outlook.cmd 当作 stdio command；应使用上面的 Node 命令。
+- stdio 不需要复制令牌。HTTP 接入方式见 README.md；令牌会随服务重启更换。
+
+本安装器生成配置和指引，不自动修改未指定的 Agent 客户端配置。

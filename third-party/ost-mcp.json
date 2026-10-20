@@ -1,0 +1,10 @@
+{
+  "name": "ost-mcp",
+  "version": "0.1.0",
+  "source": "https://github.com/3rg0n/ost-mcp/tree/v0.1.0",
+  "url": "https://github.com/3rg0n/ost-mcp/releases/download/v0.1.0/ost-mcp-x86_64-pc-windows-msvc.zip",
+  "sha256": "9590ab5ed51e019fe49cd6301a239df2ba9edae96847e6302fb6526d3a7efc94",
+  "exe_sha256": "bc28944d508ce70a6d7bc9149f1293ca95384a667c0ad6a4876d0f085fb66106",
+  "architecture": "x64",
+  "license": "MIT"
+}

@@ -1,0 +1,24 @@
+{
+  "name": "outlook-local-service",
+  "version": "0.2.1",
+  "private": true,
+  "type": "module",
+  "description": "Read-only Windows classic Outlook service, CLI and MCP; no AI runtime",
+  "engines": { "node": ">=22" },
+  "bin": { "outlook-local": "bin/outlook.mjs" },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "start": "node bin/outlook.mjs start",
+    "status": "node bin/outlook.mjs status",
+    "stop": "node bin/outlook.mjs stop",
+    "mcp": "node bin/outlook.mjs mcp",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.3.1",
+    "@modelcontextprotocol/node": "2.1.1",
+    "html-to-text": "10.0.1",
+    "zod": "^4.2.0"
+  },
+  "devDependencies": { "@modelcontextprotocol/client": "2.3.1" }
+}
