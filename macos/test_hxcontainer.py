@@ -14,6 +14,7 @@ from hxcontainer import (  # noqa: E402
     Block,
     decode_lz4,
     iter_blocks,
+    read_block_at,
 )
 
 
@@ -64,6 +65,33 @@ def make_block(
 
 
 class HxContainerTests(unittest.TestCase):
+    def test_targeted_block_read_skips_unrelated_corrupt_block(self):
+        first = make_block(b'broken', corrupt_body=True)
+        second = make_block('中文正文'.encode())
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'HxStore.hxd'
+            source.write_bytes(store_header() + first + second)
+            before = source.read_bytes()
+            offset = 0x40 + len(first)
+            self.assertEqual(read_block_at(source, offset), Block(offset, 8, '中文正文'.encode()))
+            self.assertEqual(source.read_bytes(), before)
+            with self.assertRaises(ValueError):
+                read_block_at(source, 0x40)
+            source.write_bytes(before[:-1])
+            with self.assertRaisesRegex(ValueError, 'truncated'):
+                read_block_at(source, offset)
+
+    def test_targeted_block_read_rejects_symlink_and_invalid_offset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / 'HxStore.hxd'
+            source.write_bytes(store_header() + make_block(b'body'))
+            link = source.with_name('link')
+            link.symlink_to(source)
+            with self.assertRaises(OSError):
+                read_block_at(link, 0x40)
+            with self.assertRaises(ValueError):
+                read_block_at(source, -1)
+
     def test_utf8_and_binary_bytes_round_trip(self):
         value = "主题：你好，世界 🌏".encode("utf-8") + b"\x00\xff\x10"
         self.assertEqual(decode_lz4(literal_block(value), len(value)), value)

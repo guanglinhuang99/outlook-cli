@@ -1,5 +1,7 @@
 import copy
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import gzip
 import hashlib
 import json
 import os
@@ -72,6 +74,230 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(all(row['sent_at'].startswith('2000-') for row in page['items']))
         self.assertTrue(all(row['received_at'].startswith('2001-01-01') for row in page['items']))
         self.assertEqual(page['date_basis'], 'received_at')
+
+    def test_delayed_received_mail_can_read_body_after_received_filter(self):
+        received = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp()
+        for identifier in self.ids[:2]:
+            self.scope['messages'][identifier]['received_unix'] = received
+        self.client.call('outlook_local_refresh', {'from_date': '2001-01-01'})
+        page = self.client.call('outlook_local_search', {
+            'from_date': '2001-01-01', 'to_date': '2001-01-01'
+        })
+        message = self.client.call('outlook_local_read', {'id': page['items'][0]['id']})
+        self.assertEqual(message['body']['status'], 'cached_html')
+        self.assertTrue(message['body'].get('text'))
+
+    def test_refresh_defers_body_freeze_and_reuses_resolved_sidecar(self):
+        original = self.fixture.profile_tree()
+        with patch.object(service.core, 'freeze_body', wraps=service.core.freeze_body) as freeze:
+            result = self.refresh()
+            self.assertEqual(result['deferred_bodies'], result['messages'])
+            self.assertEqual(freeze.call_count, 0)
+            listing = self.client.call('outlook_local_search', {})
+            self.assertEqual(freeze.call_count, 0)
+            target = next(item for item in listing['items'] if item['subject'] == '中文主题乙')
+            message = self.client.call('outlook_local_read', {'id': target['id']})
+            self.assertEqual(message['body']['status'], 'cached_html')
+            self.assertEqual(freeze.call_count, 1)
+            self.client.call('outlook_local_read', {'id': target['id']})
+            self.assertEqual(freeze.call_count, 1)
+        self.assertEqual(self.fixture.profile_tree(), original)
+        _, index = self.client._load()
+        self.assertTrue((self.fixture.state / 'snapshots' / index['source_snapshot'] / 'deferred').is_dir())
+
+    def test_deferred_cache_is_bound_to_message_identity(self):
+        self.refresh()
+        directory, index = self.client._current()
+        original = next(row for row in index['items'] if row['subject'] == '中文主题乙')
+        twin = copy.deepcopy(original)
+        twin['id'] = f"{original['id']}-different"
+        twin['message_id'] = '<different-message@example.test>'
+        index['items'].append(twin)
+
+        with patch.object(service.core, 'freeze_body', wraps=service.core.freeze_body) as freeze:
+            service.core.read_message(directory, index, original['id'], 20_000)
+            service.core.read_message(directory, index, twin['id'], 20_000)
+        self.assertEqual(freeze.call_count, 2)
+
+    def test_concurrent_deferred_reads_materialize_once(self):
+        self.refresh()
+        directory, index = self.client._current()
+        with patch.object(service.core, 'freeze_body', wraps=service.core.freeze_body) as freeze:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda _: service.core.read_message(
+                    directory, index, self.ids[1], 20000), range(8)))
+        self.assertEqual(freeze.call_count, 1)
+        self.assertTrue(all(r['body']['status'] == 'cached_html' for r in results))
+        self.assertEqual(len({r['body']['sha256'] for r in results}), 1)
+
+    def test_cached_body_survives_source_change_after_freeze(self):
+        self.refresh()
+        listing = self.client.call('outlook_local_search', {})
+        identifier = next(item['id'] for item in listing['items'] if item['subject'] == '中文主题乙')
+        first = self.client.call('outlook_local_read', {'id': identifier, 'body_max_chars': 2})
+        self.assertEqual(first['body']['status'], 'cached_html')
+        self.fixture.gzip_body_source.write_bytes(b"changed after freeze")
+        second = self.client.call('outlook_local_read', {'id': identifier})
+        self.assertEqual(second['body']['status'], 'cached_html')
+        self.assertIn('gzip 冻结正文', second['body']['text'])
+
+    def test_deferred_read_repairs_legacy_partial_payload_with_cached_metadata(self):
+        self.refresh()
+        first = self.client.call('outlook_local_read', {'id': self.ids[1]})
+        directory, _ = self.client._load()
+        for root, key in (('payloads', 'sha256'), ('textpayloads', 'text_sha256')):
+            with self.subTest(root=root):
+                payload = directory / root / first['body'][key]
+                payload.chmod(0o600)
+                payload.write_bytes(b'partial')
+                recovered = self.client.call('outlook_local_read', {'id': self.ids[1]})
+                self.assertEqual(recovered['body']['text'], first['body']['text'])
+                self.assertEqual(recovered['body'][key], first['body'][key])
+
+    def test_deferred_body_rejects_changed_source_before_read(self):
+        self.refresh()
+        listing = self.client.call('outlook_local_search', {})
+        identifier = next(item['id'] for item in listing['items'] if item['subject'] == '中文主题乙')
+        self.fixture.gzip_body_source.write_bytes(self.fixture.gzip_body_source.read_bytes() + b' changed')
+        with self.assertRaisesRegex(ValueError, 'body source changed since snapshot'):
+            self.client.call('outlook_local_read', {'id': identifier})
+
+    def test_deferred_read_uses_private_container_after_outlook_updates(self):
+        source_bytes = self.fixture.source_cache.read_bytes()
+        self.refresh()
+        directory, index = self.client._load()
+        self.assertEqual((directory / 'source.hxd').read_bytes(), source_bytes)
+        self.fixture.source_cache.write_bytes(b'Outlook synchronised a new container')
+        message = self.client.call('outlook_local_read', {'id': self.ids[1]})
+        self.assertEqual(message['body']['status'], 'cached_html')
+        self.assertEqual((directory / 'source.hxd').read_bytes(), source_bytes)
+
+    def test_deferred_read_rejects_modified_private_container(self):
+        self.refresh()
+        directory, index = self.client._load()
+        source = directory / 'source.hxd'
+        source.chmod(0o600)
+        source.write_bytes(source.read_bytes() + b' corrupt')
+        with self.assertRaisesRegex(ValueError, 'frozen HxStore source changed'):
+            self.client.call('outlook_local_read', {'id': self.ids[1]})
+
+    def test_refresh_repairs_private_container_without_changing_original_mail(self):
+        original = self.fixture.profile_tree()
+        self.refresh()
+        for damage in ('modified', 'missing'):
+            with self.subTest(damage=damage):
+                directory, old_index = self.client._load()
+                source = directory / 'source.hxd'
+                if damage == 'modified':
+                    source.chmod(0o600)
+                    source.write_bytes(source.read_bytes() + b' corrupt')
+                else:
+                    source.unlink()
+                repaired = self.refresh()
+                new_directory, new_index = self.client._load()
+                self.assertNotEqual(new_index['source_snapshot'], old_index['source_snapshot'])
+                self.assertEqual((new_directory / 'source.hxd').read_bytes(), self.fixture.source_cache.read_bytes())
+                body = self.client.call('outlook_local_read', {'id': self.ids[1]})['body']
+                self.assertEqual(body['status'], 'cached_html')
+                self.assertEqual(self.refresh()['snapshot'], repaired['snapshot'])
+        self.assertEqual(self.fixture.profile_tree(), original)
+
+    def test_deferred_bundle_checks_source_budget_before_freezing(self):
+        self.refresh()
+        with patch.object(service, 'BUNDLE_SOURCE_BYTES', 1), patch.object(
+                service.core, 'freeze_body', wraps=service.core.freeze_body) as freeze:
+            result = self.client.call('outlook_local_messages_bundle', {'ids': [self.ids[1]]})
+        self.assertEqual(freeze.call_count, 0)
+        self.assertEqual(result['items'], [])
+        self.assertIn('source byte budget', result['errors'][0]['error'])
+
+    def test_failed_deferred_bundle_read_still_consumes_source_budget(self):
+        self.refresh()
+        directory, index = self.client._load()
+        row = copy.deepcopy(next(r for r in index['items'] if r['id'] == self.ids[1]))
+        twin = {**row, 'id': row['id'] + '-second'}
+        index['items'] = [row, twin]
+        budget = sum((fp or {}).get('size', 0) for fp in
+                     row['body']['deferred']['external_fingerprints'].values())
+        budget += sum(index['source_block_bytes'].values())
+        self.assertGreater(budget, 0)
+        with patch.object(service, 'BUNDLE_SOURCE_BYTES', budget), patch.object(
+                self.client, '_current', return_value=(directory, index)), patch.object(
+                service.core, 'stable_read', side_effect=OSError('body read failed')) as read:
+            result = self.client.call('outlook_local_messages_bundle', {'ids': [row['id'], twin['id']]})
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(len(result['errors']), 1)
+        self.assertIn('source byte budget', result['errors'][0]['error'])
+
+    def test_bundle_bounds_external_gzip_inflation_and_can_retry(self):
+        html = ('<html><body>' + fixtures.GZIP_PREVIEW + 'x' * 1024**2 + '</body></html>').encode()
+        compressed = gzip.compress(html)
+        self.assertLess(len(compressed), len(html) // 100)
+        self.fixture.gzip_body_source.write_bytes(compressed)
+        self.refresh()
+        directory, index = self.client._load()
+        row = next(row for row in index['items'] if row['subject'] == '中文主题乙')
+        twin = {**row, 'id': row['id'] + '-second'}
+        index['items'] = [row, twin]
+        budget = (len(html) + len(compressed) + sum(index['source_block_bytes'].values())) * 3 // 2
+        with patch.object(self.client, '_current', return_value=(directory, index)), \
+                patch.object(service, 'BUNDLE_SOURCE_BYTES', budget):
+            result = self.client.call('outlook_local_messages_bundle', {'ids': [row['id'], twin['id']]})
+            self.assertEqual(len(result['items']), 1)
+            self.assertIn('source byte budget', result['errors'][0]['error'])
+            self.assertIsNone(service.core._read_deferred_cache(directory, twin))
+            retried = self.client.call('outlook_local_read', {'id': twin['id'], 'body_max_chars': 100})
+            self.assertEqual(retried['body']['status'], 'cached_html')
+
+    def test_bundle_skips_oversized_source_but_reads_later_small_message(self):
+        self.fixture.body_source.write_bytes(
+            ('<html><body>' + fixtures.PREVIEW + 'x' * 100_000 + '</body></html>').encode())
+        large_id = next(row['id'] for row in self.base['items']
+                        if row['message_id'] == '<first@example.test>')
+        self.scope['messages'][large_id]['folder_id'] = 'inbox'
+        self.refresh()
+        _, index = self.client._load()
+        large = next(row for row in index['items'] if row['message_id'] == '<first@example.test>')
+        small = next(row for row in index['items'] if row['message_id'] == '<second@example.test>')
+        with patch.object(service, 'BUNDLE_SOURCE_BYTES', 48 * 1024), \
+                patch.object(service.core, 'stable_read', wraps=service.core.stable_read) as read:
+            result = self.client.call('outlook_local_messages_bundle', {'ids': [large['id'], small['id']]})
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual([item['id'] for item in result['items']], [small['id']])
+        self.assertEqual(result['errors'][0]['id'], large['id'])
+        self.assertIn('source byte budget', result['errors'][0]['error'])
+
+    def test_excluded_folder_read_does_not_freeze_body(self):
+        self.refresh()
+        with patch.object(service.core, 'freeze_body', wraps=service.core.freeze_body) as freeze:
+            with self.assertRaises(ValueError):
+                self.client.call('outlook_local_read', {'id': self.ids[2]})
+        self.assertEqual(freeze.call_count, 0)
+
+    def test_bundle_counts_decoded_blocks_for_tiny_inline_bodies(self):
+        self.refresh()
+        directory, index = self.client._load()
+        row = index['items'][0]
+        index['items'] = [{**row, 'id': f'block-{n}', 'body': {
+            'status': 'deferred', 'deferred': {'external_fingerprints': {},
+                                             'inline_frames': [{'full_length': 1}]}}}
+                          for n in range(3)]
+        index['source_block_bytes'] = {str(n): 24 * 1024**2 for n in range(3)}
+
+        def read(directory, index, identifier, maximum):
+            offset = int(identifier.rsplit('-', 1)[1])
+            service.core._read_source_block(directory, index, offset, {})
+            return {'id': identifier, 'body': {'text': 'x'}}
+
+        with patch.object(self.client, '_current', return_value=(directory, index)), \
+                patch.object(self.client, '_read', side_effect=read), \
+                patch('hxcontainer.read_block_at', return_value=self.fixture.block) as decode:
+            result = self.client.call('outlook_local_messages_bundle', {
+                'ids': [row['id'] for row in index['items']]})
+        self.assertEqual(decode.call_count, 2)
+        self.assertEqual(len(result['items']), 2)
+        self.assertIn('source byte budget', result['errors'][0]['error'])
 
     def test_native_today_does_not_use_sent_time_when_receipt_is_missing(self):
         self.scope['messages'][self.ids[0]].update(received_unix=None, received_time_status='missing',
@@ -326,18 +552,51 @@ time.sleep(30)
         with self.assertRaisesRegex(ValueError, 'folder access changed'):
             self.client._current(before)
 
-    def test_bundle_enforces_aggregate_source_byte_budget_before_read(self):
+    def test_cached_bundle_needs_no_source_budget_or_inflation(self):
         self.refresh()
-        _, index = self.client._load()
-        for row in index['items']:
-            row['body']['bytes'] = 8
-        with patch.object(self.client, '_current', return_value=(None, index)), \
-                patch.object(service, 'BUNDLE_SOURCE_BYTES', 10), \
-                patch.object(self.client, '_read', return_value={'body': {'text': 'ok'}}) as read:
+        for identifier in self.ids[:2]:
+            self.client.call('outlook_local_read', {'id': identifier})
+        with patch.object(service, 'BUNDLE_SOURCE_BYTES', 0), \
+                patch.object(service.core, 'stable_read', side_effect=AssertionError('source read')), \
+                patch.object(service.core, 'decode_body', side_effect=AssertionError('body inflation')):
             result = self.client.call('outlook_local_messages_bundle', {'ids': self.ids[:2]})
-        self.assertEqual(read.call_count, 1)
-        self.assertEqual(len(result['items']), 1)
-        self.assertIn('source byte budget', result['errors'][0]['error'])
+        self.assertEqual(len(result['items']), 2)
+        self.assertEqual(result['errors'], [])
+
+    def test_cached_bundle_bounds_cold_verification_and_reuses_verified_payloads(self):
+        self.fixture.body_source.write_bytes(
+            ('<html><body>' + fixtures.PREVIEW + 'x' * 2048 + '</body></html>').encode())
+        self.fixture.gzip_body_source.write_bytes(
+            ('<html><body>' + fixtures.GZIP_PREVIEW + 'y' * 2048 + '</body></html>').encode())
+        first_id = next(row['id'] for row in self.base['items']
+                        if row['message_id'] == '<first@example.test>')
+        second_id = next(row['id'] for row in self.base['items']
+                         if row['message_id'] == '<second@example.test>')
+        self.scope['messages'][first_id]['folder_id'] = 'inbox'
+        self.refresh()
+        for identifier in (first_id, second_id):
+            self.client.call('outlook_local_read', {'id': identifier})
+        directory, index = self.client._load()
+        first = service.core.find_message(index, first_id)
+        cached = service.core._read_deferred_cache(directory, first)
+        verification_bytes = cached['bytes'] + cached['text_bytes']
+        # A new process starts with neither verification memo populated.
+        service.core._verified_raw_payloads.clear()
+        service.core._verified_text_chunks.clear()
+        with patch.object(service, 'BUNDLE_SOURCE_BYTES', 0), \
+                patch.object(service, 'BUNDLE_VERIFY_BYTES', verification_bytes), \
+                patch.object(service.core, 'freeze_body', side_effect=AssertionError('cache rebuilt')):
+            result = self.client.call('outlook_local_messages_bundle', {'ids': [first_id, second_id]})
+        self.assertEqual([item['id'] for item in result['items']], [first_id])
+        self.assertEqual(result['errors'][0]['id'], second_id)
+        self.assertIn('cache verification byte budget', result['errors'][0]['error'])
+        with patch.object(service, 'BUNDLE_SOURCE_BYTES', 0), \
+                patch.object(service, 'BUNDLE_VERIFY_BYTES', 0):
+            warm = self.client.call('outlook_local_messages_bundle', {'ids': [first_id]})
+        self.assertEqual(len(warm['items']), 1)
+        self.assertEqual(warm['errors'], [])
+        self.assertEqual(self.client.call('outlook_local_read', {'id': second_id})['body']['status'],
+                         'cached_html')
 
     def test_expired_pinned_snapshot_refreshes_before_deleted_access(self):
         before = self.refresh()['snapshot']
@@ -588,9 +847,43 @@ time.sleep(30)
             self.fixture.attachment_source.write_bytes(f'cache-change-{position}'.encode())
             with self.assertRaisesRegex(ValueError, 'no verified'):
                 self.refresh()
-            self.assertLessEqual(len(list((self.fixture.state / 'snapshots').iterdir())), 2)
+            self.assertEqual(len(list((self.fixture.state / 'snapshots').iterdir())), 1)
             self.assertEqual(self.client._status()['snapshot'], before)
             self.assertFalse(self.client._fresh())
+
+    def test_changed_source_retains_only_one_compressed_copy(self):
+        original = self.fixture.profile_tree()
+        snapshots = []
+        for position in range(4):
+            # A changed asset manifest also creates a new source snapshot.
+            self.fixture.attachment_source.write_bytes(f'cache-change-{position}'.encode())
+            snapshots.append(self.refresh()['snapshot'])
+            copies = list((self.fixture.state / 'snapshots').glob('*/source.hxd'))
+            self.assertEqual(len(copies), 1)
+            self.assertEqual({p.name for p in (self.fixture.state / 'views').iterdir()},
+                             {snapshots[-1]})
+        self.assertEqual(self.fixture.source_cache.read_bytes(),
+                         (copies[0]).read_bytes())
+        self.assertEqual(set(original), set(self.fixture.profile_tree()))
+
+    def test_failed_upgrade_refresh_restores_prior_base_without_loading_old_schema(self):
+        self.refresh()
+        _, index = self.client._load()
+        previous_base = (self.fixture.state / 'CURRENT').read_text()
+        view_index = self.fixture.state / 'views' / index['snapshot'] / 'index.json'
+        old_index = json.loads(view_index.read_text())
+        old_index['schema_version'] = service.core.VERSION - 2
+        view_index.chmod(0o600)
+        view_index.write_text(json.dumps(old_index))
+        view_index.chmod(0o400)
+        self.fixture.attachment_source.write_bytes(b'changed-source-before-failed-upgrade')
+        with patch.object(sys.modules['osa_scope'], 'read_scope',
+                          side_effect=ValueError('scope unavailable during upgrade')):
+            with self.assertRaisesRegex(ValueError, '^scope unavailable during upgrade$'):
+                self.refresh()
+        self.assertEqual((self.fixture.state / 'CURRENT').read_text(), previous_base)
+        self.assertEqual({p.name for p in (self.fixture.state / 'snapshots').iterdir()},
+                         {previous_base.strip()})
 
     def test_cycles_conflicts_and_deleted_descendants_not_allowed(self):
         folders = self.scope['folders'] + [dict(id='cycle', parent_id='cycle', name='循环'),

@@ -1,14 +1,16 @@
 """Read-only parser for the HxStore Nostromo i block container.
 
-The module accepts caller-provided bytes-like snapshots, including a private
-read-only mmap.  It does not open or write any Outlook cache file; callers
-provide a store snapshot and receive verified decompressed blocks.
+The scanner accepts caller-provided bytes-like snapshots, including a private
+read-only mmap. The targeted reader opens one source block read-only for lazy
+body recovery. Neither path writes Outlook cache files.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 import mmap
+import os
+import stat
 import zlib
 
 
@@ -220,3 +222,32 @@ def iter_blocks(data: bytes, stats: dict | None = None):
             yield Block(offset=offset, kind=kind, data=block_data)
 
     return walk()
+
+
+def read_block_at(source, offset: int) -> Block:
+    """Read one bounded, CRC-verified source block without scanning the store."""
+    if type(offset) is not int or offset < 0x40:
+        raise ValueError("invalid HxStore block offset")
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as handle:
+        if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+            raise ValueError("HxStore source must be a regular file")
+        store_header = handle.read(0x40)
+        _check_store_header(store_header)
+        handle.seek(offset)
+        header = handle.read(BLOCK_HEADER_SIZE)
+        if (len(header) != BLOCK_HEADER_SIZE or header[8:16] != BLOCK_MAGIC
+                or zlib.crc32(header[4:0x20]) & 0xFFFFFFFF != _read_u32(header, 0)):
+            raise ValueError("HxStore block header changed or is invalid")
+        payload_length = _read_u32(header, 0x14)
+        # Valid LZ4 literal overhead is far smaller than this bounded allowance.
+        if payload_length > MAX_INFLATED * 2:
+            raise ValueError("HxStore block payload exceeds read limit")
+        payload = handle.read(payload_length)
+        if len(payload) != payload_length:
+            raise ValueError("HxStore block is truncated")
+    blocks = list(iter_blocks(store_header + header + payload))
+    if len(blocks) != 1 or blocks[0].offset != 0x40:
+        raise ValueError("HxStore block changed or failed verification")
+    block = blocks[0]
+    return Block(offset, block.kind, block.data)

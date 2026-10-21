@@ -241,7 +241,8 @@ class CommonReader:
         if method == "read":
             offset = number(params, "body_offset", 0, 0, 100000000)
             maximum = number(params, "max_chars", 20000, 1, 200000)
-            page = core.read_body_page(directory, index, row["id"], offset, maximum)
+            row = {**row, "body": core.resolve_message_body(directory, index, row["id"])}
+            page = core.read_body_page(directory, {**index, "items": [row]}, row["id"], offset, maximum)
             text = None if page is None else page["text"]
             total = None if page is None else page["total_chars"]
             start = 0 if page is None else page["offset"]

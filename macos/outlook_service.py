@@ -22,6 +22,7 @@ RETAINED_VIEWS = 3
 MAX_EXPORT_FILES = 64
 MAX_EXPORT_BYTES = 512 * 1024**2
 BUNDLE_SOURCE_BYTES = 64 * 1024**2
+BUNDLE_VERIFY_BYTES = 64 * 1024**2
 VERIFIED_MEMBERSHIP = {"verified_latest_observation", "verified_hx_folder_membership"}
 TOKEN = re.compile(r"[a-f0-9]{24}\Z")
 COVERAGE = ("Locally recoverable cache only; Inbox and Sent Items with all known descendants. "
@@ -122,7 +123,7 @@ class MailService:
         directory = self.state / "snapshots" / base
         if directory.exists() or directory.is_symlink():
             core._private_directory(directory, "source snapshot directory")
-            for name in ("payloads", "textpayloads"):
+            for name in ("payloads", "textpayloads", "deferred"):
                 root = directory / name
                 if root.exists() or root.is_symlink():
                     core._private_directory(root, f"source snapshot {name} directory")
@@ -159,11 +160,21 @@ class MailService:
             if automatic and self._fresh():
                 return self._status()
             self._clean_abandoned_builds()
+            previous_base = None
+            source_pointer = self.state / "CURRENT"
+            if source_pointer.exists() or source_pointer.is_symlink():
+                core._private_file(source_pointer, "source snapshot pointer")
+                previous_base = source_pointer.read_text().strip()
+                if not TOKEN.fullmatch(previous_base):
+                    raise ValueError("invalid source snapshot pointer")
             # A failed refresh must not leave the previous scope marked fresh.
             (self.state / "REFRESH.json").unlink(missing_ok=True)
             # The raw parser knows sent time only. Do not trim by sent date before
             # associating delivery evidence: a much older mail may arrive today.
-            core.make_snapshot(SimpleNamespace(state=str(self.state), profile=str(profile), from_date="0001-01-01"))
+            core.make_snapshot(SimpleNamespace(
+                state=str(self.state), profile=str(profile), from_date="0001-01-01",
+                freeze_bodies=False,
+            ))
             _, base = core.load_index(self.state)
             from osa_scope import read_scope
             try:
@@ -172,7 +183,7 @@ class MailService:
                 if not folders:
                     raise ValueError("no verified Inbox or Sent folder tree is available in the local cache; previous view retained")
             except (OSError, ValueError):
-                self._prune_failed_sources()
+                self._prune_failed_sources(previous_base)
                 raise
             items, outside, unknown = [], 0, 0
             cutoff = core.day_start(requested)
@@ -210,9 +221,10 @@ class MailService:
                        "outside_scope_excluded": outside, "unresolved_folder_excluded": unknown,
                        "source_messages": len(base["items"]),
                        "cached_bodies": sum(r["body"]["status"] == "cached_html" for r in items),
+                       "deferred_bodies": sum(r["body"]["status"] == "deferred" for r in items),
                        "linked_attachments": sum(len(r["attachments"]) for r in items),
                        "body_statuses": {s: sum(r["body"]["status"] == s for r in items)
-                                         for s in ("cached_html", "not_cached", "not_linked", "unavailable")},
+                                         for s in ("cached_html", "deferred", "not_cached", "not_linked", "unavailable")},
                        "body_diagnoses": {code: sum(r["body"]["diagnosis"]["code"] == code for r in items)
                                           for code in sorted({r["body"]["diagnosis"]["code"] for r in items})},
                        "source_exclusions": {key: base["summary"].get(key) for key in (
@@ -260,7 +272,7 @@ class MailService:
             return self._status()
 
     def _prune(self, current):
-        """Under the refresh lock, keep the current view and two recent views."""
+        """Keep up to three views sharing the current compressed source copy."""
         views = self.state / "views"
         candidates = [path for path in views.iterdir()
                       if TOKEN.fullmatch(path.name) and path.is_dir() and not path.is_symlink()]
@@ -277,6 +289,8 @@ class MailService:
                 _, index = self._load(path.name)
             except (OSError, ValueError, KeyError, TypeError):
                 # Old schemas and broken historical views cannot serve reads.
+                continue
+            if index["source_snapshot"] != current_index["source_snapshot"]:
                 continue
             retained.add(path.name)
             bases.add(index["source_snapshot"])
@@ -335,9 +349,15 @@ class MailService:
         # Prior versions lacked owners; let their worker deadline expire.
         return time.time() - path.lstat().st_mtime >= 185
 
-    def _prune_failed_sources(self):
+    def _prune_failed_sources(self, previous_base):
         """Failed scope refreshes may replace the base but must not accumulate it."""
-        keep = {(self.state / "CURRENT").read_text().strip()}
+        if previous_base is not None:
+            # A base without a published scope cannot serve this service. Roll
+            # back without interpreting a previous schema during an upgrade.
+            core.publish_current(self.state, previous_base)
+        else:
+            (self.state / "CURRENT").unlink(missing_ok=True)
+        keep = {previous_base} if previous_base is not None else set()
         views = self.state / "views"
         if views.is_symlink():
             raise ValueError("views directory must not be a symbolic link")
@@ -606,19 +626,18 @@ class MailService:
             return {key: value for key, value in result.items() if key != "_export_fingerprint"}
         if name == "outlook_local_messages_bundle":
             budget = arguments.get("text_budget_chars", 60000)
-            items, errors, used, source_bytes = [], [], 0, 0
+            items, errors, used = [], [], 0
+            source_budget = {"remaining": BUNDLE_SOURCE_BYTES,
+                             "verification_remaining": BUNDLE_VERIFY_BYTES}
             for identifier in dict.fromkeys(arguments["ids"]):
                 if budget <= 0:
                     errors.append({"id": identifier, "error": "bundle text budget exhausted"})
                     continue
                 try:
-                    row = core.find_message(index, identifier)
-                    body_bytes = row["body"].get("bytes", 0)
-                    if source_bytes + body_bytes > BUNDLE_SOURCE_BYTES:
-                        errors.append({"id": identifier, "error": "bundle source byte budget exhausted"})
-                        continue
-                    source_bytes += body_bytes
-                    item = self._read(directory, index, identifier, min(arguments.get("body_max_chars", 12000), budget))
+                    # Charge only actual source reads and body decoding. A
+                    # resolved sidecar can serve a body without using this budget.
+                    with core.source_read_budget(source_budget):
+                        item = self._read(directory, index, identifier, min(arguments.get("body_max_chars", 12000), budget))
                     length = len(item["body"].get("text", ""))
                     budget -= length
                     used += length
