@@ -82,13 +82,13 @@ test('platform construction and foreign IDs never cross native backends', async 
   defaultWin.close();
 
   const macCalls = [];
-  const mac = stub(async (method, params) => { macCalls.push({ method, params }); return { backend: 'mac-cache', date_basis: 'sent_at' }; });
+  const mac = stub(async (method, params) => { macCalls.push({ method, params }); return { backend: 'mac-cache', date_basis: 'received_at' }; });
   const macRouter = new BackendRouter({ platform: 'darwin', mac });
   assert.equal(macRouter.com, undefined);
   assert.equal(macRouter.local, undefined);
   const macResult = await macRouter.call('read', { id: macId });
   assert.equal(macResult.backend, 'mac-cache');
-  assert.equal(macResult.date_basis, 'sent_at');
+  assert.equal(macResult.date_basis, 'received_at');
   await assert.rejects(macRouter.call('read', { id: localId }), { code: 'BACKEND_ID_MISMATCH' });
   await assert.rejects(macRouter.call('read', { id: comId }), { code: 'BACKEND_ID_MISMATCH' });
   await assert.rejects(macRouter.call('health', { backend: 'com' }), { code: 'UNSUPPORTED_BACKEND' });
@@ -135,7 +135,7 @@ test('today fixes the Singapore date across UTC+8 midnight and reports the backe
   const mac = new BackendRouter({ platform: 'darwin', mac: stub(async () => ({ messages: [], backend: 'mac-cache' })), now: () => now });
   const macToday = await mac.call('today', { backend: 'mac-cache' });
   assert.equal(macToday.date, '2026-10-21');
-  assert.equal(macToday.date_basis, 'sent_at');
+  assert.equal(macToday.date_basis, 'received_at');
 });
 
 test('today rejects malformed calendar dates before touching a backend', async () => {

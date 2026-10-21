@@ -23,13 +23,19 @@ def folder_view(identifier, parent, display, type_value):
     """
 
 
-def message_header(entry, message_id, sent, folder):
+def message_header(entry, message_id, sent, folder, received=None, received_ticks=None):
+    receipt = ""
+    if received is not None:
+        receipt += f"<LastDeliveryTime>{escape(received)}</LastDeliveryTime>"
+    if received_ticks is not None:
+        receipt += f"<ReceivedOrRenewTime>{escape(str(received_ticks))}</ReceivedOrRenewTime>"
     return f"""
       <FlattenedMessage>
         <MessageHeader>
           <ImmId>{entry}</ImmId>
           <InternetMessageId>{escape(message_id)}</InternetMessageId>
           <SentTime>{sent}</SentTime>
+          {receipt}
           <ViewId><OutlookId></OutlookId><ImmId>{folder}</ImmId><Type>1</Type></ViewId>
           <Body><Html>this body must not be retained</Html></Body>
         </MessageHeader>
@@ -105,6 +111,211 @@ class OsaScopeTests(unittest.TestCase):
         )
         self.assertFalse(result["messages"]["hx_one"]["evidence"]["live"])
         self.assertFalse(result["evidence"]["body_read"])
+
+    def test_receipt_pair_maps_across_sent_date_boundary(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><LogTime>2026-10-20T02:01:00Z</LogTime>"
+            + message_header(
+                "ENTRY-RECEIVED",
+                "<received@example.test>",
+                "2026-10-19T23:59:00Z",
+                "CHILD",
+                "2026-10-20T00:01:00Z",
+                "639280512600000000",
+            )
+            + "</Response>",
+        )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_received", "message_id": "<received@example.test>",
+              "sent_unix": 1792454340, "entry_ids": ["ENTRY-RECEIVED"]}],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_received"]
+        self.assertEqual(row["folder_id"], "CHILD")
+        self.assertEqual(row["received_unix"], 1792454460.0)
+        self.assertEqual(row["received_time_status"], "verified")
+        self.assertEqual(
+            row["received_time_method"],
+            "osa_last_delivery_time",
+        )
+
+    def test_missing_receipt_does_not_fallback_to_root_receive_time(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><ReceiveTime>2026-10-20T03:00:00Z</ReceiveTime>"
+            + message_header("ENTRY-MISSING-RECEIPT", "<missing@example.test>",
+                             "2026-10-20T01:59:00Z", "CHILD")
+            + "</Response>",
+        )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_missing_receipt", "message_id": "<missing@example.test>",
+              "sent_unix": 1792461540, "entry_ids": ["ENTRY-MISSING-RECEIPT"]}],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_missing_receipt"]
+        self.assertEqual(row["folder_id"], "CHILD")
+        self.assertIsNone(row["received_unix"])
+        self.assertEqual(row["received_time_status"], "missing")
+        self.assertEqual(row["received_time_method"], "osa_receipt_fields_missing")
+
+    def test_valid_receipt_ignores_candidate_missing_both_fields(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        message = "<Response><LogTime>{}</LogTime>{}</Response>"
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            message.format(
+                "2026-10-20T02:01:00Z",
+                message_header("ENTRY-PARTIAL-RECEIPT", "<partial@example.test>",
+                               "2026-10-20T01:59:00Z", "CHILD"),
+            ),
+        )
+        self.write_log(
+            "x.GetMessage.2.res.xmlgz",
+            message.format(
+                "2026-10-20T02:02:00Z",
+                message_header("ENTRY-PARTIAL-RECEIPT", "<partial@example.test>",
+                               "2026-10-20T01:59:00Z", "CHILD",
+                               "2026-10-20T02:00:00Z", "639280584000000000"),
+            ),
+        )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_partial_receipt", "message_id": "<partial@example.test>",
+              "sent_unix": 1792461540, "entry_ids": ["ENTRY-PARTIAL-RECEIPT"]}],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_partial_receipt"]
+        self.assertEqual(row["received_unix"], 1792461600.0)
+        self.assertEqual(row["received_time_status"], "verified")
+
+    def test_invalid_or_naive_receipt_is_exposed_without_hiding_membership(self):
+        self.assertIsNone(osa_scope._parse_explicit_time_ticks("2026-10-20T02:00:00"))
+        self.assertIsNone(osa_scope._parse_dotnet_ticks("nan"))
+        self.assertIsNone(osa_scope._parse_dotnet_ticks(float("nan")))
+        self.assertIsNone(osa_scope._parse_dotnet_ticks(True))
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><LogTime>2026-10-20T02:01:00Z</LogTime>"
+            + message_header("ENTRY-BAD-RECEIPT", "<bad@example.test>",
+                             "2026-10-20T01:59:00Z", "CHILD",
+                             "2026-10-20T02:00:00", "nan")
+            + "</Response>",
+        )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_bad_receipt", "message_id": "<bad@example.test>",
+              "sent_unix": 1792461540, "entry_ids": ["ENTRY-BAD-RECEIPT"]}],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_bad_receipt"]
+        self.assertEqual(row["folder_id"], "CHILD")
+        self.assertIsNone(row["received_unix"])
+        self.assertEqual(row["received_time_status"], "invalid")
+
+    def test_receipt_beyond_metadata_safe_upper_bound_is_invalid(self):
+        safe = osa_scope._DOTNET_MAX_SUPPORTED_TICKS_EXCLUSIVE
+        self.assertEqual(
+            osa_scope._parse_explicit_time_ticks(
+                "9999-12-31T15:59:59.9999999Z"
+            ),
+            safe - 1,
+        )
+        self.assertIsNone(
+            osa_scope._parse_explicit_time_ticks("9999-12-31T16:00:00Z")
+        )
+        self.assertIsNone(osa_scope._parse_dotnet_ticks(str(safe)))
+        rounded = osa_scope._received_time_evidence([{
+            'received_time': '9999-12-31T15:59:59.9999999Z',
+            'received_ticks': str(safe - 1),
+        }])
+        self.assertEqual(rounded['received_time_status'], 'invalid')
+        self.assertIsNone(rounded['received_unix'])
+
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><LogTime>2026-10-20T02:01:00Z</LogTime>"
+            + message_header(
+                "ENTRY-RECEIPT-OVERFLOW",
+                "<overflow-receipt@example.test>",
+                "2026-10-20T01:59:00Z",
+                "CHILD",
+                "9999-12-31T16:00:00Z",
+                safe,
+            )
+            + "</Response>",
+        )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_receipt_overflow", "message_id": "<overflow-receipt@example.test>",
+              "sent_unix": 1792461540, "entry_ids": ["ENTRY-RECEIPT-OVERFLOW"]}],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_receipt_overflow"]
+        self.assertEqual(row["folder_id"], "CHILD")
+        self.assertIsNone(row["received_unix"])
+        self.assertEqual(row["received_time_status"], "invalid")
+
+    def test_receipt_pair_mismatch_is_conflict(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><LogTime>2026-10-20T02:01:00Z</LogTime>"
+            + message_header("ENTRY-TICK-MISMATCH", "<mismatch@example.test>",
+                             "2026-10-20T01:59:00Z", "CHILD",
+                             "2026-10-20T02:00:00Z", "639280584001230000")
+            + "</Response>",
+        )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_tick_mismatch", "message_id": "<mismatch@example.test>",
+              "sent_unix": 1792461540, "entry_ids": ["ENTRY-TICK-MISMATCH"]}],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_tick_mismatch"]
+        self.assertEqual(row["folder_id"], "CHILD")
+        self.assertIsNone(row["received_unix"])
+        self.assertEqual(row["received_time_status"], "conflict")
+        self.assertEqual(
+            row["received_time_method"],
+            "osa_last_delivery_time_and_received_or_renew_time_mismatch",
+        )
+
+    def test_pre_epoch_and_epoch_zero_receipt_ticks_are_valid(self):
+        self.assertEqual(
+            osa_scope._parse_explicit_time_ticks("1970-01-01T00:00:00Z"),
+            osa_scope._DOTNET_EPOCH_TICKS,
+        )
+        self.assertEqual(
+            osa_scope._parse_explicit_time_ticks("1970-01-01T00:00:00.0000001Z"),
+            osa_scope._DOTNET_EPOCH_TICKS + 1,
+        )
+        self.assertEqual(
+            osa_scope._parse_explicit_time_ticks("1969-12-31T23:59:00Z"),
+            621355967400000000,
+        )
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><LogTime>2026-10-20T02:01:00Z</LogTime>"
+            + message_header("ENTRY-PRE-EPOCH-RECEIPT", "<pre-receipt@example.test>",
+                             "1969-12-31T23:58:00Z", "CHILD",
+                             "1969-12-31T23:59:00Z", "621355967400000000")
+            + "</Response>",
+        )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_pre_receipt", "message_id": "<pre-receipt@example.test>",
+              "sent_unix": -120, "entry_ids": ["ENTRY-PRE-EPOCH-RECEIPT"]}],
+            log_root=self.log_root,
+        )
+        self.assertEqual(result["messages"]["hx_pre_receipt"]["received_unix"], -60.0)
 
     def test_pre_epoch_timestamps_are_valid_and_map_membership(self):
         self.assertIsNone(osa_scope._parse_time("not-a-date"))

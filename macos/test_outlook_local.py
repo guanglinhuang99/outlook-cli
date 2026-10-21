@@ -151,6 +151,8 @@ class OutlookLocalTests(unittest.TestCase):
 
     def test_last_supported_to_date_has_no_unrepresentable_next_day(self):
         _, _, index = self.snapshot()
+        for row in index['items']:
+            row['received_unix'] = row['sent_unix'] + 60
         result = outlook_local.search(index, SimpleNamespace(
             from_date=None, to_date='9999-12-31', query='', field='all', limit=100, cursor=None))
         self.assertEqual(result['total_matched'], len(index['items']))

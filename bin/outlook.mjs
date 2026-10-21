@@ -48,7 +48,7 @@ Messages/search: --after/--before ISO time with timezone, --offset,
 --limit, --scan-limit. Search covers one folder per call; follow next_offset.
 All mailbox commands accept --backend auto|com|local|mac-cache (default auto).
 auto uses Windows COM/local OST/PST or the macOS HxStore cache by platform.
-Windows date filters use received_at; macOS uses verified sent_at.
+Both platforms filter by received_at; macOS uses verified LastDeliveryTime.
 On macOS, Python 3.11+ is required; unread/body-search/HTML are unsupported.
 Local reads contain cached data only; COM and local IDs are different.
 Use stores -> root_id -> folders to discover other folders.

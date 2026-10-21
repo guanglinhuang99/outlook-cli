@@ -36,6 +36,21 @@ _MESSAGE_NAME = re.compile(
 )
 _FORBIDDEN_XML = (b"<!doctype", b"<!entity")
 _FORBIDDEN_TAIL_BYTES = 128
+_INTEGER_TEXT = re.compile(r"\A\d+\Z")
+_ISO_EXPLICIT_TIME = re.compile(
+    r"\A(?P<date>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})"
+    r"(?:[.,](?P<fraction>\d+))?(?P<offset>Z|[+-]\d{2}:?\d{2})\Z"
+)
+_DOTNET_TICKS_PER_SECOND = 10_000_000
+_DOTNET_EPOCH_TICKS = 621355968000000000
+_DOTNET_MAX_TICKS_EXCLUSIVE = 3155378976000000000
+# The metadata path converts Unix seconds to an Asia/Singapore datetime.  Keep
+# the UTC receipt below 9999-12-31 16:00:00 so that conversion cannot roll into
+# year 10000.
+_DOTNET_MAX_SUPPORTED_TICKS_EXCLUSIVE = (
+    _DOTNET_MAX_TICKS_EXCLUSIVE
+    - 8 * 60 * 60 * _DOTNET_TICKS_PER_SECOND
+)
 
 
 class _BoundError(ValueError):
@@ -116,6 +131,123 @@ def _parse_time(value: str | None) -> float | None:
         return timestamp if math.isfinite(timestamp) else None
     except (TypeError, ValueError, OverflowError, OSError):
         return None
+
+
+def _parse_dotnet_ticks(value: Any) -> int | None:
+    """Parse a nonnegative .NET DateTime tick value without float conversion."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        ticks = value
+    elif isinstance(value, str) and _INTEGER_TEXT.fullmatch(value.strip()):
+        try:
+            ticks = int(value.strip())
+        except (TypeError, ValueError, OverflowError):
+            return None
+    else:
+        return None
+    if not 0 <= ticks < _DOTNET_MAX_SUPPORTED_TICKS_EXCLUSIVE:
+        return None
+    return ticks
+
+
+def _parse_explicit_time_ticks(value: Any) -> int | None:
+    """Parse an ISO timestamp with an explicit offset into .NET ticks."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    match = _ISO_EXPLICIT_TIME.fullmatch(value.strip())
+    if match is None:
+        return None
+    fraction = match.group("fraction") or ""
+    if len(fraction) > 7:
+        return None
+    microseconds = fraction[:6].ljust(6, "0")
+    offset = match.group("offset")
+    if offset == "Z":
+        offset = "+00:00"
+    elif len(offset) == 5:
+        offset = f"{offset[:3]}:{offset[3:]}"
+    try:
+        parsed = datetime.fromisoformat(
+            f"{match.group('date')}.{microseconds}{offset}"
+        )
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            return None
+        parsed = parsed.astimezone(timezone.utc)
+        epoch = datetime(1, 1, 1, tzinfo=timezone.utc)
+        delta = parsed - epoch
+        ticks = (
+            delta.days * 86_400 * _DOTNET_TICKS_PER_SECOND
+            + delta.seconds * _DOTNET_TICKS_PER_SECOND
+            + delta.microseconds * 10
+            + (int(fraction[6]) if len(fraction) == 7 else 0)
+        )
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return (
+        ticks
+        if 0 <= ticks < _DOTNET_MAX_SUPPORTED_TICKS_EXCLUSIVE
+        else None
+    )
+
+
+def _received_time_evidence(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Validate direct delivery fields across all identity-matched observations."""
+    values: list[int] = []
+    has_nonempty = False
+    has_invalid = False
+    has_pair = False
+    has_mismatch = False
+    for row in rows:
+        iso_value = row.get("received_time")
+        raw_value = row.get("received_ticks")
+        iso_present = isinstance(iso_value, str) and bool(iso_value.strip())
+        raw_present = isinstance(raw_value, str) and bool(raw_value.strip())
+        if not iso_present and not raw_present:
+            continue
+        has_nonempty = True
+        iso_ticks = _parse_explicit_time_ticks(iso_value) if iso_present else None
+        raw_ticks = _parse_dotnet_ticks(raw_value) if raw_present else None
+        if iso_present and iso_ticks is None:
+            has_invalid = True
+        if raw_present and raw_ticks is None:
+            has_invalid = True
+        if iso_present and raw_present:
+            if iso_ticks is None or raw_ticks is None:
+                continue
+            has_pair = True
+            if iso_ticks != raw_ticks:
+                has_mismatch = True
+                continue
+        values.extend(value for value in (iso_ticks, raw_ticks) if value is not None)
+
+    if has_invalid:
+        return {"received_unix": None, "received_time_status": "invalid",
+                "received_time_method": "osa_last_delivery_or_renew_invalid"}
+    if has_mismatch:
+        return {"received_unix": None, "received_time_status": "conflict",
+                "received_time_method": "osa_last_delivery_time_and_received_or_renew_time_mismatch"}
+    if values and len(set(values)) > 1:
+        return {"received_unix": None, "received_time_status": "conflict",
+                "received_time_method": "osa_receipt_candidates_conflict"}
+    if has_pair and values:
+        received = (values[0] - _DOTNET_EPOCH_TICKS) / _DOTNET_TICKS_PER_SECOND
+        # Public metadata rounds to milliseconds; float conversion must not
+        # carry a near-maximum timestamp into year 10000 in the display zone.
+        upper_ms = (_DOTNET_MAX_SUPPORTED_TICKS_EXCLUSIVE - _DOTNET_EPOCH_TICKS) // 10_000
+        if round(received * 1000) >= upper_ms:
+            return {"received_unix": None, "received_time_status": "invalid",
+                    "received_time_method": "osa_receipt_out_of_display_range"}
+        return {
+            "received_unix": received,
+            "received_time_status": "verified",
+            "received_time_method": "osa_last_delivery_time",
+        }
+    if has_nonempty:
+        return {"received_unix": None, "received_time_status": "incomplete",
+                "received_time_method": "osa_receipt_pair_incomplete"}
+    return {"received_unix": None, "received_time_status": "missing",
+            "received_time_method": "osa_receipt_fields_missing"}
 
 
 def _item_time(item: Mapping[str, Any]) -> float | None:
@@ -279,6 +411,8 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
                         "message_id": _text(element, "InternetMessageId"),
                         "sent_time": _text(element, "SentTime"),
                         "sent_unix": _parse_time(_text(element, "SentTime")),
+                        "received_time": _text(element, "LastDeliveryTime"),
+                        "received_ticks": _text(element, "ReceivedOrRenewTime"),
                         "folder_id": _view_folder_id(element),
                         "log_time": log_time,
                         "log_unix": _parse_time(log_time),
@@ -294,7 +428,10 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
                     inside_header = any(value == "MessageHeader" for value in stack[:-1])
                     keep_header_field = (
                         inside_header
-                        and (inside_view_id or tag in {"ImmId", "InternetMessageId", "SentTime", "ViewId"})
+                        and (inside_view_id or tag in {
+                            "ImmId", "InternetMessageId", "SentTime", "LastDeliveryTime",
+                            "ReceivedOrRenewTime", "ViewId",
+                        })
                     )
                     # Keep only fields needed by a View or MessageHeader;
                     # clear unrelated response data, including real body data.
@@ -512,6 +649,11 @@ def read_scope(
         "messages_fallback_input_duplicate": 0,
         "messages_fallback_identity_conflict": 0,
         "messages_no_valid_log_time": 0,
+        "messages_received_verified": 0,
+        "messages_received_missing": 0,
+        "messages_received_incomplete": 0,
+        "messages_received_invalid": 0,
+        "messages_received_conflict": 0,
     }
     files = _log_files(root, evidence)
     rows = _input_rows(items)
@@ -765,9 +907,12 @@ def read_scope(
         else:
             scope = "outside"
         folder_status = "verified_latest_observation"
+        received = _received_time_evidence(candidates)
+        evidence[f"messages_received_{received['received_time_status']}"] += 1
         messages[identifier] = {
             "folder_id": public_id_by_key[folder_key],
             "folder_status": folder_status,
+            **received,
             "evidence": {
                 "match_method": method if candidates else "none",
                 "scope": scope,

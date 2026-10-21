@@ -144,7 +144,9 @@ class CommonReader:
                 "sender": {"name": row.get("sender_name") or None, "address": address,
                            "address_type": "SMTP" if address and "@" in address else None,
                            "smtp_address": address if address and "@" in address else None},
-                "received_at": None, "sent_at": native["sent_at"], "unread": None,
+                "received_at": native["received_at"], "sent_at": native["sent_at"],
+                "received_time_status": native["received_time_status"],
+                "received_time_method": native["received_time_method"], "unread": None,
                 "size_bytes": None, "download_state": None, "preview": row.get("preview"),
                 "body_status": row["body"]["status"], "attachment_count": len(row["attachments"]),
                 "attachments_complete": False,
@@ -172,7 +174,7 @@ class CommonReader:
         identity = None if value in ("inbox", "sent", "deleted", "drafts", "junk", "outbox") else decode_id(value, kind)
         directory, index = self.service._current(identity["snapshot"] if identity else None)
         groups = self.groups(index)
-        context = {"backend": "mac-cache", "data_scope": "verified_inbox_sent_cache", "date_basis": "sent_at",
+        context = {"backend": "mac-cache", "data_scope": "verified_inbox_sent_cache", "date_basis": "received_at",
                    "snapshot": index["snapshot"], "captured_at": index["created_at"],
                    "coverage": index["summary"]["coverage"]}
         if method == "health":
@@ -180,7 +182,7 @@ class CommonReader:
                     "store_count": len(groups), "readable_store_count": len(groups),
                     "outlook_version": None, "cache_summary": index["summary"],
                     "capabilities": {"unread_filter": False, "body_search": False, "html_body": False,
-                                     "received_time": False, "sent_time": True},
+                                     "received_time": True, "sent_time": True},
                     "limitations": ["Only recoverable cache in verified Inbox/Sent folders is exposed.",
                                     "Folder names may be redacted; membership is a local observation, not live server state."]}
         if method == "stores":
@@ -201,9 +203,14 @@ class CommonReader:
             after, before = timestamp(params.get("after")), timestamp(params.get("before"))
             if after is not None and before is not None and after >= before:
                 fail("INVALID_ARGUMENT", "after must be earlier than before")
-            rows = [row for row in index["items"] if row["folder_id"] == key
-                    and (after is None or row["sent_unix"] >= after)
-                    and (before is None or row["sent_unix"] < before)]
+            folder_rows = [row for row in index["items"] if row["folder_id"] == key]
+            unknown_times = sum(row.get("received_unix") is None for row in folder_rows)
+            dated = after is not None or before is not None
+            rows = sorted((row for row in folder_rows
+                           if not dated or (row.get("received_unix") is not None
+                               and (after is None or row["received_unix"] >= after)
+                               and (before is None or row["received_unix"] < before))),
+                          key=core.received_sort_key)
             offset = number(params, "offset", 0, 0, 10000000)
             limit = number(params, "limit", 25, 1, 200)
             scan = number(params, "scan_limit", 500, 1, 2000)
@@ -220,7 +227,9 @@ class CommonReader:
             return {**context, "messages": matched, "scanned": max(0, position - offset),
                     "filtered_item_count": len(rows), "next_offset": position if position < len(rows) else None,
                     "complete": position >= len(rows), "scope": "single_folder",
-                    "pagination": "live_offset_not_snapshot", "body_search_incomplete": False}
+                    "pagination": "live_offset_not_snapshot", "body_search_incomplete": False,
+                    "received_time_unknown": unknown_times,
+                    "date_filter_incomplete": bool(dated and unknown_times)}
         if not identity or kind != "message":
             fail("INVALID_ID", "Expected a message ID")
         row = next((row for row in index["items"] if row["id"] == identity["key"]), None)

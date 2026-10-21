@@ -33,8 +33,8 @@ class CommonWorkerTests(unittest.TestCase):
     def test_common_contract_discovers_stores_and_restricts_folder_tree(self):
         health = self.reader.perform('health', {})
         self.assertEqual(health['backend'], 'mac-cache')
-        self.assertEqual(health['date_basis'], 'sent_at')
-        self.assertFalse(health['capabilities']['received_time'])
+        self.assertEqual(health['date_basis'], 'received_at')
+        self.assertTrue(health['capabilities']['received_time'])
         stores = self.reader.perform('stores', {})['stores']
         self.assertEqual(len(stores), 1)
         root_listing = self.reader.perform('folders', {'folder': stores[0]['root_id']})
@@ -74,11 +74,12 @@ class CommonWorkerTests(unittest.TestCase):
         self.assertEqual(self.reader.folder_key(common.encode_id('folder', 'sent-b', 'a' * 24), index),
                          'sent-b')
 
-    def test_sent_time_filters_do_not_fabricate_received_time(self):
+    def test_received_time_filters_preserve_separate_sent_time(self):
         result = self.reader.perform('messages', {})
         self.assertEqual(len(result['messages']), 1)
         mail = result['messages'][0]
-        self.assertIsNone(mail['received_at'])
+        self.assertIsNotNone(mail['received_at'])
+        self.assertNotEqual(mail['received_at'], mail['sent_at'])
         self.assertIsNone(mail['unread'])
         self.assertIsNone(mail['size_bytes'])
         self.assertEqual(mail['folder_path'], '收件箱')
@@ -86,13 +87,13 @@ class CommonWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.reader.perform('search', {'query': '中文'})['messages']), 1)
         self.assertEqual(self.reader.perform('search', {'query': "' OR 1=1"})['messages'], [])
 
-    def test_millisecond_sent_time_keeps_filter_and_order_boundaries(self):
+    def test_millisecond_received_time_keeps_filter_and_order_boundaries(self):
         directory, index = self.fixture.client._current()
         inbox = next(row for row in index['items'] if row['folder_id'] == 'inbox')
         nested = next(row for row in index['items'] if row['folder_id'] == 'deep')
-        inbox['sent_unix'] = 946_684_800.500
+        inbox['received_unix'] = 946_684_800.500
         nested['folder_id'] = 'inbox'
-        nested['sent_unix'] = 946_684_800.250
+        nested['received_unix'] = 946_684_800.250
         with patch.object(self.fixture.client, '_current', return_value=(directory, index)):
             result = self.reader.perform('messages', {
                 'after': '2000-01-01T00:00:00.250Z',
@@ -100,13 +101,36 @@ class CommonWorkerTests(unittest.TestCase):
             })
             self.assertEqual([row['id'] for row in result['messages']],
                              [self.message_id(inbox['id']), self.message_id(nested['id'])])
-            self.assertEqual(result['messages'][0]['sent_at'], '2000-01-01T08:00:00.500000+08:00')
-            self.assertEqual(result['messages'][1]['sent_at'], '2000-01-01T08:00:00.250000+08:00')
+            self.assertEqual(result['messages'][0]['received_at'], '2000-01-01T08:00:00.500000+08:00')
+            self.assertEqual(result['messages'][1]['received_at'], '2000-01-01T08:00:00.250000+08:00')
             excluded = self.reader.perform('messages', {
                 'after': '2000-01-01T00:00:00Z',
                 'before': '2000-01-01T00:00:00.250Z',
             })
         self.assertEqual(excluded['messages'], [])
+
+    def test_received_day_wins_over_sent_day_and_missing_times_are_reported(self):
+        directory, index = self.fixture.client._current()
+        inbox = next(row for row in index['items'] if row['folder_id'] == 'inbox')
+        nested = next(row for row in index['items'] if row['folder_id'] == 'deep')
+        inbox['received_unix'] = common.timestamp('2000-01-02T00:00:00+08:00')
+        # Sent timestamps remain Jan 1; no fallback for the unknown row.
+        nested.update(folder_id='inbox', received_unix=None, received_time_status='missing')
+        with patch.object(self.fixture.client, '_current', return_value=(directory, index)):
+            filters = {'after': '2000-01-02T00:00:00+08:00', 'before': '2000-01-03T00:00:00+08:00'}
+            for method, params in [('messages', filters), ('search', {**filters, 'query': '中文'})]:
+                result = self.reader.perform(method, params)
+                self.assertEqual(len(result['messages']), 1)
+                self.assertEqual(result['messages'][0]['received_at'], '2000-01-02T00:00:00+08:00')
+                self.assertEqual(result['received_time_unknown'], 1)
+                self.assertTrue(result['date_filter_incomplete'])
+            undated = self.reader.perform('messages', {})
+            self.assertEqual(len(undated['messages']), 2)
+            self.assertIsNone(undated['messages'][-1]['received_at'])
+            self.assertFalse(undated['date_filter_incomplete'])
+            previous_day = self.reader.perform('messages', {
+                'after': '2000-01-01T00:00:00+08:00', 'before': '2000-01-02T00:00:00+08:00'})
+            self.assertEqual(previous_day['messages'], [])
 
     def test_unsupported_filters_and_foreign_ids_fail_explicitly(self):
         for method, params in [('messages', {'unread': False}), ('search', {'query': '中文', 'search_body': True}),
@@ -150,7 +174,7 @@ class CommonWorkerTests(unittest.TestCase):
         self.assertFalse(result['body']['available'])
         self.assertIsNone(result['body']['text'])
         self.assertIsNone(result['body']['total_chars'])
-        self.assertIsNone(result['received_at'])
+        self.assertIsNotNone(result['received_at'])
 
     def test_chunked_attachments_match_original_without_source_writes(self):
         row = next(row for row in self.fixture.base['items'] if row['attachments'])

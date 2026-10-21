@@ -47,6 +47,10 @@ class ServiceTests(unittest.TestCase):
             },
             'fingerprint': 'first-catalog', 'evidence': {'source': 'synthetic'},
         }
+        for row in self.base['items']:
+            self.scope['messages'][row['id']].update(
+                received_unix=row['sent_unix'] + 60,
+                received_time_status='verified', received_time_method='osa_last_delivery_time')
         module = types.ModuleType('osa_scope')
         module.read_scope = lambda profile, items: copy.deepcopy(self.scope)
         self.addCleanup(patch.stopall)
@@ -55,6 +59,36 @@ class ServiceTests(unittest.TestCase):
 
     def refresh(self):
         return self.client.call('outlook_local_refresh', {})
+
+    def test_receipt_scope_does_not_drop_mail_sent_before_cutoff(self):
+        # These headers were sent in 2000 but delivered in 2001.
+        received = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp()
+        for identifier in self.ids[:2]:
+            self.scope['messages'][identifier]['received_unix'] = received
+        result = self.client.call('outlook_local_refresh', {'from_date': '2001-01-01'})
+        self.assertEqual(result['messages'], 2)
+        page = self.client.call('outlook_local_search', {'from_date': '2001-01-01', 'to_date': '2001-01-01'})
+        self.assertEqual(page['total_matched'], 2)
+        self.assertTrue(all(row['sent_at'].startswith('2000-') for row in page['items']))
+        self.assertTrue(all(row['received_at'].startswith('2001-01-01') for row in page['items']))
+        self.assertEqual(page['date_basis'], 'received_at')
+
+    def test_native_today_does_not_use_sent_time_when_receipt_is_missing(self):
+        self.scope['messages'][self.ids[0]].update(received_unix=None, received_time_status='missing',
+                                                  received_time_method=None)
+        self.refresh()
+        listing = self.client.call('outlook_local_search', {})
+        self.assertEqual(listing['total_matched'], 2)
+        self.assertEqual(listing['received_time_unknown'], 1)
+        with patch.object(service, 'datetime', FrozenDatetime):
+            FrozenDatetime.instant = datetime(1999, 12, 31, 16, 30, tzinfo=timezone.utc)
+            page = self.client.call('outlook_local_today', {})
+        self.assertEqual(page['total_matched'], 1)
+        self.assertTrue(page['date_filter_incomplete'])
+        self.assertEqual(page['received_time_unknown'], 1)
+        undated = self.client.call('outlook_local_read', {'id': self.ids[0]})
+        self.assertIsNone(undated['received_at'])
+        self.assertIsNotNone(undated['sent_at'])
 
     def test_status_does_not_scan_or_create_state(self):
         fresh = self.fixture.state.parent / 'fresh'
@@ -198,7 +232,7 @@ time.sleep(30)
         with self.assertRaises(ValueError):
             self.client.call('outlook_local_search', {'folder_id': 'deleted'})
 
-    def test_today_uses_singapore_sent_date_and_existing_read_only_scope(self):
+    def test_today_uses_singapore_received_date_and_existing_read_only_scope(self):
         self.refresh()
         original = self.fixture.profile_tree()
         FrozenDatetime.instant = datetime(1999, 12, 31, 16, 30, tzinfo=timezone.utc)
@@ -206,7 +240,7 @@ time.sleep(30)
             result = self.client.call('outlook_local_today', {})
             self.assertEqual(result['date'], '2000-01-01')
             self.assertEqual(result['timezone'], 'Asia/Singapore')
-            self.assertEqual(result['date_basis'], 'sent_at')
+            self.assertEqual(result['date_basis'], 'received_at')
             self.assertEqual(result['total_matched'], 2)
             self.assertTrue(result['complete'])
             self.assertEqual({row['id'] for row in result['items']}, set(self.ids[:2]))

@@ -12,7 +12,7 @@ const filters = {
   folder,
   ...page,
   unread: z.boolean().optional(),
-  after: z.iso.datetime({ offset: true }).optional().describe('Inclusive ISO timestamp. Windows uses received_at; macOS uses verified sent_at. Check date_basis in the result.'),
+  after: z.iso.datetime({ offset: true }).optional().describe('Inclusive ISO timestamp. Both platforms use verified received_at; missing receipt times are excluded from date-filtered results. Check date_basis in the result.'),
   before: z.iso.datetime({ offset: true }).optional().describe('Exclusive ISO timestamp, using the same backend date_basis as after.'),
   scan_limit: integer(1, 2000, 500)
 };
@@ -22,7 +22,7 @@ export const definitions = {
   stores: define('List Outlook stores with opaque root folder IDs.', {}),
   folders: define('List immediate child folders. Use a store root_id or a folder id; paginated, not recursive.', { folder, ...page }),
   messages: define('List newest mail metadata in one folder. next_offset counts examined items; mailbox changes may shift pages.', filters),
-  today: define('List today\'s mail in one folder using Asia/Singapore dates. Windows filters received_at; macOS filters verified sent_at. Cached data may be incomplete. For subsequent offset pages, pass the returned date to preserve the first page\'s day across midnight.', {
+  today: define('List today\'s mail in one folder using Asia/Singapore dates. Both platforms filter received_at; macOS uses verified LastDeliveryTime. Cached data may be incomplete. For subsequent offset pages, pass the returned date to preserve the first page\'s day across midnight.', {
     folder, ...page, unread: z.boolean().optional(), scan_limit: integer(1, 2000, 500),
     date: todayDate.optional().describe('Continuation day from the previous result; omit on the first page to use today.')
   }),

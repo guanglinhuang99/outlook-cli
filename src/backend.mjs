@@ -143,7 +143,7 @@ export class BackendRouter {
     const args = { ...params, after: singaporeMidnight(date), before: singaporeMidnight(next, true) };
     delete args.date;
     const result = await this.call('messages', args);
-    return { ...result, date, timezone: singaporeTimezone, date_basis: result.backend === 'mac-cache' ? 'sent_at' : 'received_at' };
+    return { ...result, date, timezone: singaporeTimezone, date_basis: 'received_at' };
   }
   close() { for (const bridge of this.bridges) bridge.close(); }
 }

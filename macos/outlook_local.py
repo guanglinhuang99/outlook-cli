@@ -784,12 +784,23 @@ def find_message(index, message_id):
     return row
 
 
+def received_sort_key(row):
+    value = row.get("received_unix")
+    return (value is None, -value if value is not None else 0, row["id"])
+
+
 def metadata(row):
     sent = (datetime(1970, 1, 1, tzinfo=timezone.utc)
             + timedelta(milliseconds=round(row["sent_unix"] * 1000))).astimezone(ZONE)
+    received = row.get("received_unix")
+    received_at = ((datetime(1970, 1, 1, tzinfo=timezone.utc)
+                    + timedelta(milliseconds=round(received * 1000))).astimezone(ZONE).isoformat()
+                   if received is not None else None)
     return {**{k: row[k] for k in ("id", "message_id", "subject", "subject_status", "sender", "sender_status", "sender_name", "preview", "mailbox_state")},
             "preview_method": row.get("preview_method", "after_class_candidate"),
-            "sent_at": sent.isoformat(),
+            "sent_at": sent.isoformat(), "received_at": received_at,
+            "received_time_status": row.get("received_time_status", "missing"),
+            "received_time_method": row.get("received_time_method"),
             "time_method": row["time_method"],
             "body_status": row["body"]["status"], "body_diagnosis": row["body"]["diagnosis"]["code"],
             "attachment_count": len(row["attachments"]),
@@ -807,9 +818,12 @@ def search(index, args):
     if start is not None and end is not None and start >= end:
         raise ValueError("from-date must not exceed to-date")
     query, matched = args.query.casefold(), []
-    for row in index["items"]:
-        if start is not None and row["sent_unix"] < start or end is not None and row["sent_unix"] >= end:
-            continue
+    unknown_times = sum(row.get("received_unix") is None for row in index["items"])
+    for row in sorted(index["items"], key=received_sort_key):
+        received = row.get("received_unix")
+        if start is not None or end is not None:
+            if received is None or (start is not None and received < start) or (end is not None and received >= end):
+                continue
         fields = [args.field] if args.field != "all" else ["subject", "sender", "sender_name", "preview"]
         hits = [field for field in fields if query in (row.get(field) or "").casefold()]
         if query and not hits:
@@ -828,6 +842,8 @@ def search(index, args):
     next_offset = offset + len(items)
     return {"snapshot": index["snapshot"], "items": items, "total_matched": len(matched),
             "scope_from_date": index["summary"]["scope_from_date"], "captured_at": index["created_at"],
+            "date_basis": "received_at", "received_time_unknown": unknown_times,
+            "date_filter_incomplete": bool(unknown_times and (start is not None or end is not None)),
             "complete": next_offset >= len(matched),
             "next_cursor": f"{signature}:{next_offset}" if next_offset < len(matched) else None,
             "coverage": index["summary"]["coverage"]}

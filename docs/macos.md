@@ -36,7 +36,7 @@ node bin/outlook.mjs mcp-config
 
 这套配置暴露与 Windows 相同的 9 个 `outlook_*` 工具，包含 `outlook_today`。端口、令牌鉴权和 Streamable HTTP 与 Windows 共用。`OUTLOOK_LOCAL_STATE_DIR` 必须与启动服务时一致；通常直接复制 `mcp-config` 的输出即可。 自定义服务状态路径的父目录须由当前用户或 root 控制，拒绝可被其他用户替换的共享目录。
 
-服务状态会保留启动时的自定义 profile 保护路径，后续下载命令无需重复设置该环境变量。升级旧版本后先执行 `node bin/outlook.mjs restart`；旧状态缺少保护路径时，下载会要求重启。MCP 工具可能创建、刷新或清理私有缓存，因此安全注解会标明本地文件写入；这不改变原始 Outlook 邮件只读的约束。
+服务状态会保留启动时的自定义 profile 保护路径，后续下载命令无需重复设置该环境变量。升级旧版本后先执行 `node bin/outlook.mjs restart`；旧状态缺少保护路径时，下载会要求重启。接收时间筛选版本使用新的目录快照版本，重启后会重新构建索引。MCP 工具可能创建、刷新或清理私有缓存，因此安全注解会标明本地文件写入；这不改变原始 Outlook 邮件只读的约束。
 
 `OUTLOOK_LOCAL_STATE_DIR` 必须是专用目录的绝对路径，首次应指定尚不存在的目录。服务只认领新目录或经验证的旧服务目录，拒绝更改无关现有目录的权限。
 
@@ -57,8 +57,9 @@ node bin/outlook.mjs mcp-config
 - `stores` 返回缓存账户分组；用 `root_id` 调用 `folders` 可获得收件箱和已发送根目录，按 `is_inbox` / `is_sent` 识别，再逐级获取子目录。部分原始目录名被 Outlook 脱敏为 `pii:`；返回名称状态，不猜测中文名称或账户名称。
 - `inbox` / `sent` 仅在能唯一确定缓存账户时使用。判断包含根目录和全部已知子目录；多个账户有缓存时返回 `FOLDER_AMBIGUOUS`，应选择显式文件夹 ID。
 - `messages`、`search`、`today` 每次查一个文件夹，不递归。遍历全部邮件需逐级调用 `folders`，逐目录跟随 `next_offset`；分页为 offset 模式，跨页邮箱变化可能带来重复或遗漏，按 ID 去重。
-- Mac 已验证的时间字段是发送时间：`date_basis: "sent_at"`，`received_at: null`。`today` 以新加坡时区当天 `[00:00, 次日00:00)` 筛选发送时间，不能据此声称是当天新接收的全部邮件。翻页传回结果的 `date` 和 `next_offset`。 共享工具的显式 `date` 范围为 `1970-01-01` 至 `9999-12-30`；使用历史日期时按 `Asia/Singapore` 的对应时区规则筛选。
-- 字段 271 的时间按毫秒对齐的 .NET DateTime ticks 解码，保留毫秒用于排序和时间过滤；支持从公元 1 年起、至 UTC `9999-12-31 16:00:00` 之前的格式有效值，上界预留新加坡时区转换空间，没有按当前年份或 2030 年截断。
+- Mac 与 Windows 一样按接收时间筛选：`date_basis: "received_at"`。读取 Osa `MessageHeader.LastDeliveryTime`，与同一记录的 `ReceivedOrRenewTime` 原始 .NET ticks 核对，并沿用 EntryID / Message-ID 与发送时间的身份验证；不使用日志的响应时间或文件修改时间。`today` 以新加坡时区当天 `[00:00, 次日00:00)` 筛选接收时间。这里的接收时间是 Outlook 最后投递时间，不保证是邮件最初的 SMTP 接收时间。翻页传回结果的 `date` 和 `next_offset`。 共享工具的显式 `date` 范围为 `1970-01-01` 至 `9999-12-30`；使用历史日期时按 `Asia/Singapore` 的对应时区规则筛选。
+- 接收时间缺失、无效或证据冲突时，`received_at` 为 null，`received_time_status` 说明原因；不回退到发送时间。无日期条件仍可检索和读取这些邮件，有日期条件时排除并通过 `received_time_unknown` / `date_filter_incomplete` 提示范围不完整。结果按已验证接收时间倒序，缺失时间置后。接收时间只覆盖本地日志可可靠关联的记录，不保证全部服务器邮件。
+- 字段 271 仍单独保留为 `sent_at`，用于显示与身份核对，不参与邮件日期筛选。该字段按毫秒对齐的 .NET DateTime ticks 解码，保留毫秒用于排序和时间过滤；支持从公元 1 年起、至 UTC `9999-12-31 16:00:00` 之前的格式有效值，上界预留新加坡时区转换空间，没有按当前年份或 2030 年截断。
 - 只能读取已缓存、且能可靠关联的内容。`captured_at` 是快照生成时间，不是服务器同步时间；`coverage` 说明本地证据范围，不保证服务器邮箱完整。
 - 每次成功刷新后保留当前目录快照和最近两个历史快照，清理不再引用的正文快照和附件导出。旧 ID/游标超过保留范围会失效，或在并发刷新清理时返回读取错误，应重新检索；原始 Outlook 缓存不参与清理。任何相关 Osa 日志读取失败时刷新报错，旧目录范围也不再视为有效。
 

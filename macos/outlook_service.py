@@ -17,7 +17,7 @@ import uuid
 
 import outlook_local as core
 
-VIEW_VERSION = 2
+VIEW_VERSION = 3
 RETAINED_VIEWS = 3
 MAX_EXPORT_FILES = 64
 MAX_EXPORT_BYTES = 512 * 1024**2
@@ -27,7 +27,7 @@ TOKEN = re.compile(r"[a-f0-9]{24}\Z")
 COVERAGE = ("Locally recoverable cache only; Inbox and Sent Items with all known descendants. "
             "Deleted Items and its descendants are excluded. "
             "Unresolved folder membership is excluded. Folder membership is the latest "
-            "reliable local observation, not a live server guarantee. Dates use sent time "
+            "reliable local observation, not a live server guarantee. Dates use verified last delivery time "
             "in Asia/Singapore; missing bodies and attachments remain explicit.")
 
 
@@ -161,7 +161,9 @@ class MailService:
             self._clean_abandoned_builds()
             # A failed refresh must not leave the previous scope marked fresh.
             (self.state / "REFRESH.json").unlink(missing_ok=True)
-            core.make_snapshot(SimpleNamespace(state=str(self.state), profile=str(profile), from_date=requested))
+            # The raw parser knows sent time only. Do not trim by sent date before
+            # associating delivery evidence: a much older mail may arrive today.
+            core.make_snapshot(SimpleNamespace(state=str(self.state), profile=str(profile), from_date="0001-01-01"))
             _, base = core.load_index(self.state)
             from osa_scope import read_scope
             try:
@@ -173,6 +175,7 @@ class MailService:
                 self._prune_failed_sources()
                 raise
             items, outside, unknown = [], 0, 0
+            cutoff = core.day_start(requested)
             for row in base["items"]:
                 membership = scope["messages"].get(row["id"])
                 if (membership is None or not membership.get("folder_id") or
@@ -183,16 +186,25 @@ class MailService:
                 if identifier not in folders:
                     outside += 1
                     continue
-                items.append({**row, "folder_id": identifier, "folder_path": folders[identifier]["path"],
+                received = membership.get("received_unix")
+                if received is not None and received < cutoff:
+                    continue
+                items.append({**row, "received_unix": received,
+                              "received_time_status": membership.get("received_time_status", "missing"),
+                              "received_time_method": membership.get("received_time_method"),
+                              "folder_id": identifier, "folder_path": folders[identifier]["path"],
                               "folder_status": membership["folder_status"],
                               "folder_evidence": membership.get("evidence", {}),
                               "mailbox_state": "inbox_or_sent_latest_local_observation"})
+            items.sort(key=core.received_sort_key)
             folder_rows = sorted(folders.values(), key=lambda f: (f["scope_root_id"], f["path"], f["id"]))
             cached_message_counts = Counter(row["folder_id"] for row in items)
             for folder in folder_rows:
                 folder["cached_messages"] = cached_message_counts[folder["id"]]
-            summary = {"scope_from_date": requested, "timezone": "Asia/Singapore", "date_basis": "sent_at",
+            summary = {"scope_from_date": requested, "timezone": "Asia/Singapore", "date_basis": "received_at",
                        "messages": len(items), "folders": len(folder_rows),
+                       "received_time_known": sum(r["received_unix"] is not None for r in items),
+                       "received_time_unknown": sum(r["received_unix"] is None for r in items),
                        "inbox_roots": sum(bool(f.get("is_inbox")) for f in folder_rows),
                        "sent_roots": sum(bool(f.get("is_sent")) for f in folder_rows),
                        "outside_scope_excluded": outside, "unresolved_folder_excluded": unknown,
@@ -482,7 +494,7 @@ class MailService:
         self._metadata(result, index)
         if result["next_cursor"]:
             result["next_cursor"] = f"v1.{index['snapshot']}.{folder_signature}.{result['next_cursor']}"
-        result.update(date_basis="sent_at", timezone="Asia/Singapore", folder_id=folder_id,
+        result.update(date_basis="received_at", timezone="Asia/Singapore", folder_id=folder_id,
                       include_subfolders=descendants, folder_scope_complete=False)
         return result
 

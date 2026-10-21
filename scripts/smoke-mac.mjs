@@ -16,7 +16,7 @@ async function run() {
   stage = 'health';
   const health = await call('health');
   assert.equal(health.backend, 'mac-cache');
-  assert.equal(health.date_basis, 'sent_at');
+  assert.equal(health.date_basis, 'received_at');
   report.health = true;
   stage = 'folder_tree';
   const stores = await call('stores');
@@ -46,25 +46,26 @@ async function run() {
   const selection = { folder: inbox.id };
   const list = await call('messages', { ...selection, limit: 200 });
   assert.ok(list.messages.length > 0, 'Inbox must have a cached test message');
-  assert.ok(list.messages.every(row => row.received_at === null && row.unread === null));
+  assert.ok(list.messages.every(row => row.unread === null));
   const sample = list.messages[0];
+  assert.ok(sample.received_at, "Newest Inbox sample must have verified receipt time");
   stage = 'today';
   for (const [label, folder] of [['inbox', inbox], ['sent', sent]]) {
     if (!folder) { report[`today_${label}_sample`] = null; continue; }
     const today = await call('today', { folder: folder.id, limit: 5 });
-    assert.equal(today.date_basis, 'sent_at');
+    assert.equal(today.date_basis, 'received_at');
     assert.equal(today.timezone, 'Asia/Singapore');
     const start = Date.parse(`${today.date}T00:00:00+08:00`);
-    assert.ok(today.messages.every(row => Date.parse(row.sent_at) >= start && Date.parse(row.sent_at) < start + 86400000));
+    assert.ok(today.messages.every(row => Date.parse(row.received_at) >= start && Date.parse(row.received_at) < start + 86400000));
     const repeated = await call('today', { folder: folder.id, date: today.date, limit: 5 });
     assert.deepEqual(repeated.messages.map(row => row.id), today.messages.map(row => row.id));
     report[`today_${label}_sample`] = today.messages.length;
   }
   stage = 'search_and_dates';
-  const ranged = await call('messages', { ...selection, after: sample.sent_at, limit: 1 });
+  const ranged = await call('messages', { ...selection, after: sample.received_at, limit: 1 });
   assert.equal(ranged.messages[0]?.id, sample.id);
-  const excluded = await call('messages', { ...selection, before: sample.sent_at, limit: 5 });
-  assert.ok(excluded.messages.every(row => Date.parse(row.sent_at) < Date.parse(sample.sent_at)));
+  const excluded = await call('messages', { ...selection, before: sample.received_at, limit: 5 });
+  assert.ok(excluded.messages.every(row => Date.parse(row.received_at) < Date.parse(sample.received_at)));
   if (sample.subject) {
     const match = await call('search', { ...selection, query: sample.subject.slice(0, 500), limit: 1 });
     assert.equal(match.messages[0]?.id, sample.id);
@@ -148,7 +149,7 @@ async function run() {
       assert.equal(tools.tools.length, 9);
       const mail = await client.callTool({ name: 'outlook_today', arguments: { ...selection, limit: 1 } });
       assert.equal(mail.isError, undefined);
-      assert.equal(mail.structuredContent.date_basis, 'sent_at');
+      assert.equal(mail.structuredContent.date_basis, 'received_at');
       const body = await client.callTool({ name: 'outlook_read', arguments: { id: sample.id, max_chars: 100 } });
       assert.equal(body.isError, undefined);
       assert.ok(Object.hasOwn(body.structuredContent.body, 'available'));

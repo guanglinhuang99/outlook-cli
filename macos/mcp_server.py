@@ -101,11 +101,11 @@ _SEARCH_PROPERTIES = {
     ),
     "field": _string("Search field.", enum=("subject", "sender", "preview", "all"), default="subject"),
     "from_date": _string(
-        "Inclusive sent date in YYYY-MM-DD form, interpreted in Asia/Singapore.",
+        "Inclusive received date in YYYY-MM-DD form, interpreted in Asia/Singapore.",
         max_length=MAX_DATE_LENGTH,
     ),
     "to_date": _string(
-        "Inclusive sent date upper bound in YYYY-MM-DD form, interpreted in Asia/Singapore; the whole day is included.",
+        "Inclusive received date upper bound in YYYY-MM-DD form, interpreted in Asia/Singapore; the whole day is included.",
         max_length=MAX_DATE_LENGTH,
     ),
     "folder_id": _string(
@@ -121,7 +121,7 @@ _SEARCH_PROPERTIES = {
 TOOL_SCHEMAS = (
     _tool(
         "outlook_local_status",
-        "Return status for the read-only snapshot of Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Cache may be incomplete; dates are sent dates in Asia/Singapore.",
+        "Return status for the read-only snapshot of Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Cache may be incomplete; dates are received dates in Asia/Singapore.",
         {},
     ),
     _tool(
@@ -133,10 +133,10 @@ TOOL_SCHEMAS = (
     ),
     _tool(
         "outlook_local_refresh",
-        "Refresh the read-only snapshot for Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Cache may be incomplete; from_date is a sent date in Asia/Singapore.",
+        "Refresh the read-only snapshot for Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Cache may be incomplete; from_date is a received date in Asia/Singapore.",
         {
             "from_date": _string(
-                "Optional inclusive sent date in YYYY-MM-DD form, interpreted in Asia/Singapore.",
+                "Optional inclusive received date in YYYY-MM-DD form, interpreted in Asia/Singapore.",
                 max_length=MAX_DATE_LENGTH,
             )
         },
@@ -145,14 +145,14 @@ TOOL_SCHEMAS = (
     ),
     _tool(
         "outlook_local_search",
-        "Search messages only in Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Cache may be incomplete; date filters use the sent date in Asia/Singapore and to_date is inclusive.",
+        "Search messages only in Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Cache may be incomplete; date filters use the received date in Asia/Singapore and to_date is inclusive.",
         _SEARCH_PROPERTIES,
         read_only_hint=False,
         destructive_hint=True,
     ),
     _tool(
         "outlook_local_today",
-        "List today's locally cached mail metadata from Inbox/Sent Items and known descendants; Deleted is excluded. Today uses the sent date in Asia/Singapore, not received time. Returns IDs, subjects, previews and body status; use read or messages_bundle for bodies. Cache may be incomplete. A cursor keeps the first page's date across midnight.",
+        "List today's locally cached mail metadata from Inbox/Sent Items and known descendants; Deleted is excluded. Today uses verified last delivery time in Asia/Singapore. Missing receipt times are excluded and counted. Returns IDs, subjects, previews and body status; use read or messages_bundle for bodies. Cache may be incomplete. A cursor keeps the first page's date across midnight.",
         {
             "folder_id": _SEARCH_PROPERTIES["folder_id"],
             "include_subfolders": _SEARCH_PROPERTIES["include_subfolders"],
