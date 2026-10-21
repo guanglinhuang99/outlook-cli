@@ -16,3 +16,7 @@ local-stores.json
 /MCP-SETUP.txt
 /mcp-config.json
 /installation.json
+__pycache__/
+*.py[cod]
+*.hxd
+*.xmlgz

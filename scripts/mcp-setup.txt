@@ -5,7 +5,7 @@ Outlook Local：MCP 安装和接入
 一、服务端已经安装完成
 install.cmd 已安装专用 Node.js、MCP 服务端依赖和 Outlook 读取程序，
 并生成这台电脑的 MCP 配置。无需另外安装 npm 包，也不需要 AI API Key。
-安装器自动验证 stdio 握手和 8 个只读工具是否可用。
+安装器自动验证 stdio 握手和 9 个只读工具是否可用。
 这里只安装邮件服务；调用它的 Agent 客户端由你自行选择。
 
 二、把 MCP 添加到 Agent
@@ -35,7 +35,7 @@ install.cmd 已安装专用 Node.js、MCP 服务端依赖和 Outlook 读取程�
 并通过 outlook_health 检查真实后台服务和邮箱后端，不读取邮件正文。
 成功时显示 "mcp": "ready"，backend 为 com 或 local。
 工具列表应包含 outlook_health、outlook_stores、outlook_folders、
-outlook_messages、outlook_search、outlook_read、outlook_attachments、
+outlook_messages、outlook_search、outlook_today、outlook_read、outlook_attachments、
 outlook_read_attachment。可让 Agent 调用 outlook_health 做首次检查。
 
 四、常见问题

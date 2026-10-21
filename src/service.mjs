@@ -1,11 +1,13 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { writeFile, readFile, unlink } from 'node:fs/promises';
+import { readFile, unlink } from 'node:fs/promises';
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { BackendRouter } from './backend.mjs';
 import { validateCall } from './tools.mjs';
 import { createMcp } from './mcp.mjs';
-import { prepareRuntime, statePath, port } from './runtime.mjs';
+import { prepareRuntime, publishState, statePath, port } from './runtime.mjs';
+import { MacCacheBridge } from './mac.mjs';
+import { canonicalMacProtectedRoots, resolveMacProfile } from './mac-paths.mjs';
 
 export function authenticate(req, token, listenPort) {
   if (![ `127.0.0.1:${listenPort}`, `localhost:${listenPort}` ].includes(req.headers.host)) return false;
@@ -34,16 +36,25 @@ function json(res, status, data) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
   res.end(JSON.stringify(data));
 }
-export async function startService({ bridge = new BackendRouter(), listenPort = port, token = randomBytes(32).toString('hex'), persist = true } = {}) {
+export async function startService({ bridge, listenPort = port, token = randomBytes(32).toString('hex'), persist = true } = {}) {
   const startedAt = new Date().toISOString();
+  const resolvedMacProfile = process.platform === 'darwin'
+    ? await resolveMacProfile({ strict: bridge == null })
+    : undefined;
+  const protectedMailRoots = persist && process.platform === 'darwin'
+    ? await canonicalMacProtectedRoots({ profileDir: resolvedMacProfile, autoDiscover: false })
+    : undefined;
+  const serviceBridge = bridge ?? (process.platform === 'darwin'
+    ? new BackendRouter({ mac: new MacCacheBridge({ profileDir: resolvedMacProfile }) })
+    : new BackendRouter());
   let closing = false;
   const sockets = new Set();
-  const invoke = (method, params) => bridge.call(method, validateCall(method, params));
+  const invoke = (method, params) => serviceBridge.call(method, validateCall(method, params));
   const server = http.createServer(async (req, res) => {
     try {
       if (!authenticate(req, token, listenPort)) return json(res, 403, { error: { code: 'FORBIDDEN', message: 'Local bearer authentication required' } });
       const url = req.url;
-      if (url === '/status' && req.method === 'GET') return json(res, 200, { service: 'outlook-local', version: '0.2.1', pid: process.pid, port: listenPort, started_at: startedAt, queue_length: bridge.queue.length, busy: Boolean(bridge.active), read_only: true });
+      if (url === '/status' && req.method === 'GET') return json(res, 200, { service: 'outlook-local', version: '0.3.0', pid: process.pid, port: listenPort, started_at: startedAt, queue_length: serviceBridge.queue.length, busy: Boolean(serviceBridge.active), read_only: true });
       if (closing) return json(res, 503, { error: { code: 'STOPPING', message: 'Service is stopping' } });
       if (url === '/shutdown' && req.method === 'POST') {
         await parseBody(req);
@@ -83,7 +94,7 @@ export async function startService({ bridge = new BackendRouter(), listenPort = 
   async function close() {
     if (closing) return;
     closing = true;
-    bridge.close();
+    serviceBridge.close();
     server.close();
     for (const socket of sockets) socket.destroy();
     if (persist) {
@@ -96,7 +107,11 @@ export async function startService({ bridge = new BackendRouter(), listenPort = 
   if (persist) await prepareRuntime();
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(listenPort, '127.0.0.1', resolve); });
   if (persist) {
-    try { await writeFile(statePath, JSON.stringify({ port: listenPort, token, pid: process.pid, startedAt }), { mode: 0o600 }); }
+    try {
+      const state = { port: listenPort, token, pid: process.pid, startedAt };
+      if (protectedMailRoots) state.protected_mail_roots = protectedMailRoots;
+      await publishState(state);
+    }
     catch (error) { await close(); throw error; }
   }
   return { server, token, close };

@@ -1,13 +1,14 @@
 {
   "name": "outlook-local-service",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Read-only Windows classic Outlook service, CLI and MCP; no AI runtime",
+  "description": "Read-only Windows and macOS Outlook service, CLI and MCP; no AI runtime",
   "engines": { "node": ">=22" },
   "bin": { "outlook-local": "bin/outlook.mjs" },
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "test:mac": "python3 -m unittest discover -s macos -p 'test*.py'",
     "start": "node bin/outlook.mjs start",
     "status": "node bin/outlook.mjs status",
     "stop": "node bin/outlook.mjs stop",

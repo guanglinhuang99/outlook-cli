@@ -58,7 +58,7 @@ if (attached) {
   }
 }
 // Exercise automatic transition with a simulated unavailable COM and the REAL reader.
-const router = new BackendRouter({ com: { queue: [], active: false, close() {}, async call() { throw localError('OUTLOOK_UNAVAILABLE', 'simulated closed session'); } }, local: new LocalFileBridge() });
+const router = new BackendRouter({ platform: 'win32', com: { queue: [], active: false, close() {}, async call() { throw localError('OUTLOOK_UNAVAILABLE', 'simulated closed session'); } }, local: new LocalFileBridge() });
 try {
   const automatic = await router.call('health');
   assert.equal(automatic.backend, 'local');

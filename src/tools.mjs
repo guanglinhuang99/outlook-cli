@@ -4,20 +4,28 @@ const integer = (min, max, value) => z.number().int().min(min).max(max).default(
 const opaqueId = z.string().min(8).max(16000).regex(/^[A-Za-z0-9_-]+$/);
 const folder = z.union([z.enum(['inbox', 'sent', 'drafts', 'deleted', 'junk', 'outbox']), opaqueId]).default('inbox');
 const page = { offset: integer(0, 10000000, 0), limit: integer(1, 200, 25) };
+const todayDate = z.iso.date()
+  .refine(value => value >= '1970-01-01' && value <= '9999-12-30', {
+    message: 'date must be between 1970-01-01 and 9999-12-30'
+  });
 const filters = {
   folder,
   ...page,
   unread: z.boolean().optional(),
-  after: z.iso.datetime({ offset: true }).optional().describe('Inclusive ISO 8601 received time with timezone'),
-  before: z.iso.datetime({ offset: true }).optional().describe('Exclusive ISO 8601 received time with timezone'),
+  after: z.iso.datetime({ offset: true }).optional().describe('Inclusive ISO timestamp. Both platforms use verified received_at; missing receipt times are excluded from date-filtered results. Check date_basis in the result.'),
+  before: z.iso.datetime({ offset: true }).optional().describe('Exclusive ISO timestamp, using the same backend date_basis as after.'),
   scan_limit: integer(1, 2000, 500)
 };
-const define = (description, shape) => ({ description, schema: z.strictObject({ ...shape, backend: z.enum(['auto', 'com', 'local']).optional().describe('auto: use running Outlook, otherwise local OST/PST. IDs are backend-specific; local reads expose cached data only.') }) });
+const define = (description, shape) => ({ description, schema: z.strictObject({ ...shape, backend: z.enum(['auto', 'com', 'local', 'mac-cache']).optional().describe('auto selects Windows COM/local OST/PST or macOS HxStore cache by platform. IDs are backend-specific; cache reads can be incomplete.') }) });
 export const definitions = {
   health: define('Check Outlook or local-file backend readiness, active backend and cache limitations.', {}),
   stores: define('List Outlook stores with opaque root folder IDs.', {}),
   folders: define('List immediate child folders. Use a store root_id or a folder id; paginated, not recursive.', { folder, ...page }),
   messages: define('List newest mail metadata in one folder. next_offset counts examined items; mailbox changes may shift pages.', filters),
+  today: define('List today\'s mail in one folder using Asia/Singapore dates. Both platforms filter received_at; macOS uses verified LastDeliveryTime. Cached data may be incomplete. For subsequent offset pages, pass the returned date to preserve the first page\'s day across midnight.', {
+    folder, ...page, unread: z.boolean().optional(), scan_limit: integer(1, 2000, 500),
+    date: todayDate.optional().describe('Continuation day from the previous result; omit on the first page to use today.')
+  }),
   search: define('Case-insensitive substring search in subject and sender in ONE folder, optionally body. Bounded scan; follow next_offset until null. No claim of whole-mailbox coverage.', {
     ...filters, query: z.string().min(1).max(500), search_body: z.boolean().default(false)
   }),
