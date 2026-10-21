@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 
 sys.path.insert(0, str(Path(__file__).parent))
+import hxcontainer  # noqa: E402
 import outlook_local  # noqa: E402
+from test_hxcontainer import make_block, store_header  # noqa: E402
 from test_hxrecords import (  # noqa: E402
     attachment_frame,
     exchange_entry,
@@ -112,8 +114,19 @@ class OutlookLocalTests(unittest.TestCase):
         )
         self.iter_blocks_mock = self.iter_blocks_patch.start()
 
+        def read_block_at_stub(_source, offset):
+            if offset != self.block.offset:
+                raise ValueError("unknown synthetic block")
+            return hxcontainer.Block(self.block.offset, 8, self.block.data)
+
+        self.read_block_patch = patch.object(
+            hxcontainer, "read_block_at", side_effect=read_block_at_stub
+        )
+        self.read_block_patch.start()
+
     def tearDown(self):
         self.iter_blocks_patch.stop()
+        self.read_block_patch.stop()
         self.temporary.cleanup()
 
     def snapshot(self):
@@ -123,6 +136,53 @@ class OutlookLocalTests(unittest.TestCase):
         result = outlook_local.make_snapshot(args)
         directory, index = outlook_local.load_index(str(self.state))
         return result, directory, index
+
+    def deferred_snapshot(self):
+        args = SimpleNamespace(
+            profile=str(self.profile), state=str(self.state), from_date="2000-01-01",
+            freeze_bodies=False,
+        )
+        result = outlook_local.make_snapshot(args)
+        directory, index = outlook_local.load_index(str(self.state))
+        return result, directory, index
+
+    @staticmethod
+    def flaky_payload_temporary(fail_number):
+        """Patch payload temp writes once, after leaving a partial file."""
+        original = outlook_local.tempfile.NamedTemporaryFile
+        attempts = {"payload": 0}
+
+        def factory(*args, **kwargs):
+            handle = original(*args, **kwargs)
+            if kwargs.get("prefix") != ".payload-":
+                return handle
+            attempts["payload"] += 1
+            if attempts["payload"] != fail_number:
+                return handle
+
+            class PartialWriter:
+                def __init__(self, wrapped):
+                    self.wrapped = wrapped
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exit_args):
+                    return self.wrapped.__exit__(*exit_args)
+
+                def write(self, data):
+                    partial = data[:max(1, len(data) // 2)]
+                    self.wrapped.write(partial)
+                    raise OSError("simulated interrupted payload write")
+
+                def __getattr__(self, name):
+                    return getattr(self.wrapped, name)
+
+            return PartialWriter(handle)
+
+        return patch.object(
+            outlook_local.tempfile, "NamedTemporaryFile", side_effect=factory
+        ), attempts
 
     def profile_tree(self):
         result = {}
@@ -450,6 +510,166 @@ class OutlookLocalTests(unittest.TestCase):
         self.assertEqual(result["body"]["text"], PREVIEW + "。")
         self.assertTrue(result["body"]["truncated"])
 
+    def _assert_deferred_payload_retry_after_interruption(self, fail_number):
+        _, directory, index = self.deferred_snapshot()
+        first = self.row(index, "<first@example.test>")
+        before = self.profile_tree()
+        flaky, attempts = self.flaky_payload_temporary(fail_number)
+        with flaky:
+            try:
+                first_read = outlook_local.read_message(directory, index, first["id"], 20_000)
+            except OSError:
+                first_read = None
+        self.assertEqual(attempts["payload"], fail_number)
+        if first_read is not None:
+            self.assertNotEqual(first_read["body"]["status"], "cached_html")
+        self.assertEqual(list((directory / "payloads").glob(".payload-*")), [])
+        self.assertEqual(list((directory / "textpayloads").glob(".payload-*")), [])
+
+        result = outlook_local.read_message(directory, index, first["id"], 20_000)
+        raw = self.body_source.read_bytes()
+        text, _ = outlook_local.decode_body(raw)
+        self.assertEqual(result["body"]["status"], "cached_html")
+        self.assertEqual(result["body"]["sha256"], outlook_local.sha(raw))
+        self.assertEqual(result["body"]["text_sha256"], outlook_local.sha(
+            text.encode("utf-16-le", errors="surrogatepass")
+        ))
+        self.assertIn(PREVIEW, result["body"]["text"])
+        self.assertEqual(self.profile_tree(), before)
+
+    def test_deferred_raw_payload_write_interruption_recovers_on_retry(self):
+        self._assert_deferred_payload_retry_after_interruption(fail_number=1)
+
+    def test_deferred_text_payload_write_interruption_recovers_on_retry(self):
+        self._assert_deferred_payload_retry_after_interruption(fail_number=2)
+
+    def test_deferred_partial_hash_named_payloads_are_repaired(self):
+        _, directory, index = self.deferred_snapshot()
+        first = self.row(index, "<first@example.test>")
+        raw = self.body_source.read_bytes()
+        text, _ = outlook_local.decode_body(raw)
+        text_bytes = text.encode("utf-16-le", errors="surrogatepass")
+        raw_path = directory / "payloads" / outlook_local.sha(raw)
+        text_path = directory / "textpayloads" / outlook_local.sha(text_bytes)
+        raw_path.write_bytes(raw[:max(1, len(raw) // 3)])
+        text_path.write_bytes(text_bytes[:max(2, len(text_bytes) // 3)])
+        raw_path.chmod(0o600)
+        text_path.chmod(0o600)
+        before = self.profile_tree()
+
+        result = outlook_local.read_message(directory, index, first["id"], 20_000)
+
+        self.assertEqual(result["body"]["status"], "cached_html")
+        self.assertEqual(raw_path.read_bytes(), raw)
+        self.assertEqual(text_path.read_bytes(), text_bytes)
+        self.assertEqual(raw_path.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(text_path.stat().st_mode & 0o777, 0o400)
+        self.assertEqual(result["body"]["sha256"], outlook_local.sha(raw))
+        self.assertEqual(result["body"]["text_sha256"], outlook_local.sha(text_bytes))
+        self.assertIn(PREVIEW, result["body"]["text"])
+        self.assertEqual(self.profile_tree(), before)
+
+    def test_deferred_unavailable_external_marker_returns_metadata_without_source_read(self):
+        unsafe_reference = "~/Files/EFMData/../unsafe-body.html"
+        header_key, body_key = 0xA21, 0xA22
+        self.set_block_data(
+            self.inline_header(header_key, "<unsafe-body@example.test>", PREVIEW, target=body_key),
+            serialized_frame(202, body_key, unsafe_reference.encode("utf-16le") + b"\0\0"),
+        )
+        _, directory, index = self.deferred_snapshot()
+        row = self.row(index, "<unsafe-body@example.test>")
+        marker = row["body"]["deferred"]["external_fingerprints"][unsafe_reference]
+        self.assertTrue(marker["unavailable"])
+        self.assertIn("unsafe cache path", marker["error"])
+        before = self.profile_tree()
+
+        with patch.object(outlook_local, "stable_read",
+                          side_effect=AssertionError("unsafe external source was read")):
+            result = outlook_local.read_message(directory, index, row["id"], 20_000)
+
+        self.assertEqual(result["subject"], row["subject"])
+        self.assertEqual(result["body"]["status"], "unavailable")
+        self.assertEqual(result["body"]["checks"][0]["path"], unsafe_reference)
+        self.assertEqual(result["body"]["checks"][0]["status"], "unavailable")
+        self.assertIn("unsafe cache path", result["body"]["checks"][0]["error"])
+        self.assertEqual(self.profile_tree(), before)
+
+    def test_deferred_small_source_copy_checks_scratch_space_before_write(self):
+        before = self.profile_tree()
+        required = self.source_cache.stat().st_size
+        with patch.object(outlook_local.shutil, "disk_usage") as disk_usage:
+            disk_usage.return_value.free = max(0, required - 1)
+            with self.assertRaisesRegex(ValueError, "insufficient scratch space"):
+                self.deferred_snapshot()
+        self.assertFalse(any(self.state.glob(".building-*")))
+        self.assertEqual(self.profile_tree(), before)
+
+    def test_source_read_budget_debits_block_once_and_consumes_failed_read(self):
+        _, directory, index = self.deferred_snapshot()
+        offset = str(self.block.offset)
+        size = index["source_block_bytes"][offset]
+        cache = {}
+        budget = {"remaining": size}
+        with outlook_local.source_read_budget(budget):
+            outlook_local._read_source_block(directory, index, self.block.offset, cache)
+            self.assertEqual(budget["remaining"], 0)
+            outlook_local._read_source_block(directory, index, self.block.offset, cache)
+            self.assertEqual(budget["remaining"], 0)
+
+        failed_budget = {"remaining": size}
+        with patch.object(hxcontainer, "read_block_at", side_effect=ValueError("synthetic read failure")):
+            with outlook_local.source_read_budget(failed_budget):
+                with self.assertRaisesRegex(ValueError, "synthetic read failure"):
+                    outlook_local._read_source_block(directory, index, self.block.offset, {})
+        self.assertEqual(failed_budget["remaining"], 0)
+
+    def test_decode_body_charges_non_gzip_decoded_bytes(self):
+        raw = f"<html><body>{PREVIEW}</body></html>".encode()
+        budget = {"remaining": len(raw) - 1}
+        with outlook_local.source_read_budget(budget):
+            with self.assertRaises(outlook_local.SourceBudgetExceeded):
+                outlook_local.decode_body(raw)
+        self.assertEqual(budget["remaining"], len(raw) - 1)
+
+        budget = {"remaining": len(raw)}
+        with outlook_local.source_read_budget(budget):
+            text, encoding = outlook_local.decode_body(raw)
+        self.assertEqual(encoding, "html")
+        self.assertIn(PREVIEW, text)
+        self.assertEqual(budget["remaining"], 0)
+
+    def test_oversized_gzip_without_bundle_budget_keeps_prototype_error(self):
+        raw = b"<html><body>" + b"x" * 64 + b"</body></html>"
+        with patch.object(outlook_local, "MAX_BODY", 32):
+            with self.assertRaisesRegex(ValueError, "inflated body exceeds prototype limit"):
+                outlook_local.decode_body(gzip.compress(raw))
+
+    def test_deferred_external_gzip_budget_bounds_inflation_without_sidecar(self):
+        html = (
+            f"<html><body>{GZIP_PREVIEW}"
+            + "x" * (256 * 1024)
+            + "</body></html>"
+        ).encode()
+        compressed = gzip.compress(html)
+        self.assertLess(len(compressed), len(html))
+        self.gzip_body_source.write_bytes(compressed)
+
+        _, directory, index = self.deferred_snapshot()
+        row = self.row(index, "<second@example.test>")
+        block_size = index["source_block_bytes"][str(self.block.offset)]
+        budget = {"remaining": block_size + len(compressed) + 1024}
+        with outlook_local.source_read_budget(budget):
+            with self.assertRaises(outlook_local.SourceBudgetExceeded):
+                outlook_local.read_message(directory, index, row["id"], 20_000)
+        self.assertEqual(budget["remaining"], 0)
+        self.assertIsNone(outlook_local._read_deferred_cache(directory, row))
+
+        budget = {"remaining": block_size + len(compressed) + len(html)}
+        with outlook_local.source_read_budget(budget):
+            result = outlook_local.read_message(directory, index, row["id"], 20_000)
+        self.assertEqual(result["body"]["status"], "cached_html")
+        self.assertIn(GZIP_PREVIEW, result["body"]["text"])
+
     def test_asset_changes_refresh_snapshot_without_hxstore_change(self):
         first_result, _, first_index = self.snapshot()
         first_row = self.row(first_index, "<first@example.test>")
@@ -754,6 +974,18 @@ class OutlookLocalTests(unittest.TestCase):
         payload.write_bytes(b"corrupted-frozen-body")
         with self.assertRaisesRegex(ValueError, "checksum mismatch"):
             outlook_local.read_message(directory, index, first["id"], 20_000)
+
+    def test_frozen_body_remains_paginable_after_source_changes(self):
+        _, directory, index = self.snapshot()
+        first = self.row(index, "<first@example.test>")
+        first_page = outlook_local.read_body_page(directory, index, first["id"], 0, 2)
+        self.assertIsNotNone(first_page["next_offset"])
+
+        self.body_source.write_bytes(b"<html><body>changed after freeze</body></html>")
+        second_page = outlook_local.read_body_page(
+            directory, index, first["id"], first_page["next_offset"], 20_000
+        )
+        self.assertIn("冻结后仍可读取", first_page["text"] + second_page["text"])
 
     def test_frozen_text_payload_checksum_failure_is_reported(self):
         _, directory, index = self.snapshot()
@@ -1184,6 +1416,58 @@ class OutlookLocalTests(unittest.TestCase):
         self.assertIn("完整历史正文🧪", result["body"]["text"])
         self.assertNotIn("只有本次回复", result["body"]["text"])
         self.assertEqual(self.profile_tree(), before)
+
+    def test_deferred_adjacent_cross_key_inline_bodies_use_real_frozen_source(self):
+        # The normal fixture uses a synthetic block reader for fast parser
+        # tests. Stop both patches here so deferred recovery exercises the
+        # bounded HxStore reader against the private source.hxd copy.
+        self.iter_blocks_patch.stop()
+        self.read_block_patch.stop()
+        try:
+            first_key, first_body_key = 0xA11, 0xA12
+            second_key, second_body_key = 0xA13, 0xA14
+            first_preview = "甲邮件正文预览"
+            second_preview = "乙邮件正文预览"
+            first_html = f"<html><body>{first_preview}。甲邮件完整正文。</body></html>"
+            second_html = f"<html><body>{second_preview}。乙邮件完整正文。</body></html>"
+            block_data = b"".join((
+                self.inline_header(first_key, "<deferred-first@example.test>",
+                                   first_preview, target=first_body_key),
+                inline_body_frame(first_body_key, first_html),
+                self.inline_header(second_key, "<deferred-second@example.test>",
+                                   second_preview, target=second_body_key),
+                inline_body_frame(second_body_key, second_html),
+            ))
+            self.source_cache.write_bytes(store_header() + make_block(block_data))
+            before = self.profile_tree()
+            summary = outlook_local.make_snapshot(SimpleNamespace(
+                profile=str(self.profile), state=str(self.state), from_date="2000-01-01",
+                freeze_bodies=False,
+            ))
+            directory, index = outlook_local.load_index(str(self.state))
+            self.assertEqual(summary["body_mode"], "deferred")
+            first = self.row(index, "<deferred-first@example.test>")
+            second = self.row(index, "<deferred-second@example.test>")
+            self.assertEqual(first["body"]["status"], "deferred")
+            self.assertEqual(second["body"]["status"], "deferred")
+            self.assertEqual(first["body"]["diagnosis"]["inline_candidates"], 1)
+            self.assertEqual(second["body"]["diagnosis"]["inline_candidates"], 1)
+            self.assertEqual((directory / "source.hxd").read_bytes(), self.source_cache.read_bytes())
+
+            with patch.object(outlook_local, "freeze_body", wraps=outlook_local.freeze_body) as freeze:
+                first_read = outlook_local.read_message(directory, index, first["id"], 20_000)
+                first_again = outlook_local.read_message(directory, index, first["id"], 20_000)
+                second_read = outlook_local.read_message(directory, index, second["id"], 20_000)
+            self.assertEqual(freeze.call_count, 2)
+            self.assertIn("甲邮件完整正文", first_read["body"]["text"])
+            self.assertNotIn("乙邮件完整正文", first_read["body"]["text"])
+            self.assertEqual(first_again["body"]["text"], first_read["body"]["text"])
+            self.assertIn("乙邮件完整正文", second_read["body"]["text"])
+            self.assertNotIn("甲邮件完整正文", second_read["body"]["text"])
+            self.assertEqual(self.profile_tree(), before)
+        finally:
+            self.iter_blocks_patch.start()
+            self.read_block_patch.start()
 
     def test_corrupt_gzip_inline_body_is_unavailable_without_aborting_snapshot(self):
         corrupted = bytearray(gzip.compress(f"<html><body>{PREVIEW}</body></html>".encode()))

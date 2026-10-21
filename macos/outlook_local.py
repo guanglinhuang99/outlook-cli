@@ -5,8 +5,11 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict, defaultdict
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime, time, timedelta, timezone
 import errno
+import fcntl
 import gzip
 import hashlib
 from html.parser import HTMLParser
@@ -28,7 +31,7 @@ from hxrecords import (entry_ids, file_references, iter_frames, normalize_subjec
                        parse_attachment, parse_header, parse_inline_body, typed_references)
 
 
-VERSION = 17
+VERSION = 19
 MAX_BODY = 64 * 1024 * 1024
 MAX_ATTACHMENT = 256 * 1024 * 1024
 MAX_IN_MEMORY_SOURCE = 64 * 1024**2
@@ -42,6 +45,40 @@ ZONE = ZoneInfo("Asia/Singapore")
 
 _verified_raw_payloads = OrderedDict()
 _verified_text_chunks = OrderedDict()
+_source_read_budget = ContextVar("outlook_source_read_budget", default=None)
+
+
+class SourceBudgetExceeded(ValueError):
+    """The bounded source/body read budget cannot cover another read."""
+
+
+@contextmanager
+def source_read_budget(budget):
+    """Temporarily bound decoded HxStore bytes for one bundle read."""
+    if not isinstance(budget, dict) or type(budget.get("remaining")) is not int \
+            or budget["remaining"] < 0:
+        raise ValueError("invalid bundle source byte budget")
+    token = _source_read_budget.set(budget)
+    try:
+        yield budget
+    finally:
+        _source_read_budget.reset(token)
+
+
+def _debit_source_budget(size, field="remaining"):
+    """Charge bounded source or cache-verification work before I/O."""
+    budget = _source_read_budget.get()
+    if budget is None or (field != "remaining" and field not in budget):
+        return
+    remaining = budget.get(field) if isinstance(budget, dict) else None
+    label = "cache verification" if field == "verification_remaining" else "source"
+    if type(size) is not int or size < 0 or type(remaining) is not int or remaining < 0:
+        if isinstance(budget, dict):
+            budget[field] = 0
+        raise SourceBudgetExceeded(f"bundle {label} byte budget exhausted")
+    if size > remaining:
+        raise SourceBudgetExceeded(f"bundle {label} byte budget exhausted")
+    budget[field] = remaining - size
 
 
 def sha(data):
@@ -271,12 +308,36 @@ class BodyText(HTMLParser):
 
 
 def decode_body(data):
+    restore_budget = None
+    budget_limited = False
     if data.startswith(b"\x1f\x8b"):
+        budget = _source_read_budget.get()
+        if budget is None:
+            maximum = MAX_BODY
+        else:
+            remaining = budget.get("remaining") if isinstance(budget, dict) else None
+            if type(remaining) is not int or remaining < 0:
+                if isinstance(budget, dict):
+                    budget["remaining"] = 0
+                raise SourceBudgetExceeded("bundle source byte budget exhausted")
+            # Reserve the entire bounded allowance before inflating.  A
+            # corrupt or overlarge stream therefore cannot be retried for
+            # free; only a successful bounded decode returns unused bytes.
+            budget_limited = remaining < MAX_BODY
+            maximum = min(MAX_BODY, remaining)
+            budget["remaining"] = 0
         with gzip.GzipFile(fileobj=io.BytesIO(data)) as handle:
-            raw = handle.read(MAX_BODY + 1)
+            raw = handle.read(maximum + 1)
+        if len(raw) > maximum:
+            if budget_limited:
+                raise SourceBudgetExceeded("bundle source byte budget exhausted")
+            raise ValueError("inflated body exceeds prototype limit")
+        if budget is not None:
+            restore_budget = remaining - len(raw)
         encoding = "gzip-html"
     else:
         raw, encoding = data, "html"
+        _debit_source_budget(len(raw))
     if len(raw) > MAX_BODY:
         raise ValueError("inflated body exceeds prototype limit")
     html = raw.decode("utf-8-sig", errors="strict")
@@ -286,6 +347,8 @@ def decode_body(data):
         raise ValueError("unsupported body format")
     parser = BodyText()
     parser.feed(html)
+    if restore_budget is not None:
+        _source_read_budget.get()["remaining"] = restore_budget
     return "".join(parser.parts).strip(), encoding
 
 
@@ -295,16 +358,37 @@ def folded(value):
     return "".join(c for c in value.casefold() if not c.isspace() and c not in "\ufeff\u200b")
 
 
-def frozen_payload(directory, data):
+def _atomic_payload(root, data, label):
     name = sha(data)
-    target = directory / "payloads" / name
-    target.parent.mkdir(exist_ok=True, mode=0o700)
-    _private_directory(target.parent, "frozen body payload root")
-    if not target.exists():
-        with target.open("xb") as handle:
+    root.mkdir(exist_ok=True, mode=0o700)
+    _private_directory(root, label + " root")
+    target = root / name
+    if target.exists() or target.is_symlink():
+        _private_file(target, label)
+        if target.stat().st_size == len(data):
+            with target.open("rb") as handle:
+                if hashlib.file_digest(handle, "sha256").hexdigest() == name:
+                    return name
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=root, prefix=".payload-", delete=False) as handle:
+            temporary = Path(handle.name)
             handle.write(data)
-        target.chmod(0o400)
+            handle.flush()
+            os.fsync(handle.fileno())
+        with temporary.open("rb") as handle:
+            if hashlib.file_digest(handle, "sha256").hexdigest() != name:
+                raise ValueError("temporary payload checksum mismatch")
+        temporary.chmod(0o400)
+        temporary.replace(target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return name
+
+
+def frozen_payload(directory, data):
+    return _atomic_payload(directory / "payloads", data, "frozen body payload")
 
 
 def frozen_text_payload(directory, text):
@@ -312,20 +396,7 @@ def frozen_text_payload(directory, text):
     data = text.encode("utf-16-le", errors="surrogatepass")
     if len(data) % 2 or TEXT_CHUNK_BYTES % 2:
         raise ValueError("invalid UTF-16 text payload size")
-    name = sha(data)
-    root = directory / "textpayloads"
-    if root.is_symlink():
-        raise ValueError("frozen text payload directory must not be a symbolic link")
-    root.mkdir(exist_ok=True, mode=0o700)
-    _private_directory(root, "frozen text payload root")
-    target = root / name
-    if target.exists():
-        if target.is_symlink() or not target.is_file():
-            raise ValueError("frozen text payload must be a regular file")
-    else:
-        with target.open("xb") as handle:
-            handle.write(data)
-        target.chmod(0o400)
+    name = _atomic_payload(directory / "textpayloads", data, "frozen text payload")
     return {"text_sha256": name, "text_bytes": len(data),
             "text_utf16_units": len(data) // 2, "text_chars": len(text),
             "text_chunk_bytes": TEXT_CHUNK_BYTES,
@@ -353,12 +424,24 @@ def asset_digest(profile):
     return sha(json.dumps(sorted(manifest), sort_keys=True).encode())
 
 
-def reusable_snapshot(state, profile, source, from_date):
+def _frozen_source(directory, index):
+    source = directory / "source.hxd"
+    _private_file(source, "frozen HxStore source")
+    if fingerprint(source) != index.get("source_copy_fingerprint"):
+        raise ValueError("frozen HxStore source changed since snapshot")
+    return source
+
+
+def reusable_snapshot(state, profile, source, from_date, freeze_bodies=True):
+    body_mode = "eager" if freeze_bodies else "deferred"
     try:
         directory, index = load_index(state)
         if (index.get("profile") != str(profile)
-                or index.get("summary", {}).get("scope_from_date") != from_date):
+                or index.get("summary", {}).get("scope_from_date") != from_date
+                or index.get("summary", {}).get("body_mode", "eager") != body_mode):
             return None
+        if not freeze_bodies:
+            _frozen_source(directory, index)
         source_stat = fingerprint(source)
         if index.get("source_fingerprint") != source_stat:
             return None
@@ -395,14 +478,23 @@ def freeze_body(directory, profile, header, references, inline=(), body_objects=
 
     for reference in sorted(references):
         try:
-            data, source_stat = stable_read(source_path(profile, reference), MAX_BODY)
+            source = source_path(profile, reference)
+            # Fingerprint before opening the file so the bundle budget covers
+            # the bytes that stable_read is about to consume.
+            source_stat = fingerprint(source)
+            _debit_source_budget(source_stat["size"])
+            data, source_stat = stable_read(source, min(MAX_BODY, source_stat["size"]))
             candidate(data, {"storage": "external_file", "source_path": reference,
                             "source_fingerprint": source_stat, "association": references[reference]})
+        except SourceBudgetExceeded:
+            raise
         except FileNotFoundError:
             errors.append({"path": reference, "status": "not_cached"})
         except (ValueError, UnicodeError, OSError, EOFError, zlib.error) as error:
             errors.append({"path": reference, "status": "unavailable", "error": str(error)})
+    inline_count = 0
     for body in inline:
+        inline_count += 1
         metadata = {"storage": "hxstore_inline", "association": body["evidence"]}
         temporary = body.get("data_path")
         try:
@@ -425,13 +517,15 @@ def freeze_body(directory, profile, header, references, inline=(), body_objects=
             if len(data) > MAX_BODY:
                 raise ValueError("inline body exceeds prototype limit")
             candidate(data, metadata)
+        except SourceBudgetExceeded:
+            raise
         except (ValueError, UnicodeError, OSError, EOFError, zlib.error) as error:
             errors.append({**metadata, "status": "unavailable", "error": str(error)})
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
     diagnosis = {"body_object_frames": body_objects, "external_references": len(references),
-                 "inline_candidates": len(inline), "unparsed_body_objects": unparsed_objects}
+                 "inline_candidates": inline_count, "unparsed_body_objects": unparsed_objects}
     if best_candidate is None:
         if errors:
             status = "unavailable" if any(e["status"] != "not_cached" for e in errors) else "not_cached"
@@ -454,6 +548,21 @@ def freeze_body(directory, profile, header, references, inline=(), body_objects=
                     checks=errors, diagnosis={**diagnosis, "code": f"{metadata['storage']}_recovered"})
     metadata.update(frozen_text_payload(directory, text))
     return metadata
+
+
+def deferred_body(references, inline_frames=(), body_objects=0, body_reference=None,
+                  unparsed_objects=0, external_fingerprints=None):
+    """Describe body candidates without reading or copying their contents."""
+    diagnosis = {"body_object_frames": body_objects,
+                 "external_references": len(references),
+                 "inline_candidates": len(inline_frames),
+                 "unparsed_body_objects": unparsed_objects,
+                 "code": "body_read_deferred"}
+    return {"status": "deferred", "diagnosis": diagnosis, "checks": [],
+            "body_reference": body_reference,
+            "deferred": {"external_references": references,
+                         "external_fingerprints": external_fingerprints or {},
+                         "inline_frames": list(inline_frames)}}
 
 
 def day_start(value):
@@ -479,7 +588,8 @@ def make_snapshot(args):
     profile = discover_profile(args.profile)
     state = state_root(args.state, profile, create=True)
     source = profile / "HxStore.hxd"
-    reused = reusable_snapshot(state, profile, source, args.from_date)
+    freeze_bodies = getattr(args, "freeze_bodies", True)
+    reused = reusable_snapshot(state, profile, source, args.from_date, freeze_bodies)
     if reused is not None:
         return reused
     build = Path(tempfile.mkdtemp(prefix=f".building-{os.getpid()}-", dir=state))
@@ -528,24 +638,57 @@ def make_snapshot(args):
         if data is None:
             raise ValueError("Outlook cache kept changing; no snapshot published")
         assets = asset_digest(profile)
-        snapshot_id = sha(f"{VERSION}|{profile}|{digest}|{assets}|{args.from_date}".encode())[:24]
+        body_mode = "eager" if freeze_bodies else "deferred"
+        snapshot_id = sha(f"{VERSION}|{profile}|{digest}|{assets}|{args.from_date}|{body_mode}".encode())[:24]
         final = state / "snapshots" / snapshot_id
         if final.is_symlink():
             raise ValueError("snapshot directory must not be a symbolic link")
         if final.exists():
-            publish_current(state, snapshot_id)
-            return {"snapshot": snapshot_id, "reused": True, **json.loads((final / "index.json").read_text())["summary"]}
+            existing = json.loads((final / "index.json").read_text())
+            try:
+                if not freeze_bodies:
+                    _frozen_source(final, existing)
+            except (OSError, ValueError):
+                # Keep old IDs immutable; refresh publishes a repaired copy.
+                snapshot_id = sha(f"{snapshot_id}|repair|{os.urandom(16).hex()}".encode())[:24]
+                final = state / "snapshots" / snapshot_id
+            else:
+                publish_current(state, snapshot_id)
+                return {"snapshot": snapshot_id, "reused": True, **existing["summary"]}
+        source_copy_fingerprint = None
+        if not freeze_bodies:
+            frozen_source = build / "source.hxd"
+            if source_copy is not None:
+                source_copy.rename(frozen_source)
+                source_copy = None
+            else:
+                required = len(data)
+                try:
+                    available = shutil.disk_usage(build).free
+                except OSError as error:
+                    raise ValueError("insufficient scratch space for HxStore snapshot") from error
+                if available < required:
+                    raise ValueError(
+                        f"insufficient scratch space for HxStore snapshot: need {required} bytes, "
+                        f"have {available}"
+                    )
+                frozen_source.write_bytes(data)
+            frozen_source.chmod(0o400)
+            source_copy_fingerprint = fingerprint(frozen_source)
         headers, body_paths, exact_body_paths, attachments = (
             defaultdict(list), defaultdict(dict), defaultdict(dict), defaultdict(list)
         )
         body_objects, inline_bodies, header_body_targets = defaultdict(int), defaultdict(list), defaultdict(set)
+        inline_body_evidence = defaultdict(list)
         unparsed_bodies = defaultdict(int)
         header_body_evidence = {}
         file_records = []
         stats, frame_counts = {}, defaultdict(int)
+        source_block_bytes = {}
         blocks = iter_blocks(data, stats)
         try:
             for block in blocks:
+                source_block_bytes[str(block.offset)] = len(block.data)
                 for frame in iter_frames(block):
                     frame_counts[str(frame.kind)] += 1
                     if frame.kind == 201:
@@ -560,8 +703,8 @@ def make_snapshot(args):
                                                                    "target_key": target_key}
                     elif frame.kind == 202:
                         body_objects[frame.key] += 1
-                        inline_body = parse_inline_body(frame)
-                        if inline_body:
+                        inline_body = parse_inline_body(frame, include_data=freeze_bodies)
+                        if inline_body and freeze_bodies:
                             inline_data = inline_body.pop("data")
                             with tempfile.NamedTemporaryFile(
                                     prefix=".inline-", dir=build, delete=False) as handle:
@@ -570,13 +713,16 @@ def make_snapshot(args):
                             inline_body["data_sha256"] = sha(inline_data)
                             inline_bodies[frame.key].append(inline_body)
                             del inline_data
+                        elif inline_body:
+                            inline_body_evidence[frame.key].append(inline_body["evidence"])
                         references = [ref for ref in file_references(frame) if "/EFMData/" in ref["path"]]
                         if not inline_body and not references:
                             unparsed_bodies[frame.key] += 1
                         for ref in references:
                             body_paths[frame.key][ref["path"]] = {
                                 "method": "same_typed_message_key", "key": frame.key,
-                                "block": frame.block, "frame_offset": frame.offset, "kind": 202}
+                                "block": frame.block, "frame_offset": frame.offset, "kind": 202,
+                                "frame_bytes": len(frame.data), "frame_sha256": sha(frame.data)}
                     elif frame.kind == 362:
                         attachment = parse_attachment(frame)
                         if attachment:
@@ -587,6 +733,9 @@ def make_snapshot(args):
                         if len(entries) == 1 and references:
                             file_records.append((frame.key, next(iter(entries)), references,
                                                  {"block": frame.block, "frame_offset": frame.offset,
+                                                  "frame_bytes": len(frame.data),
+                                                  "frame_sha256": sha(frame.data), "kind": 247,
+                                                  "file_key": frame.key,
                                                   "association": "exact_exchange_entry_id"}))
         finally:
             close_blocks = getattr(blocks, "close", None)
@@ -658,11 +807,33 @@ def make_snapshot(args):
                 reference = header_body_evidence[key]
             else:
                 references = {}
-            row["body"] = freeze_body(
-                build, profile, row, references,
-                inline_bodies[body_key] if reference else (),
-                body_objects[body_key], reference, unparsed_bodies[body_key]
-            )
+            if freeze_bodies:
+                row["body"] = freeze_body(
+                    build, profile, row, references,
+                    inline_bodies[body_key] if reference else (),
+                    body_objects[body_key], reference, unparsed_bodies[body_key]
+                )
+            else:
+                external_fingerprints = {}
+                for reference_path in references:
+                    try:
+                        external_fingerprints[reference_path] = fingerprint(
+                            source_path(profile, reference_path)
+                        )
+                    except FileNotFoundError:
+                        external_fingerprints[reference_path] = None
+                    except (OSError, ValueError) as error:
+                        # Keep the candidate explicit; freeze_body will retain
+                        # its existing diagnosis when a caller reads it.
+                        external_fingerprints[reference_path] = {
+                            "unavailable": True, "error": str(error) or error.__class__.__name__
+                        }
+                row["body"] = deferred_body(
+                    references,
+                    inline_body_evidence[body_key] if reference else (),
+                    body_objects[body_key], reference, unparsed_bodies[body_key],
+                    external_fingerprints,
+                )
             chosen[key] = row
         attachment_conflicts = 0
         for key, versions in attachments.items():
@@ -730,21 +901,28 @@ def make_snapshot(args):
                     Path(temporary).unlink(missing_ok=True)
         items = sorted(chosen.values(), key=lambda row: (-row["sent_unix"], row["id"]))
         summary = {"scope_from_date": args.from_date, "timezone": "Asia/Singapore",
+                   "body_mode": body_mode,
                    "messages": len(items), "paired_subjects": sum(bool(r["subject"]) for r in items),
                    "unresolved_times_excluded": unresolved_times,
                    "time_conflicts_excluded": time_conflicts,
                    "unparsed_header_frames": frame_counts["201"] - sum(len(v) for v in headers.values()),
                    "cached_bodies": sum(r["body"]["status"] == "cached_html" for r in items),
                    "body_statuses": {status: sum(r["body"]["status"] == status for r in items)
-                                     for status in ("cached_html", "not_linked", "not_cached", "unavailable")},
+                                     for status in ("cached_html", "deferred", "not_linked", "not_cached", "unavailable")},
                    "body_diagnoses": {code: sum(r["body"]["diagnosis"]["code"] == code for r in items)
                                       for code in sorted({r["body"]["diagnosis"]["code"] for r in items})},
                    "linked_attachments": sum(len(r["attachments"]) for r in items),
                    "identity_conflicts_excluded": conflicts, "attachment_conflicts_excluded": attachment_conflicts,
                    "container": stats, "frames": dict(frame_counts),
                    "coverage": "recoverable_cached_records; mailbox membership and completeness unverified"}
+        # Keep the private payload roots present for both eager and deferred
+        # snapshots; deferred refreshes leave them empty until a body is read.
+        (build / "payloads").mkdir(exist_ok=True, mode=0o700)
+        (build / "textpayloads").mkdir(exist_ok=True, mode=0o700)
         index = {"schema_version": VERSION, "snapshot": snapshot_id, "profile": str(profile),
                  "source_sha256": digest, "source_fingerprint": source_stat, "asset_manifest_sha256": assets,
+                 "source_copy_fingerprint": source_copy_fingerprint,
+                 "source_block_bytes": source_block_bytes,
                  "created_at": datetime.now(timezone.utc).isoformat(), "summary": summary, "items": items}
         (build / "index.json").write_text(json.dumps(index, ensure_ascii=False))
         build.rename(final)
@@ -766,7 +944,7 @@ def load_index(state_arg):
         raise ValueError("invalid snapshot pointer")
     directory = state / "snapshots" / snapshot
     _private_directory(directory, "snapshot directory")
-    for name in ("payloads", "textpayloads"):
+    for name in ("payloads", "textpayloads", "deferred"):
         entry = directory / name
         if entry.exists() or entry.is_symlink():
             _private_directory(entry, f"snapshot {name} directory")
@@ -873,14 +1051,18 @@ def _verified_raw_payload(directory, body):
         raise ValueError("frozen body checksum mismatch")
     key = (str(path), expected, tuple(current.items()))
     if key not in _verified_raw_payloads:
+        _debit_source_budget(expected_bytes, "verification_remaining")
         digest = hashlib.sha256()
         with path.open("rb") as handle:
-            while True:
-                chunk = handle.read(1024 * 1024)
+            remaining = expected_bytes
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
                 if not chunk:
                     break
                 digest.update(chunk)
-        if digest.hexdigest() != expected:
+                remaining -= len(chunk)
+            extra = handle.read(1)
+        if remaining or extra or fingerprint(path) != current or digest.hexdigest() != expected:
             raise ValueError("frozen body checksum mismatch")
         _remember(_verified_raw_payloads, key)
     else:
@@ -931,6 +1113,7 @@ def _verified_text_range(directory, body, start, end):
                 if key in _verified_text_chunks:
                     _verified_text_chunks.move_to_end(key)
                     continue
+                _debit_source_budget(expected_size, "verification_remaining")
                 handle.seek(number * chunk_bytes)
                 data = handle.read(expected_size)
                 if len(data) != expected_size or sha(data) != chunks[number]:
@@ -961,10 +1144,205 @@ def _read_python_prefix(directory, body, maximum):
     return (text if total_chars <= maximum else text[:maximum], total_chars > maximum)
 
 
+def _deferred_cache_root(directory):
+    root = directory / "deferred"
+    if root.exists() or root.is_symlink():
+        _private_directory(root, "deferred body cache root")
+    else:
+        root.mkdir(mode=0o700, exist_ok=True)
+        _private_directory(root, "deferred body cache root")
+    return root
+
+
+def _deferred_cache_path(directory, row):
+    body = row.get("body", {})
+    key = sha(json.dumps({"id": row.get("id"), "message_id": row.get("message_id"),
+                          "preview": row.get("preview"), "body": body},
+                         sort_keys=True, ensure_ascii=False).encode())
+    return _deferred_cache_root(directory) / key
+
+
+def _read_deferred_cache(directory, row):
+    path = _deferred_cache_path(directory, row)
+    if not path.exists() and not path.is_symlink():
+        return None
+    _private_file(path, "deferred body cache")
+    try:
+        cached = json.loads(path.read_text())
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(cached, dict) or cached.get("status") not in {
+            "cached_html", "not_cached", "not_linked", "unavailable"}:
+        return None
+    return cached
+
+
+def _write_deferred_cache(directory, row, cached):
+    root = _deferred_cache_root(directory)
+    target = _deferred_cache_path(directory, row)
+    if target.exists() or target.is_symlink():
+        _private_file(target, "deferred body cache")
+    with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix=".body-", delete=False) as handle:
+        json.dump(cached, handle, ensure_ascii=False)
+        temporary = Path(handle.name)
+    try:
+        temporary.chmod(0o400)
+        try:
+            temporary.replace(target)
+        except FileExistsError:
+            pass
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_source_block(directory, index, offset, cache=None):
+    if cache is not None and offset in cache:
+        return cache[offset]
+    budget = _source_read_budget.get()
+    if budget is not None:
+        sizes = index.get("source_block_bytes")
+        size = sizes.get(str(offset)) if isinstance(sizes, dict) else None
+        remaining = budget.get("remaining") if isinstance(budget, dict) else None
+        if type(size) is not int or size < 0 or type(remaining) is not int or remaining < 0:
+            raise ValueError("bundle source byte budget cannot verify source block size")
+        # Debit before the I/O so a failed read cannot be retried for free.
+        _debit_source_budget(size)
+    from hxcontainer import read_block_at
+    source = _frozen_source(directory, index)
+    block = read_block_at(source, offset)
+    if fingerprint(source) != index.get("source_copy_fingerprint"):
+        raise ValueError("frozen HxStore source changed during read")
+    if cache is not None:
+        if len(cache) >= 4:
+            cache.pop(next(iter(cache)))
+        cache[offset] = block
+    return block
+
+
+def _validated_source_frame(directory, index, evidence, cache=None):
+    """Validate one source frame by its recorded block offset and digest."""
+    if not isinstance(evidence, dict):
+        return
+    required = ("block", "frame_offset", "frame_sha256")
+    if any(key not in evidence for key in required):
+        return
+    block = _read_source_block(directory, index, evidence["block"], cache)
+    for frame in iter_frames(block):
+        if (frame.offset == evidence["frame_offset"]
+                and sha(frame.data) == evidence["frame_sha256"]
+                and ("kind" not in evidence or frame.kind == evidence["kind"])
+                and ("file_key" not in evidence or frame.key == evidence["file_key"])):
+            return
+    raise ValueError("Outlook cache source frame changed since snapshot")
+
+
+def _validate_deferred_sources(directory, index, row, body, cache=None):
+    deferred = body.get("deferred") or {}
+    _validated_source_frame(directory, index, row.get("evidence"), cache)
+    for evidence in (deferred.get("external_references") or {}).values():
+        _validated_source_frame(directory, index, evidence, cache)
+    for evidence in deferred.get("inline_frames") or ():
+        _validated_source_frame(directory, index, evidence, cache)
+    expected = deferred.get("external_fingerprints") or {}
+    unavailable = {}
+    for reference, expected_fingerprint in expected.items():
+        if isinstance(expected_fingerprint, dict) and expected_fingerprint.get("unavailable"):
+            unavailable[reference] = expected_fingerprint.get("error") \
+                or "external body source was unavailable at indexing"
+            continue
+        try:
+            current = fingerprint(source_path(Path(index["profile"]), reference))
+        except FileNotFoundError:
+            current = None
+        except (OSError, ValueError) as error:
+            raise ValueError("Outlook body source cannot be verified safely") from error
+        if current != expected_fingerprint:
+            raise ValueError("Outlook body source changed since snapshot; build a fresh snapshot")
+    return unavailable
+
+
+def _resolve_deferred_body(directory, index, row):
+    body = row.get("body", {})
+    if body.get("status") != "deferred":
+        return body
+    # Clients may share a snapshot; publish payloads completely before another
+    # process tries to reuse them, including identical bodies of different IDs.
+    lock_path = directory / ".body.lock"
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(descriptor, "rb") as lock:
+        _private_file(lock_path, "body cache lock")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        return _materialize_deferred_body(directory, index, row)
+
+
+def _materialize_deferred_body(directory, index, row):
+    body = row["body"]
+    profile = Path(index["profile"])
+    cached = _read_deferred_cache(directory, row)
+    if cached is not None:
+        try:
+            if cached.get("status") == "cached_html":
+                _verified_raw_payload(directory, cached)
+                _text_payload_info(directory, cached)
+        except SourceBudgetExceeded:
+            raise
+        except (OSError, ValueError):
+            # A pre-atomic writer may have published metadata for a partial
+            # payload. Rebuild only after validating the original candidates.
+            pass
+        else:
+            return cached
+    block_cache = {}
+    unavailable = _validate_deferred_sources(directory, index, row, body, block_cache)
+    deferred = body.get("deferred") or {}
+    all_references = deferred.get("external_references") or {}
+    references = {reference: evidence for reference, evidence in all_references.items()
+                  if reference not in unavailable}
+    descriptors = deferred.get("inline_frames") or []
+
+    def inline_candidates():
+        # Only the blocks that own this message's inline body are decoded.
+        for descriptor in descriptors:
+            block = _read_source_block(directory, index, descriptor["block"], block_cache)
+            found = next((frame for frame in iter_frames(block)
+                          if frame.kind == 202
+                          and frame.offset == descriptor["frame_offset"]
+                          and frame.key == descriptor.get("owner_key")
+                          and sha(frame.data) == descriptor["frame_sha256"]), None)
+            if found is None:
+                raise ValueError("inline body frame changed since snapshot")
+            parsed = parse_inline_body(found)
+            if parsed is None:
+                raise ValueError("inline body layout changed since snapshot")
+            yield parsed
+    result = freeze_body(
+        directory, profile, row, references, inline_candidates(),
+        body.get("diagnosis", {}).get("body_object_frames", 0),
+        body.get("body_reference"),
+        body.get("diagnosis", {}).get("unparsed_body_objects", 0),
+    )
+    _validate_deferred_sources(directory, index, row, body, block_cache)
+    if unavailable:
+        checks = [{"path": reference, "status": "unavailable", "error": error}
+                  for reference, error in sorted(unavailable.items())]
+        diagnosis = {**result.get("diagnosis", {}),
+                     "external_references": len(all_references),
+                     "code": result.get("diagnosis", {}).get("code", "body_candidates_rejected")}
+        if result.get("status") != "cached_html":
+            result = {**result, "status": "unavailable",
+                      "diagnosis": {**diagnosis, "code": "body_candidates_rejected"},
+                      "checks": checks + result.get("checks", [])}
+        else:
+            result = {**result, "diagnosis": diagnosis,
+                      "checks": checks + result.get("checks", [])}
+    _write_deferred_cache(directory, row, result)
+    return result
+
+
 def read_body_page(directory, index, message_id, offset, maximum):
     """Read a UTF-16-unit page for the common worker without rebuilding HTML."""
     row = find_message(index, message_id)
-    body = row["body"]
+    body = _resolve_deferred_body(directory, index, row)
     if body["status"] != "cached_html":
         return None
     _verified_raw_payload(directory, body)
@@ -977,14 +1355,22 @@ def read_body_page(directory, index, message_id, offset, maximum):
             "truncated": end < total_units}
 
 
+def resolve_message_body(directory, index, message_id):
+    """Resolve a deferred body while keeping the immutable message row intact."""
+    row = find_message(index, message_id)
+    return _resolve_deferred_body(directory, index, row)
+
+
 def read_message(directory, index, message_id, maximum):
     row = find_message(index, message_id)
-    result = {**metadata(row), "snapshot": index["snapshot"], "body": {**row["body"]},
+    body = _resolve_deferred_body(directory, index, row)
+    effective = {**row, "body": body}
+    result = {**metadata(effective), "snapshot": index["snapshot"], "body": {**body},
               "attachments": row["attachments"], "evidence": row["evidence"],
               "subject_evidence": row.get("subject_evidence", row["evidence"])}
-    if row["body"]["status"] == "cached_html":
-        _verified_raw_payload(directory, row["body"])
-        text, truncated = _read_python_prefix(directory, row["body"], maximum)
+    if body["status"] == "cached_html":
+        _verified_raw_payload(directory, body)
+        text, truncated = _read_python_prefix(directory, body, maximum)
         result["body"].update(text=text, truncated=truncated)
     return result
 

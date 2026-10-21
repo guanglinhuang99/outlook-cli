@@ -87,6 +87,29 @@ class CommonWorkerTests(unittest.TestCase):
         self.assertEqual(len(self.reader.perform('search', {'query': '中文'})['messages']), 1)
         self.assertEqual(self.reader.perform('search', {'query': "' OR 1=1"})['messages'], [])
 
+    def test_late_delivery_listing_defers_body_until_shared_read(self):
+        # The source header was sent in 2000; delivery in 2001 must still match.
+        raw_id = self.fixture.ids[1]
+        self.fixture.scope['messages'][raw_id].update(
+            folder_id='inbox', received_unix=common.timestamp('2001-01-02T10:00:00+08:00'))
+        client = common.MailService(self.fixture.fixture.state.parent / 'lazy-common-state',
+                                    self.fixture.fixture.profile, from_date='2001-01-02')
+        reader = common.CommonReader(client)
+        with patch.object(common.core, 'freeze_body', wraps=common.core.freeze_body) as freeze:
+            result = reader.perform('messages', {
+                'after': '2001-01-02T00:00:00+08:00', 'before': '2001-01-03T00:00:00+08:00'})
+            self.assertEqual(len(result['messages']), 1)
+            mail = result['messages'][0]
+            self.assertTrue(mail['sent_at'].startswith('2000-'))
+            self.assertTrue(mail['received_at'].startswith('2001-01-02'))
+            self.assertEqual(freeze.call_count, 0)
+            first = reader.perform('read', {'id': mail['id'], 'max_chars': 2})
+            self.assertTrue(first['body']['available'])
+            self.assertEqual(first['body']['status'], 'cached_html')
+            self.assertEqual(freeze.call_count, 1)
+            reader.perform('read', {'id': mail['id'], 'body_offset': first['body']['next_offset']})
+            self.assertEqual(freeze.call_count, 1)
+
     def test_millisecond_received_time_keeps_filter_and_order_boundaries(self):
         directory, index = self.fixture.client._current()
         inbox = next(row for row in index['items'] if row['folder_id'] == 'inbox')

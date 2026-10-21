@@ -4,7 +4,7 @@
 
 **原始邮件只读**：不发送、删除、移动邮件，也不修改已读状态。邮箱登录和同步由 Outlook 完成；本项目不内置 AI 模型，不需要模型 API Key 或 Microsoft Graph OAuth。
 
-> 跨平台源码版本为 **v0.3.0**，目前位于 [草稿 PR #1](https://github.com/guanglinhuang99/outlook-cli/pull/1) 的 `codex/macos-windows-unified` 分支。以下源码安装命令指定该分支。Windows 已发布的 v0.2.1 安装包不包含 Mac 读取器和 `outlook_today` 工具。
+> 跨平台源码版本为 **v0.3.0**，源码安装使用 `main` 分支。Windows 已发布的 v0.2.1 安装包不包含 Mac 读取器和 `outlook_today` 工具。
 
 ## 项目背景
 
@@ -49,7 +49,7 @@ Codex / 其他 Agent / 命令行
 准备：Git、Node.js **22+**、Python **3.11+**，以及已经登录并同步邮件的 Outlook。Python 读取器使用标准库，无需额外安装 pip 依赖。
 
 ```sh
-git clone --branch codex/macos-windows-unified https://github.com/guanglinhuang99/outlook-cli.git
+git clone --branch main https://github.com/guanglinhuang99/outlook-cli.git
 cd outlook-cli
 npm ci --ignore-scripts
 
@@ -58,7 +58,7 @@ node bin/outlook.mjs health
 node bin/outlook.mjs today --folder inbox --limit 25
 ```
 
-`start` 启动后台服务，`health` 检查邮件后端。首次建立缓存索引可能需要几十秒，并占用额外磁盘空间。后续命令在项目目录执行；也可使用 `sh outlook.sh` 代替 `node bin/outlook.mjs`。
+`start` 启动后台服务，`health` 检查邮件后端。Mac 首次建立邮件头、目录和接收时间索引仍需扫描本地缓存，但不会预先复制全部历史正文；正文在 `read` 时按需校验并保存，后续分页复用已保存内容。后续命令在项目目录执行；也可使用 `sh outlook.sh` 代替 `node bin/outlook.mjs`。
 
 默认自动发现唯一的 Outlook profile。存在多个 profile 时，先显式设置再启动：
 
@@ -83,7 +83,7 @@ node bin/outlook.mjs start
 准备：Git、Node.js **22+**、Windows PowerShell **5.1**，以及已配置的经典 Outlook 或支持的本地 OST/PST 文件。
 
 ```powershell
-git clone --branch codex/macos-windows-unified https://github.com/guanglinhuang99/outlook-cli.git
+git clone --branch main https://github.com/guanglinhuang99/outlook-cli.git
 cd outlook-cli
 npm ci --ignore-scripts
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-reader.ps1
@@ -226,7 +226,8 @@ codex mcp list
 
 - **本地缓存不等于完整邮箱。** 未同步或无法可靠关联的正文、附件不能保证读取；快照时间也不等于服务器同步时间。
 - Mac 会在独立私有目录写入索引、正文快照及附件导出，原始 Outlook 缓存只读。默认位于 `~/Library/Caches/outlook-cli/`；不要上传这些数据或服务令牌。
-- Mac 缓存格式并非微软公开稳定 API，其他 Outlook 版本可能不兼容。大型邮箱首次索引需要额外空间，当前没有正文缓存总字节配额。
+- Mac 列表先按接收时间和文件夹筛选，不按发送时间提前裁剪，因此早先发送、后来投递的邮件仍能进入对应接收日期。列表中的正文待读取状态不代表正文缺失；首次读取才确认可用性。首次读取前源正文变化时会要求刷新，避免将变化后的内容错误关联到旧快照。
+- Mac 缓存格式并非微软公开稳定 API，其他 Outlook 版本可能不兼容。服务保留一份当前压缩邮箱容器，刷新构建期间还需一份新容器的可用空间（容器部分通常为一份、峰值两份），另需索引、按需正文和附件空间。当前没有正文缓存总字节配额。源容器更新后旧快照 ID / 游标失效，应重新检索。
 - 服务仅监听 `127.0.0.1` 并使用令牌认证，适用于本机 Agent，不直接提供局域网远程访问。
 - Windows、macOS、Linux 自动化检查覆盖协议和合成测试；Mac 已完成真实缓存验证，统一版本的 Windows 真实邮箱验证仍待完成。
 

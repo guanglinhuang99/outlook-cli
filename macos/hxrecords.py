@@ -121,7 +121,7 @@ def typed_references(frame, kind):
     return {value for _, value in _typed_reference_values(frame, kind)}
 
 
-def parse_inline_body(frame):
+def parse_inline_body(frame, include_data=True):
     """Parse the verified fixed-layout inline HTML carried by a type-202 frame.
 
     The parser validates only structural evidence.  It deliberately leaves
@@ -204,9 +204,7 @@ def parse_inline_body(frame):
 
     unique_offset = struct.unpack_from("<I", data, INLINE_BODY_UNIQUE_OFFSET)[0]
     unique_descriptor = struct.unpack_from("<I", data, INLINE_BODY_UNIQUE_DESCRIPTOR)[0]
-    return {
-        "data": body,
-        "evidence": {
+    evidence = {
             "block": frame.block,
             "frame_offset": frame.offset,
             "frame_bytes": len(data),
@@ -235,8 +233,10 @@ def parse_inline_body(frame):
             # used as a fallback for the full representation above.
             "unique_offset": unique_offset,
             "unique_descriptor": unique_descriptor,
-        },
     }
+    # Metadata-first callers need the verified layout and source locator, but
+    # must not copy every inline body into temporary files during indexing.
+    return {**({"data": body} if include_data else {}), "evidence": evidence}
 
 
 def clean_text(value):
