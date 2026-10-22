@@ -19,6 +19,7 @@ import uuid
 
 import outlook_local as core
 from osa_scope import LogParseCache
+from fulltext_index import FullTextIndex
 
 VIEW_VERSION = 5
 RETAINED_VIEWS = 3
@@ -86,6 +87,7 @@ class MailService:
         self._index_cache = OrderedDict()
         # The cache opens lazily during refresh, after the private state guard.
         self._osa_parse_cache = LogParseCache(path=self.state / "osa-metadata.sqlite3")
+        self._fulltext_index = FullTextIndex(self.state / "fulltext.sqlite3")
 
     @contextmanager
     def _lock(self):
@@ -567,7 +569,7 @@ class MailService:
             if len(parts) != 4 or parts[0] != "v1" or parts[2] != folder_signature:
                 raise ValueError("cursor belongs to another folder filter or is invalid")
             _, snapshot, _, raw_cursor = parts
-        _, index = self._current(snapshot)
+        directory, index = self._current(snapshot)
         folders = {folder["id"]: folder for folder in index["folders"]}
         filtered = index
         if folder_id is not None:
@@ -584,8 +586,21 @@ class MailService:
         options = SimpleNamespace(query=arguments.get("query", ""), field=arguments.get("field", "subject"),
                                   person=arguments.get("person"), person_role=arguments.get("person_role", "any"),
                                   from_date=arguments.get("from_date"), to_date=arguments.get("to_date"),
-                                  limit=arguments.get("limit", 20), cursor=raw_cursor)
+                                  limit=arguments.get("limit", 20), cursor=raw_cursor,
+                                  search_body=arguments.get("search_body", False))
+        fulltext = None
+        if options.search_body and options.query:
+            candidates, _ = core.search_candidates(filtered, options)
+            options.body_hits, fulltext = self._fulltext_index.search(
+                directory, index, [row for row, _ in candidates], options.query)
+            options.body_revision = fulltext["revision"]
         result = core.search(filtered, options)
+        if fulltext is not None:
+            result.update(fulltext=fulltext, body_search_incomplete=not fulltext["complete"])
+            # A growing hit set cannot be paginated safely until indexing settles.
+            if fulltext["pending"] or fulltext["errors"]:
+                result.update(complete=False, next_cursor=None,
+                              retry_required=True)
         self._metadata(result, index)
         if result["next_cursor"]:
             result["next_cursor"] = f"v1.{index['snapshot']}.{folder_signature}.{result['next_cursor']}"

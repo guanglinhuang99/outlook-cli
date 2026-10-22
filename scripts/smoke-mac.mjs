@@ -74,6 +74,22 @@ async function run() {
   assert.equal(missing.messages.length, 0);
   assert.equal(missing.scanned, Math.min(2, list.filtered_item_count));
   report.search_and_dates = true;
+  stage = 'body_search';
+  let bodySearch = await call('search', {
+    ...selection, query: '__outlook_body_probe_no_match_6aa92e70__',
+    search_body: true, scan_limit: 2, limit: 1,
+  });
+  for (let attempt = 0; bodySearch.retry_required && attempt < 8; attempt += 1) {
+    bodySearch = await call('search', {
+      ...selection, query: '__outlook_body_probe_no_match_6aa92e70__',
+      search_body: true, scan_limit: 2, limit: 1,
+    });
+  }
+  assert.ok(bodySearch.fulltext);
+  assert.equal(typeof bodySearch.body_search_incomplete, 'boolean');
+  assert.equal(bodySearch.fulltext.pending, 0);
+  assert.equal(bodySearch.retry_required ?? false, false);
+  report.body_search = true;
   stage = 'body';
   let available = false;
   let absent = false;
@@ -97,7 +113,6 @@ async function run() {
   stage = 'scope_and_capabilities';
   await assert.rejects(call('messages', { folder: 'deleted' }), { code: 'SCOPE_DENIED' });
   await assert.rejects(call('messages', { unread: false }), { code: 'UNSUPPORTED_FILTER' });
-  await assert.rejects(call('search', { query: 'test', search_body: true }), { code: 'UNSUPPORTED_FILTER' });
   await assert.rejects(call('read', { id: sample.id, format: 'html' }), { code: 'UNSUPPORTED_FORMAT' });
   report.scope_and_capabilities = true;
   stage = 'attachments';

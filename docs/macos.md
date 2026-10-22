@@ -20,7 +20,7 @@ node bin/outlook.mjs mcp-config
 
 大于 64 MiB 的 HxStore 会分块复制到私有目录，校验后通过只读映射解析；没有 2 GiB 源文件上限。按需正文版本会保留这份压缩容器快照，小文件也保存一份，避免 Outlook 同步重排数据块后刚检索的邮件无法读取。服务仅保留当前源快照的容器副本；正常保留一份，刷新期间旧副本与新副本同时存在，容器部分峰值为两份。刷新前需额外留出新容器大小的可用空间，还要另留索引、按需正文和附件空间；空间不足会报错并保留此前可用视图。升级时旧版本遗留的历史快照在首次成功刷新后清理。进程超时退出留下的构建目录会在下一次刷新时清理，仍在运行的构建会保留。
 
-共享服务和原生 MCP 都先建立邮件身份、文件夹和接收时间索引，再执行日期及目录筛选。索引阶段不复制和解码全部历史正文；`read` 或原生批量正文工具才按需恢复目标邮件的正文，保存在私有缓存中供后续分页复用。为了识别延迟投递，仍需扫描历史邮件头，不会以发送日期提前排除。首次全量扫描的耗时仍取决于 HxStore 大小和日志量；本次优化不包含块级增量解析，也没有增加正文缓存总字节配额。
+共享服务和原生 MCP 都先建立邮件身份、文件夹和接收时间索引，再执行日期及目录筛选。索引阶段不复制和解码全部历史正文；`read`、原生批量正文工具或显式启用 `search_body` 时才按需恢复目标邮件的正文，保存在私有缓存中供后续分页和搜索复用。为了识别延迟投递，仍需扫描历史邮件头，不会以发送日期提前排除。首次全量扫描的耗时仍取决于 HxStore 大小和日志量；本次优化不包含块级增量解析，也没有增加正文缓存总字节配额。
 
 `mcp-config` 输出本机绝对路径，通用配置如下。先启动后台服务，再把此条目合并进客户端配置。现有客户端中的其他 MCP 配置应保留。
 
@@ -67,13 +67,29 @@ node bin/outlook.mjs mcp-config
 
 ## 搜索与重复读取性能
 
-原生 MCP 的 `outlook_local_search` 支持 `query`、`field`、`person`、`person_role`，人员角色为 `any` / `sender` / `to` / `cc`；关键词和人员条件按 AND 组合。Osa 收件人被脱敏或缺失时，服务读取本地 HxStore 的 Person 对象，按 UTF-16LE 解码真实姓名、邮箱，并通过邮件头及 To/Cc 父集合引用关联邮件；不解码 `pii:` 占位符，不从正文猜测，也不依赖网络 API。只接受已验证的对象布局，排除阅读窗对象、密送和歧义关联。
+原生 MCP 的 `outlook_local_search` 支持 `query`、`field`、`person`、`person_role` 和 `search_body`，人员角色为 `any` / `sender` / `to` / `cc`；关键词和人员条件按 AND 组合。Osa 收件人被脱敏或缺失时，服务读取本地 HxStore 的 Person 对象，按 UTF-16LE 解码真实姓名、邮箱，并通过邮件头及 To/Cc 父集合引用关联邮件；不解码 `pii:` 占位符，不从正文猜测，也不依赖网络 API。只接受已验证的对象布局，排除阅读窗对象、密送和歧义关联。
 
 `participants_status` 按角色标记 `verified`、`partial`、`missing`、`redacted` 或 `conflict` 等状态；`participants_evidence` 说明 HxStore 来源、解析人数和日志人数。HxStore 人员只有在没有拒绝记录、且人数与最新明确完整的 Osa 观察一致时才标为 `verified`；没有完整日志或部分对象解析失败时，可搜索已确认人员，但标为 `partial`。对象版本冲突不返回该角色名单。`verified` 是本地证据一致，不保证服务端或整个邮箱完整。`person_search_incomplete` 提醒本地证据可能漏项；原始 Exchange 地址不等于已验证的 SMTP 别名。共享 CLI 用 `search --query '预算' --person '张三' --person-role any`，按文件夹分别检索。
 
 常驻进程最多缓存 3 个已验证索引，文件内容/身份/权限变化会使缓存失效；每次请求仍检查 profile、目录权限及原始邮件隔离边界。宽范围搜索只为返回页生成完整元数据，正文继续按需解析。首次加载、Outlook 更新后的索引刷新、进程重启后仍有开销，默认 300 秒的刷新周期没有放宽。升级后的目录快照格式为 5，首次使用需重建目录/人员索引；旧邮件不会按发送日期提前排除。升级已安装 MCP 后须重新连接客户端，让常驻进程加载新代码。
 
 查询在内部复用已验证的索引，只复制实际返回的数据，避免每次搜索复制整个邮箱索引。Osa 日志的解析元数据通过 Python 标准库 SQLite 保存到私有状态目录的 `osa-metadata.sqlite3`，新进程也可复用。缓存最多保留 4096 个文件、64 MiB 序列化元数据，数据库文件另限 68 MiB；不保存正文和附件内容，不需要安装数据库服务。首次使用需要填充缓存。
+
+### 可选的正文搜索
+
+共享 CLI/MCP 的 `search_body: true` 和原生 `outlook_local_search` 的同名参数都会在元数据命中之外搜索已完成的纯文本正文；人员条件仍与正文命中按 AND 组合。默认 `search_body: false` 只查主题、发件人和已有摘要，不自动展开正文，因为正文读取可能较慢。正文索引写在服务状态目录的 `fulltext.sqlite3`，私有数据库上限为 512 MiB；只读原始缓存和服务自己的正文快照，不写回 Outlook，也不索引附件内容。Python 的 SQLite 构建需支持 FTS5/trigram，否则会返回明确的索引错误。
+
+正文搜索会先应用单文件夹、接收时间和人员筛选，再把候选交给索引。共享接口继续使用 `offset` / `scan_limit` / `next_offset`；当前窗口仍是唯一索引范围。原生接口继续使用 `next_cursor`，可搜索其默认的收件箱、已发送及已知子目录范围。三字符及以上的 Unicode 查询使用持久化 trigram 索引，一、二字符查询使用候选正文的字面扫描。
+
+正文索引按消息 ID 和正文来源指纹增量保存完整纯文本，快照更新时复用未变化的正文。冷查询会受每次最多 30 秒、128 MiB 的构建预算限制，可能返回 `fulltext.pending`；用相同的第一页参数重试，直到 `pending` 为 0，再继续下一页。完成后的热查询复用本地正文和索引，通常只需读取候选命中。预算耗尽记入 `fulltext.pending`，读取错误记入 `fulltext.errors`；共享接口的 `next_offset` 会停在本次窗口起点，重试可能看到重复命中。`missing` 表示当前快照确认没有可读正文，不是 pending；正文缓存随后出现并刷新快照后会重新检查。响应的 `body_search_incomplete` 等于 `fulltext.complete` 的否定，命中时附带 `body_snippet`，并返回 `candidates`、`indexed`、`missing`、`errors`、`pending`、`updated`、`reused`、`revision` 和引擎信息。
+
+多个 Agent 同时查询时，数据库最多等待其他写入 5 秒；`FullTextIndexBusy` 表示暂时占用，可稍后重试，不应删除索引。查询逐条处理命中正文，只保留短摘要；查询阶段超过 30 秒会明确要求缩小接收日期、文件夹或人员范围，已经完成的索引会保留。数据库容量或磁盘空间不足时明确报错，不会把失败解释成无命中。
+
+共享正文搜索只覆盖当前调用的一个文件夹；应逐目录翻页并按 ID 去重。原生分页中的 `complete` 仍只表示分页是否结束，正文状态看 `body_search_incomplete` 和 `fulltext`。Windows COM 与离线 OST/PST 使用 Node SQLite 的独立全文索引实现，支持范围、增量校验及重试方法见 [使用参考](usage-reference.md)。两平台的结果均不代表服务器上的完整邮箱。
+
+```json
+{"query":"预算","field":"all","search_body":true,"person":"张三","person_role":"any","limit":20}
+```
 
 每次刷新仍完整枚举日志，并核对文件身份、大小、修改/变更时间和权限，以及扫描前后的清单。新增、修改和删除的日志会重新参与目录、人员和接收时间关联，延迟收到的旧邮件不会被时间水位过滤掉。SQLite 缓存包含解析器版本、源文件指纹及内容校验和；损坏、占用或不安全的缓存路径会回退到源日志解析。缓存更新在成功扫描后以事务写入，不会修改原始 Outlook 文件。
 
@@ -92,7 +108,7 @@ HxStore 的 LZ4 解压改用批量复制，保留重叠复制语义、CRC 和边
 | 参数 | 错误 |
 |---|---|
 | `unread`（包含 false） | `UNSUPPORTED_FILTER` |
-| `search_body: true` | `UNSUPPORTED_FILTER` |
+| `search_body: true` | 启用本地正文索引；缺失或 pending 通过 `fulltext` 和 `body_search_incomplete` 明确返回 |
 | `format: "html"` | `UNSUPPORTED_FORMAT` |
 | 已删除、草稿、垃圾邮件、发件箱 | `SCOPE_DENIED` |
 

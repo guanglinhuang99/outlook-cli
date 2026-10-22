@@ -6,6 +6,7 @@ import path from 'node:path';
 import { BackendRouter } from '../src/backend.mjs';
 import { LocalFileBridge, encodeLocalId, decodeId, localError, asText } from '../src/offline.mjs';
 import { validateCall } from '../src/tools.mjs';
+import { WindowsFulltextIndex } from '../src/windows-fulltext-index.mjs';
 
 const stub = call => ({ call, queue: [], active: false, close() {} });
 async function fixtureBridge(t, rows, messages) {
@@ -14,7 +15,7 @@ async function fixtureBridge(t, rows, messages) {
   const filename = path.join(dir, 'fixture.ost');
   await writeFile(filename, 'fixture');
   const calls = [];
-  const bridge = new LocalFileBridge({ files: [filename], run: async args => {
+  const bridge = new LocalFileBridge({ files: [filename], fulltextIndex: new WindowsFulltextIndex({ directory: path.join(dir, 'index') }), run: async args => {
     calls.push(args);
     if (args.includes('--message')) {
       const nid = Number(args[args.indexOf('--message') + 1]);
@@ -132,13 +133,13 @@ test('offline person search fetches each candidate at most once and keeps the 50
   assert.equal(result.next_offset, 50);
   assert.equal(calls.filter(args => args.includes('--message')).length, 50);
 });
-test('offline combined body and person search reuses one fetched message', async t => {
+test('offline combined body and person search filters recipients before fetching full body', async t => {
   const rows = [{ nid: 71, subject: 'metadata miss', sender_name: 'Sender', sender_email: 'sender@example.invalid', has_attachments: false, delivered: '2026-10-20 01:00:00' }];
   const messages = { 71: { sender_name: 'Sender', sender_email: 'sender@example.invalid', recipients: [{ kind: 'to', name: '张三', email: 'zhang@example.invalid' }], body: '正文命中', body_format: 'plain', body_truncated: false, attachments: [] } };
   const { bridge, calls } = await fixtureBridge(t, rows, messages);
   const result = await bridge.call('search', searchParams({ query: '正文命中', search_body: true, person: '张三', person_role: 'to' }));
   assert.equal(result.messages.length, 1);
-  assert.equal(calls.filter(args => args.includes('--message')).length, 1);
+  assert.deepEqual(calls.filter(args => args.includes('--message')).map(args => args.at(-1)), ['1', '16000000']);
   assert.equal(result.body_search_incomplete, false);
 });
 test('local store mutation is reported instead of silently returning mixed data', async t => {

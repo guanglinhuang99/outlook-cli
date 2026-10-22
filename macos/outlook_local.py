@@ -1102,7 +1102,8 @@ def person_matches(row, person, role="any"):
     return matched, incomplete
 
 
-def search(index, args):
+def search_candidates(index, args):
+    """Apply received-time and people constraints before any body is opened."""
     if args.from_date and day_start(args.from_date) < day_start(index["summary"]["scope_from_date"]):
         raise ValueError("requested date predates snapshot scope; build a wider snapshot")
     start = day_start(args.from_date) if args.from_date else None
@@ -1112,7 +1113,7 @@ def search(index, args):
         raise ValueError("requested end date predates snapshot scope; build a wider snapshot")
     if start is not None and end is not None and start >= end:
         raise ValueError("from-date must not exceed to-date")
-    query, matched = args.query.casefold(), []
+    candidates = []
     person = getattr(args, "person", None)
     role = getattr(args, "person_role", "any")
     person_incomplete = False
@@ -1122,17 +1123,34 @@ def search(index, args):
         if start is not None or end is not None:
             if received is None or (start is not None and received < start) or (end is not None and received >= end):
                 continue
-        fields = (["subject", "sender", "sender_name", "preview"] if args.field == "all"
-                  else ["sender", "sender_name"] if args.field == "sender" else [args.field])
-        hits = [field for field in fields if query in (row.get(field) or "").casefold()]
-        if query and not hits:
-            continue
         person_roles, incomplete = person_matches(row, person, role)
         person_incomplete |= incomplete
         if person and not person_roles:
             continue
+        candidates.append((row, person_roles))
+    return candidates, {"received_time_unknown": unknown_times,
+                        "date_filter_incomplete": bool(unknown_times and (start is not None or end is not None)),
+                        "person_search_incomplete": person_incomplete}
+
+
+def search(index, args):
+    candidates, diagnostics = search_candidates(index, args)
+    query, matched = args.query.casefold(), []
+    person = getattr(args, "person", None)
+    role = getattr(args, "person_role", "any")
+    body_hits = getattr(args, "body_hits", {})
+    for row, person_roles in candidates:
+        fields = (["subject", "sender", "sender_name", "preview"] if args.field == "all"
+                  else ["sender", "sender_name"] if args.field == "sender" else [args.field])
+        hits = [field for field in fields if query in (row.get(field) or "").casefold()]
+        if row["id"] in body_hits:
+            hits.append("body")
+        if query and not hits:
+            continue
         matched.append((row, hits if query else [], person_roles))
-    signature = sha(json.dumps([index["snapshot"], args.query, args.field, args.from_date, args.to_date, args.limit, person, role]).encode())[:16]
+    signature = sha(json.dumps([index["snapshot"], args.query, args.field, args.from_date, args.to_date,
+                               args.limit, person, role, getattr(args, "search_body", False),
+                               getattr(args, "body_revision", None)]).encode())[:16]
     offset = 0
     if args.cursor:
         cursor_signature, offset_value = args.cursor.split(":")
@@ -1144,14 +1162,13 @@ def search(index, args):
     # Format only the requested page: dates and public metadata are relatively
     # expensive, and broad keyword/person searches can match thousands of rows.
     items = [{**metadata(row), "matched_fields": hits,
+              **({"body_snippet": body_hits[row["id"]]} if row["id"] in body_hits else {}),
               **({"matched_person_roles": roles} if person else {})}
              for row, hits, roles in matched[offset:offset + args.limit]]
     next_offset = offset + len(items)
     return {"snapshot": index["snapshot"], "items": items, "total_matched": len(matched),
             "scope_from_date": index["summary"]["scope_from_date"], "captured_at": index["created_at"],
-            "date_basis": "received_at", "received_time_unknown": unknown_times,
-            "date_filter_incomplete": bool(unknown_times and (start is not None or end is not None)),
-            "person_search_incomplete": person_incomplete,
+            "date_basis": "received_at", **diagnostics,
             "complete": next_offset >= len(matched),
             "next_cursor": f"{signature}:{next_offset}" if next_offset < len(matched) else None,
             "coverage": index["summary"]["coverage"]}

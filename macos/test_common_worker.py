@@ -137,9 +137,88 @@ class CommonWorkerTests(unittest.TestCase):
             self.assertEqual(missing['messages'], [])
             self.assertTrue(missing['person_search_incomplete'])
 
+    def test_body_search_matches_real_chinese_body_only_text(self):
+        body_id = next(row['id'] for row in self.fixture.base['items']
+                       if row['message_id'] == '<first@example.test>')
+        for identifier, membership in self.fixture.scope['messages'].items():
+            if identifier == body_id:
+                membership['folder_id'] = 'inbox'
+            elif membership['folder_id'] == 'inbox':
+                membership['folder_id'] = 'deep'
+        self.fixture.scope['fingerprint'] = 'shared-body-only'
+        source = self.fixture.fixture.body_source
+        source.write_text(source.read_text().replace(
+            '</body>', '<p>正文独有预算复核</p></body>'))
+        self.fixture.refresh()
+
+        metadata_only = self.reader.perform('search', {
+            'folder': 'inbox', 'query': '正文独有预算复核', 'limit': 1})
+        self.assertEqual(metadata_only['messages'], [])
+        result = self.reader.perform('search', {
+            'folder': 'inbox', 'query': '正文独有预算复核', 'search_body': True,
+            'limit': 1})
+        self.assertEqual(len(result['messages']), 1)
+        self.assertIn('正文独有预算复核', result['messages'][0]['body_snippet'])
+        self.assertFalse(result['body_search_incomplete'])
+        self.assertEqual(result['fulltext']['candidates'], 1)
+        self.assertEqual(result['fulltext']['pending'], 0)
+        self.assertEqual(result['fulltext']['errors'], 0)
+        self.assertTrue(self.reader.perform('health', {})['capabilities']['body_search'])
+
+    def test_body_search_filters_person_before_index_and_retries_pending_window(self):
+        directory, index = self.fixture.client._current()
+        inbox = next(item for item in index['items'] if item['folder_id'] == 'inbox')
+        nested = next(item for item in index['items'] if item['folder_id'] == 'deep')
+        inbox['participants'] = {
+            'sender': None, 'to': [{'name': '李四', 'address': 'li@example.test'}], 'cc': []}
+        inbox['participants_status'] = {'sender': 'redacted', 'to': 'verified', 'cc': 'verified'}
+        nested['folder_id'] = 'inbox'
+        stats = dict(candidates=1, indexed=0, missing=0, errors=0, pending=1,
+                     updated=0, reused=0, complete=False, revision='partial')
+        with patch.object(self.fixture.client, '_current', return_value=(directory, index)), \
+                patch.object(self.fixture.client._fulltext_index, 'search',
+                             return_value=({inbox['id']: '正文片段'}, stats)) as search:
+            result = self.reader.perform('search', {
+                'folder': 'inbox', 'query': '预算', 'search_body': True,
+                'person': '李四', 'person_role': 'to', 'scan_limit': 2, 'limit': 1})
+        self.assertEqual([row['id'] for row in search.call_args.args[2]], [inbox['id']])
+        self.assertEqual(result['messages'][0]['body_snippet'], '正文片段')
+        self.assertEqual(result['next_offset'], 0)
+        self.assertTrue(result['retry_required'])
+        self.assertTrue(result['body_search_incomplete'])
+        self.assertFalse(result['complete'])
+
+    def test_body_search_paginates_each_real_body_once(self):
+        body_ids = {row['id'] for row in self.fixture.base['items']
+                    if row['message_id'] in {'<first@example.test>', '<second@example.test>'}}
+        for identifier, membership in self.fixture.scope['messages'].items():
+            membership['folder_id'] = 'inbox' if identifier in body_ids else 'deep'
+        self.fixture.scope['fingerprint'] = 'shared-body-pagination'
+        first_source = self.fixture.fixture.body_source
+        first_source.write_text(first_source.read_text().replace(
+            '</body>', '<p>预算分页</p></body>'))
+        second_source = self.fixture.fixture.gzip_body_source
+        second_html = gzip.decompress(second_source.read_bytes()).decode().replace(
+            '</body>', '<p>预算分页</p></body>')
+        second_source.write_bytes(gzip.compress(second_html.encode()))
+        self.fixture.refresh()
+
+        params = {'folder': 'inbox', 'query': '预算分页', 'search_body': True,
+                  'scan_limit': 2, 'limit': 1}
+        first = self.reader.perform('search', params)
+        self.assertEqual(len(first['messages']), 1)
+        self.assertIsNotNone(first['next_offset'])
+        self.assertFalse(first['body_search_incomplete'])
+        second = self.reader.perform('search', {**params, 'offset': first['next_offset']})
+        self.assertEqual(len(second['messages']), 1)
+        self.assertNotEqual(first['messages'][0]['id'], second['messages'][0]['id'])
+        self.assertIsNone(second['next_offset'])
+        self.assertTrue(second['complete'])
+
     def test_invalid_person_search_is_rejected_before_loading_index(self):
         with patch.object(self.fixture.client, '_current', side_effect=AssertionError('invalid search must fail early')):
-            for params in ({}, {'person': ' '}, {'person': 'x', 'person_role': 'bcc'}, {'person_role': 'to'}):
+            for params in ({}, {'person': ' '}, {'person': 'x', 'person_role': 'bcc'}, {'person_role': 'to'},
+                           {'query': '预算', 'search_body': 'true'}):
                 with self.assertRaises(common.ReadError):
                     self.reader.perform('search', params)
 
@@ -212,7 +291,7 @@ class CommonWorkerTests(unittest.TestCase):
             self.assertEqual(previous_day['messages'], [])
 
     def test_unsupported_filters_and_foreign_ids_fail_explicitly(self):
-        for method, params in [('messages', {'unread': False}), ('search', {'query': '中文', 'search_body': True}),
+        for method, params in [('messages', {'unread': False}),
                                ('read', {'id': self.message_id(self.fixture.ids[0]), 'format': 'html'})]:
             with self.assertRaises(common.ReadError):
                 self.reader.perform(method, params)

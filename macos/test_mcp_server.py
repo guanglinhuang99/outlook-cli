@@ -102,7 +102,7 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(service.calls, [
             (
                 "outlook_local_search",
-                {"field": "subject", "include_subfolders": True, "limit": 20, "person_role": "any"},
+                {"field": "subject", "include_subfolders": True, "limit": 20, "person_role": "any", "search_body": False},
             )
         ])
 
@@ -118,6 +118,7 @@ class McpServerTests(unittest.TestCase):
                 "outlook_local_search",
                 {
                     "query": "合规🧪",
+                    "search_body": True,
                     "field": "all",
                     "person": "张三",
                     "person_role": "cc",

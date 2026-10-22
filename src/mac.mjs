@@ -9,6 +9,7 @@ export class MacCacheBridge extends OutlookBridge {
     const workerEnv = profileDir ? { ...process.env, OUTLOOK_MAC_PROFILE: profileDir } : process.env;
     super({
       timeoutMs,
+      enableWindowsFulltext: false,
       spawnWorker: spawnWorker ?? (() => spawn(process.env.OUTLOOK_MAC_PYTHON ?? 'python3', [macWorkerPath], {
         env: workerEnv,
         stdio: ['pipe', 'pipe', 'pipe']

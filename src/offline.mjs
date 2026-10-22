@@ -5,6 +5,8 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { convert } from 'html-to-text';
+import { WindowsFulltextIndex } from './windows-fulltext-index.mjs';
+import { searchWindowsFulltext } from './windows-fulltext.mjs';
 
 const execute = promisify(execFile);
 const root = fileURLToPath(new URL('..', import.meta.url));
@@ -78,7 +80,7 @@ export function asText(message) {
 }
 
 export class LocalFileBridge {
-  constructor({ binary = process.env.OUTLOOK_LOCAL_READER ?? path.join(root, 'runtime/ost-mcp/ost-mcp.exe'), files, run, timeoutMs = 45000 } = {}) {
+  constructor({ binary = process.env.OUTLOOK_LOCAL_READER ?? path.join(root, 'runtime/ost-mcp/ost-mcp.exe'), files, run, timeoutMs = 45000, fulltextIndex } = {}) {
     this.binary = binary;
     this.files = files;
     this.run = run ?? (async (args, timeout) => (await execute(this.binary, args, { encoding: 'utf8', windowsHide: true, timeout, maxBuffer: 64 * 1024 * 1024 })).stdout);
@@ -87,17 +89,22 @@ export class LocalFileBridge {
     this.active = false;
     this.tail = Promise.resolve();
     this.closed = false;
+    this.fulltextIndex = fulltextIndex;
   }
-  call(method, params) {
+  call(method, params, { timeoutMs = this.timeoutMs } = {}) {
     if (this.closed) return Promise.reject(localError('STOPPING', 'Service stopped'));
+    if (method === 'search' && params.search_body) {
+      return searchWindowsFulltext(this, params, this.fulltextIndex ??= new WindowsFulltextIndex());
+    }
     if (this.queue.length >= 32) return Promise.reject(localError('BUSY', 'Local reader queue is full'));
     const ticket = {};
+    const deadline = Date.now() + Math.min(timeoutMs, this.timeoutMs);
     this.queue.push(ticket);
     const result = this.tail.then(async () => {
       this.queue.splice(this.queue.indexOf(ticket), 1);
       if (this.closed) throw localError('STOPPING', 'Service stopped');
       this.active = true;
-      this.deadline = Date.now() + this.timeoutMs;
+      this.deadline = deadline;
       try { return await this.perform(method, params); } finally { this.active = false; }
     });
     this.tail = result.catch(() => {});
@@ -178,6 +185,21 @@ export class LocalFileBridge {
   async message(store, nid, maxChars = 1) {
     return this.invoke([store.path, '--message', String(nid), '--max-body-chars', String(maxChars)]);
   }
+  async fulltextFolder(store, nid, rows) {
+    rows ??= await this.folderRows(store);
+    const allowed = new Set(rows.filter(row => !row.is_search_folder
+      && /(?:^|\/)IPM_SUBTREE\/[^/]+$/.test(row.path)
+      && [...aliases.inbox, ...aliases.sent].includes(row.name?.toLowerCase())).map(row => row.nid));
+    const visited = new Set();
+    let row = rows.find(item => item.nid === nid);
+    while (row && !visited.has(row.nid)) {
+      if (row.is_search_folder || aliases.deleted.includes(row.name?.toLowerCase())) break;
+      if (allowed.has(row.nid)) return;
+      visited.add(row.nid);
+      row = rows.find(item => item.nid === row.parent_nid);
+    }
+    throw localError('FULLTEXT_FOLDER_SCOPE', 'Body indexing requires a verified Inbox or Sent folder (or a child), excluding Deleted. Select a folder ID from folders.');
+  }
   attachmentMetadata(rows) {
     return rows.map((a, i) => ({ index: i + 1, filename: a.filename, size_bytes: a.data_len ?? a.declared_size, type: a.data_len === null ? null : 1, mime: a.mime }));
   }
@@ -186,7 +208,7 @@ export class LocalFileBridge {
     // Validate all files touched during this operation after reading. This detects
     // common concurrent writes, not every possible torn-page race in this parser.
     const signatures = new Map();
-    const track = async store => { if (signatures.has(store.path)) return; const s = await stat(store.path); signatures.set(store.path, { size: s.size, mtimeMs: s.mtimeMs }); };
+    const track = async store => { if (signatures.has(store.path)) return; signatures.set(store.path, await this.storeGeneration(store)); };
     for (const store of stores) await track(store);
     let result;
     if (method === 'health') {
@@ -216,28 +238,60 @@ export class LocalFileBridge {
       const selected = await this.select(stores, params.id ?? params.folder, params.id ? 'message' : 'folder');
       const { store, nid } = selected;
       await track(store);
-      if (method === 'folders') {
+      const generation = signatures.get(store.path);
+      if (method.startsWith('fulltext_') && params.validation && params.validation !== generation) {
+        throw localError('OFFLINE_STORE_CHANGED', 'Local store changed during body indexing; repeat this page after Outlook finishes syncing.');
+      }
+      if (method === 'fulltext_validate') {
+        await this.fulltextFolder(store, nid, selected.rows);
+        result = { valid: true };
+      } else if (method === 'fulltext_read') {
+        const folder = await this.select(stores, params.folder, 'folder');
+        if (folder.store.key !== store.key) throw localError('BACKEND_ID_MISMATCH', 'Message and folder belong to different stores');
+        await this.fulltextFolder(store, folder.nid, folder.rows);
+        const current = await this.query(store, `SELECT nid FROM messages WHERE nid = ${nid} AND folder_nid = ${folder.nid}`, 1);
+        const signature = `${generation}:${nid}`;
+        if (!current.length || signature !== params.signature) result = { status: 'changed' };
+        else {
+          const message = await this.message(store, nid, 16000000);
+          if (message.body == null) result = { status: 'missing' };
+          else if (message.body_truncated || message.body.length > 16000000) result = { status: 'truncated' };
+          else if (!['plain', 'html'].includes(message.body_format)) result = { status: 'unsupported' };
+          else {
+            // Remove html-to-text's structural truncation as well as its input
+            // prefix cap. The bounded source and process deadline remain.
+            const text = message.body_format === 'plain' ? message.body : convert(message.body, {
+              wordwrap: false, limits: { maxInputLength: Infinity, maxDepth: Infinity, maxChildNodes: Infinity },
+              selectors: [{ selector: 'img', format: 'skip' }, { selector: 'a', options: { ignoreHref: true } }]
+            });
+            result = { status: 'ready', text, signature };
+          }
+        }
+      } else if (method === 'folders') {
         const rows = selected.rows ?? await this.folderRows(store);
         const parent = rows.find(r => r.nid === nid);
         if (!parent) throw localError('INVALID_ID', 'Local folder no longer exists');
         const children = rows.filter(r => r.parent_nid === nid);
         const end = Math.min(children.length, params.offset + params.limit);
         result = { parent: this.folderInfo(parent, rows, store), folders: children.slice(params.offset, end).map(r => this.folderInfo(r, rows, store)), total: children.length, next_offset: end < children.length ? end : null };
-      } else if (method === 'messages' || method === 'search') {
+      } else if (method === 'messages' || method === 'search' || method === 'fulltext_candidates') {
+        const indexing = method === 'fulltext_candidates';
+        const searching = method === 'search' || indexing;
+        if (indexing) await this.fulltextFolder(store, nid, selected.rows);
         const filters = [`folder_nid = ${nid}`, "(message_class = 'IPM.Note' OR message_class LIKE 'IPM.Note.%')"];
         if (params.unread !== undefined) filters.push(`unread = ${params.unread ? 'true' : 'false'}`);
         if (params.after) filters.push(`delivered >= TIMESTAMP '${new Date(params.after).toISOString().replace('T', ' ').replace('Z', '')}'`);
         if (params.before) filters.push(`delivered < TIMESTAMP '${new Date(params.before).toISOString().replace('T', ' ').replace('Z', '')}'`);
-        const budget = Math.min(params.scan_limit, method === 'search' ? 50 : params.scan_limit);
+        const budget = Math.min(params.scan_limit, searching ? 50 : params.scan_limit);
         const rows = await this.query(store, `SELECT *, count(*) OVER() AS total FROM messages WHERE ${filters.join(' AND ')} ORDER BY delivered DESC NULLS LAST, nid DESC LIMIT ${budget + 1} OFFSET ${params.offset}`, budget + 1);
         const matches = [];
         let scanned = 0;
         let incompleteBodies = 0;
         let incompletePersons = false;
-        const query = typeof params.query === 'string' ? params.query : '';
+        const query = !indexing && typeof params.query === 'string' ? params.query : '';
         const person = typeof params.person === 'string' && params.person.length > 0 ? params.person : null;
         const allowedPersonRoles = ['any', 'sender', 'to', 'cc'];
-        if (method === 'search' && Object.hasOwn(params, 'person_role') && !allowedPersonRoles.includes(params.person_role)) {
+        if (searching && Object.hasOwn(params, 'person_role') && !allowedPersonRoles.includes(params.person_role)) {
           throw localError('INVALID_ARGUMENT', 'person_role must be one of any, sender, to, cc');
         }
         const personRole = params.person_role ?? 'any';
@@ -246,7 +300,8 @@ export class LocalFileBridge {
           let message;
           let personResult;
           let match = true;
-          if (method === 'search') {
+          if (indexing && (!row.sender_name || !row.sender_email)) message = await this.message(store, row.nid, 1);
+          if (searching) {
             match = query.length === 0 || [row.subject, row.sender_name, row.sender_email].some(value => contains(value, query));
             if (!match && (!row.sender_name || !row.sender_email || params.search_body)) {
               message = await this.message(store, row.nid, params.search_body ? 2000000 : 1);
@@ -274,12 +329,23 @@ export class LocalFileBridge {
               if (Array.isArray(message.attachments)) item.attachment_count = message.attachments.length;
             }
             if (person && personResult) item.matched_person_roles = personResult.matched_roles;
+            if (indexing) {
+              // The pinned parser exposes no per-message change key. Any store
+              // change conservatively revalidates selected bodies, including
+              // cache fills which can retain the same message modified time.
+              item._fulltext_signature = `${generation}:${row.nid}`;
+              item._fulltext_offset = params.offset + scanned;
+            }
             matches.push(item);
             if (matches.length >= params.limit) break;
           }
         }
         const next = scanned < rows.length ? params.offset + scanned : null;
         result = { messages: matches, scanned, scan_limit_applied: budget, filtered_item_count: rows[0]?.total ?? null, next_offset: next, complete: next === null, scope: 'single_folder', pagination: 'live_offset_not_snapshot', body_search_incomplete: incompleteBodies > 0, person_search_incomplete: person ? incompletePersons : false };
+        if (indexing) {
+          result.validation = generation;
+          result.folder_id = encodeLocalId('folder', store.key, nid);
+        }
       } else if (method === 'read') {
         if (params.body_offset + params.max_chars > 2000000) throw localError('OFFLINE_BODY_LIMIT', 'Local reader supports the first 2,000,000 body characters per message');
         // Convert a stable source prefix before pagination; independently converting
@@ -313,10 +379,13 @@ export class LocalFileBridge {
       }
       result.local_file_modified_at = store.modified;
     }
-    for (const [filename, before] of signatures) {
-      const after = await stat(filename);
-      if (before.size !== after.size || before.mtimeMs !== after.mtimeMs) throw localError('OFFLINE_STORE_CHANGED', 'Local store changed while reading. Retry after Outlook finishes syncing or closes.');
+    for (const store of stores) {
+      if (signatures.get(store.path) !== await this.storeGeneration(store)) throw localError('OFFLINE_STORE_CHANGED', 'Local store changed while reading. Retry after Outlook finishes syncing or closes.');
     }
     return { ...result, backend: 'local', data_scope: 'cached_only', limitations: ['Only data already stored locally is available; file modification time is not last-sync time.', 'Parser compatibility is limited; encrypted stores and some formats are unsupported.', 'COM and local-file IDs are different.'] };
+  }
+  async storeGeneration(store) {
+    const info = await stat(store.path, { bigint: true });
+    return createHash('sha256').update([store.key, info.dev, info.ino, info.size, info.mtimeNs, info.ctimeNs].join(':')).digest('hex');
   }
 }

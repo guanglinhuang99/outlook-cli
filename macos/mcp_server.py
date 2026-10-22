@@ -102,6 +102,7 @@ _SEARCH_PROPERTIES = {
     "person": _string("Optional literal name or email substring in verified sender/to/cc metadata; combined with query using AND. Missing participant evidence is reported, never guessed.", max_length=500),
     "person_role": _string("Which participant role to search.", enum=("any", "sender", "to", "cc"), default="any"),
     "field": _string("Search field.", enum=("subject", "sender", "preview", "all"), default="subject"),
+    "search_body": _boolean("Also search complete locally cached plaintext using an incremental SQLite index. Literal Chinese short keywords are supported. Missing bodies are counted; if retry_required is true repeat without a cursor before paging. Attachment contents are excluded.", default=False),
     "from_date": _string(
         "Inclusive received date in YYYY-MM-DD form, interpreted in Asia/Singapore.",
         max_length=MAX_DATE_LENGTH,

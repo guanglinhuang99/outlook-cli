@@ -35,7 +35,7 @@ Codex / 其他 Agent / 命令行
 | 已删除邮件 | 原有后端支持；需要时显式选择目录 | 排除已删除及其子目录、归属不明邮件 |
 | 日期筛选 | 接收时间 `received_at` | 接收时间 `received_at`（验证后的 `LastDeliveryTime`） |
 | 正文 | 分页文本读取，视后端支持 HTML | 中文文本提取与分页，缺失状态明确返回 |
-| 搜索 | 主题、发件人，可选正文 | 主题、发件人 |
+| 搜索 | 主题、发件人，可选正文 | 主题、发件人，可选本地完整正文 |
 | 附件 | 普通文件附件，单个最大 10 MiB | 可可靠关联的缓存附件，单个最大 10 MiB |
 
 共享工具每次查询一个文件夹。读取所有子目录需要逐级遍历，不能把一次 `today` 或 `search` 的结果当成全部邮箱。Linux 可运行协议和合成缓存测试，暂不提供实际邮箱后端。
@@ -58,7 +58,7 @@ node bin/outlook.mjs health
 node bin/outlook.mjs today --folder inbox --limit 25
 ```
 
-`start` 启动后台服务，`health` 检查邮件后端。Mac 首次建立邮件头、目录和接收时间索引仍需扫描本地缓存，但不会预先复制全部历史正文；正文在 `read` 时按需校验并保存，后续分页复用已保存内容。后续命令在项目目录执行；也可使用 `sh outlook.sh` 代替 `node bin/outlook.mjs`。
+`start` 启动后台服务，`health` 检查邮件后端。Mac 首次建立邮件头、目录和接收时间索引仍需扫描本地缓存，但不会预先复制全部历史正文；正文在 `read` 或显式启用 `search_body` 时按需校验并保存，后续分页和搜索复用已保存内容。后续命令在项目目录执行；也可使用 `sh outlook.sh` 代替 `node bin/outlook.mjs`。
 
 默认自动发现唯一的 Outlook profile。存在多个 profile 时，先显式设置再启动：
 
@@ -80,7 +80,7 @@ node bin/outlook.mjs start
 
 ### Windows：从源码安装
 
-准备：Git、Node.js **22+**、Windows PowerShell **5.1**，以及已配置的经典 Outlook 或支持的本地 OST/PST 文件。
+准备：Git、Node.js **22.13+（推荐 24 LTS）**、Windows PowerShell **5.1**，以及已配置的经典 Outlook 或支持的本地 OST/PST 文件。
 
 ```powershell
 git clone --branch main https://github.com/guanglinhuang99/outlook-cli.git
@@ -129,7 +129,7 @@ node bin/outlook.mjs read --id '<message_id>' --max-chars 20000
 node bin/outlook.mjs read --id '<message_id>' --body-offset 20000 --max-chars 20000
 ```
 
-将示例占位符替换成响应中的真实 ID。检索结果的 `next_offset` 非空时，保持原筛选条件并用 `--offset` 继续；空白页不代表检索结束。Mac 暂不支持未读筛选、正文搜索或 HTML 原文请求。
+将示例占位符替换成响应中的真实 ID。检索结果的 `next_offset` 非空时，保持原筛选条件并用 `--offset` 继续；空白页不代表检索结束。Mac 暂不支持未读筛选或 HTML 原文请求；正文搜索需显式设置 `--search-body true`，并按 `fulltext.pending` / `body_search_incomplete` 处理索引状态。
 
 ### 读取收件箱、已发送下的全部子目录
 
@@ -148,11 +148,24 @@ Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa
 
 搜索性能：Mac 在常驻进程中复用已验证索引，仅复制返回页；用 Python 标准库 SQLite 持久保存 Osa 日志的解析元数据，重启后也可复用未变化的日志，仍检查完整日志清单和接收时间，正文按需读取。无需额外安装数据库服务，SQLite 文件位于程序自己的私有状态目录。Windows COM 搜索复用已经读取的发件人信息，单封读取复用附件集合；离线 OST/PST 搜索复用同一次读取的结果。两端均保留接收时间筛选及原始邮件只读行为。实际耗时取决于邮箱规模和后端，Mac 的测量不能代表 Windows 性能。
 
-关键词默认查主题和发件人，Mac 还查已有摘要，不展开正文。Windows 可显式启用 `--search-body true`，Mac 全正文检索仍不支持。可同时传 `--after` / `--before`，两平台均按接收时间先筛选；日期和文件夹范围越明确，需要检查的候选邮件越少。
+关键词默认查主题、发件人和 Mac 已有摘要，不展开正文。Mac 和 Windows 都可显式启用 `--search-body true`，在独立的私有 SQLite 索引中搜索纯文本正文，命中时返回 `body_snippet`。支持中文单字、双字及更长的字面关键词；三字符及以上使用 FTS5 trigram，一、二字符在筛选后的正文中匹配。先按文件夹、接收时间及人员条件筛选，再按需建立索引，不修改原始邮件或已读状态，附件内容不纳入索引。
+
+Windows COM 按邮件变更标识增量更新；未变化的正文跨查询、跨服务重启复用。离线 OST/PST 文件未变化时同样复用；目前解析器没有可靠的逐邮件变更标识，文件变化后会保守重校验本次候选正文，避免漏掉刚补下载的内容。Windows 使用 Node 内置 SQLite，无需另装数据库或 Python；源码运行全文搜索需 Node 22.13+，Windows 安装器附带的 Node 24 已满足要求。
+
+索引数据库上限 512 MiB。Windows 每次扫描最多 50 个候选项目，只允许收件箱、已发送及其子目录，排除已删除；共享接口每次查询一个文件夹，子目录需逐级遍历。首次正文读取受时间及大小预算限制：`retry_required=true` 时保持**本页原参数**重试；完成后才按 `next_offset` 翻页。检查 `fulltext` 与 `body_search_incomplete`，正文缺失、截断、格式不支持或索引错误均不能视作完整的无匹配结果。Mac 的 pending 重试与原生接口说明见下文。两平台均按接收时间筛选，不用发送时间作为增量水位；结果不代表服务器上的完整邮箱。
+```sh
+node bin/outlook.mjs search --folder inbox --query '预算' --search-body true
+```
+
+Mac 原生 `outlook_local_search` 的 JSON 参数：
+
+```json
+{"query":"预算","field":"all","search_body":true,"limit":20}
+```
 
 已安装 Mac 原生 MCP 的 agent 可优先用 `outlook_local_digest` 读取日报/周报材料：精简邮件字段、按完整正文哈希去重，并用内容版本只返回变化的邮件。它保留缺失、截断、人员验证状态和每封邮件的独立身份；不自动生成 AI 摘要。调用和增量检查方法见 [Mac 精简读取说明](docs/macos.md#周报日报的精简读取)。共享 Node/Windows 工具接口不变。
 
-Mac 原生 MCP 使用 `outlook_local_search`，例如 `{"query":"预算","field":"all","person":"张三","person_role":"any","from_date":"2026-10-01","limit":20}`。不指定 `folder_id` 时覆盖已验证的收件箱、已发送及子目录；指定后默认含子目录。原生分页使用 `next_cursor`，共享 CLI/MCP 使用 `next_offset`。
+Mac 原生 MCP 使用 `outlook_local_search`，例如 `{"query":"预算","field":"all","search_body":true,"person":"张三","person_role":"any","from_date":"2026-10-01","limit":20}`。不指定 `folder_id` 时覆盖已验证的收件箱、已发送及子目录；指定后默认含子目录。原生分页使用 `next_cursor`，共享 CLI/MCP 使用 `next_offset`。原生 `complete` 仍表示分页是否结束；正文索引状态单独看 `body_search_incomplete` 和 `fulltext`，pending 大于 0 时先重复第一页。
 
 Mac 只公开已确认的收件箱和已发送目录树。目录名可能被 Outlook 脱敏，服务不会猜测原名称。邮件 ID 属于具体后端和缓存快照，失效时重新检索获取。
 
@@ -255,7 +268,7 @@ codex mcp list
 | Mac profile 不唯一 | 设置 `OUTLOOK_MAC_PROFILE` 后重新启动服务 |
 | `FOLDER_AMBIGUOUS` | 通过 `stores` → `folders` 获取明确目录 ID |
 | 正文或附件缺失 | 检查返回的状态和诊断，确认 Outlook 已同步；不要把缺失当成空内容 |
-| Mac 参数不支持 | 移除 `unread`、`search_body: true` 或 `format: html` |
+| Mac 参数不支持 | 移除 `unread` 或 `format: html`；正文搜索使用 `search_body: true` 明确启用 |
 | Windows COM 不可用 | 检查经典 Outlook 和服务的登录会话，或使用已配置的本地 OST/PST |
 | Agent 连接失败 | 确认服务已启动，配置中的绝对路径和状态目录一致 |
 
