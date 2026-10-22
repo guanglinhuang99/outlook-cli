@@ -1,4 +1,5 @@
 import mmap
+import random
 import struct
 import sys
 import tempfile
@@ -64,6 +65,66 @@ def make_block(
     return bytes(result)
 
 
+def reference_decode_lz4(src: bytes, expected: int) -> bytes:
+    """The previous byte-at-a-time match decoder used for differential tests."""
+    source = memoryview(src)
+    output = bytearray()
+    index = 0
+    while len(output) < expected:
+        token = source[index]
+        index += 1
+        literal_length = token >> 4
+        if literal_length == 15:
+            while True:
+                extension = source[index]
+                index += 1
+                literal_length += extension
+                if extension != 255:
+                    break
+        output.extend(source[index : index + literal_length])
+        index += literal_length
+        if len(output) == expected:
+            return bytes(output)
+        distance = source[index] | (source[index + 1] << 8)
+        index += 2
+        match_length = (token & 15) + 4
+        if (token & 15) == 15:
+            while True:
+                extension = source[index]
+                index += 1
+                match_length += extension
+                if extension != 255:
+                    break
+        match_start = len(output) - distance
+        for copy_index in range(match_length):
+            output.append(output[match_start + copy_index])
+    return bytes(output)
+
+
+def encoded_length(length: int) -> bytes:
+    """Encode the continuation bytes after a 15-valued LZ4 length nibble."""
+    remaining = length - 15
+    result = bytearray()
+    while remaining >= 255:
+        result.append(255)
+        remaining -= 255
+    result.append(remaining)
+    return bytes(result)
+
+
+def literal_match_block(prefix: bytes, distance: int, match_length: int) -> tuple[bytes, int]:
+    literal_nibble = min(len(prefix), 15)
+    match_nibble = min(match_length - 4, 15)
+    payload = bytearray(((literal_nibble << 4) | match_nibble,))
+    if len(prefix) >= 15:
+        payload.extend(encoded_length(len(prefix)))
+    payload.extend(prefix)
+    payload.extend((distance & 255, distance >> 8))
+    if match_length >= 19:
+        payload.extend(encoded_length(match_length - 4))
+    return bytes(payload), len(prefix) + match_length
+
+
 class HxContainerTests(unittest.TestCase):
     def test_targeted_block_read_skips_unrelated_corrupt_block(self):
         first = make_block(b'broken', corrupt_body=True)
@@ -96,8 +157,22 @@ class HxContainerTests(unittest.TestCase):
         value = "主题：你好，世界 🌏".encode("utf-8") + b"\x00\xff\x10"
         self.assertEqual(decode_lz4(literal_block(value), len(value)), value)
 
-    def test_overlapping_match_is_copied_one_byte_at_a_time(self):
+    def test_overlapping_match_is_copied_with_repeated_pattern(self):
         self.assertEqual(decode_lz4(bytes((0x10, ord("x"), 1, 0)), 5), b"xxxxx")
+
+    def test_non_overlapping_match_is_copied_as_one_slice(self):
+        payload, expected = literal_match_block(b"abcdefgh", 8, 8)
+        self.assertEqual(decode_lz4(payload, expected), b"abcdefghabcdefgh")
+
+    def test_randomized_matches_match_the_previous_decoder(self):
+        generator = random.Random(0x4858)
+        for _ in range(400):
+            prefix = bytes(generator.randrange(256) for _ in range(generator.randrange(1, 96)))
+            distance = generator.randrange(1, len(prefix) + 1)
+            match_length = generator.randrange(4, 512)
+            payload, expected = literal_match_block(prefix, distance, match_length)
+            self.assertEqual(decode_lz4(payload, expected),
+                             reference_decode_lz4(payload, expected))
 
     def test_corrupt_distance_and_short_input_raise(self):
         with self.assertRaises(ValueError):

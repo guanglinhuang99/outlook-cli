@@ -121,6 +121,8 @@ node bin/outlook.mjs today --date 2026-10-20 --folder inbox
 
 ```sh
 node bin/outlook.mjs search --folder inbox --query '项目' --limit 25
+node bin/outlook.mjs search --folder inbox --person '张三' --person-role any --limit 25
+node bin/outlook.mjs search --folder sent --query '预算' --person 'li@example.com' --person-role to --limit 25
 node bin/outlook.mjs read --id '<message_id>' --max-chars 20000
 
 # 正文未读完时，使用返回的 body.next_offset 继续
@@ -139,6 +141,18 @@ node bin/outlook.mjs messages --folder '<folder_id>' --limit 25
 ```
 
 从 `stores` 返回的 `root_id` 开始，逐级调用 `folders`，对每个目标目录调用 `messages`、`today` 或 `search`。目录列表和邮件列表都需要跟随 `next_offset`，直到为 null。多账户无法唯一确定 `inbox` / `sent` 时，使用明确的文件夹 ID。
+
+搜索支持关键词 `query` 和相关人员 `person`，至少填一个；同时填写时两个条件都必须满足。`person_role` 可选 `any`（默认）、`sender`（发件人）、`to`（收件人）、`cc`（抄送人），按姓名或邮箱做大小写不敏感的字面子串匹配，返回 `matched_person_roles`。人员不会从正文中猜测。查看每页的 `person_search_incomplete`：本地未保存收件人等证据时，未命中不等于该人员没有相关邮件。
+
+Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa 日志中被脱敏的 To/Cc，并校验邮件和角色归属。`participants_status` 和 `participants_evidence` 区分本地验证通过、部分结果及冲突；未缓存或未知格式仍可能缺失。升级后重新连接 MCP 并刷新索引即可生效，无需 Graph 或 Outlook 网络 API，原始邮件始终只读。
+
+搜索性能：Mac 在常驻进程中复用已验证索引，仅复制返回页；用 Python 标准库 SQLite 持久保存 Osa 日志的解析元数据，重启后也可复用未变化的日志，仍检查完整日志清单和接收时间，正文按需读取。无需额外安装数据库服务，SQLite 文件位于程序自己的私有状态目录。Windows COM 搜索复用已经读取的发件人信息，单封读取复用附件集合；离线 OST/PST 搜索复用同一次读取的结果。两端均保留接收时间筛选及原始邮件只读行为。实际耗时取决于邮箱规模和后端，Mac 的测量不能代表 Windows 性能。
+
+关键词默认查主题和发件人，Mac 还查已有摘要，不展开正文。Windows 可显式启用 `--search-body true`，Mac 全正文检索仍不支持。可同时传 `--after` / `--before`，两平台均按接收时间先筛选；日期和文件夹范围越明确，需要检查的候选邮件越少。
+
+已安装 Mac 原生 MCP 的 agent 可优先用 `outlook_local_digest` 读取日报/周报材料：精简邮件字段、按完整正文哈希去重，并用内容版本只返回变化的邮件。它保留缺失、截断、人员验证状态和每封邮件的独立身份；不自动生成 AI 摘要。调用和增量检查方法见 [Mac 精简读取说明](docs/macos.md#周报日报的精简读取)。共享 Node/Windows 工具接口不变。
+
+Mac 原生 MCP 使用 `outlook_local_search`，例如 `{"query":"预算","field":"all","person":"张三","person_role":"any","from_date":"2026-10-01","limit":20}`。不指定 `folder_id` 时覆盖已验证的收件箱、已发送及子目录；指定后默认含子目录。原生分页使用 `next_cursor`，共享 CLI/MCP 使用 `next_offset`。
 
 Mac 只公开已确认的收件箱和已发送目录树。目录名可能被 Outlook 脱敏，服务不会猜测原名称。邮件 ID 属于具体后端和缓存快照，失效时重新检索获取。
 

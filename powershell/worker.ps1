@@ -61,12 +61,13 @@ function Sender-Info($Mail) {
     }
     return @{ name = [string]$Mail.SenderName; address = $address; address_type = $addressType; smtp_address = $smtp }
 }
-function Mail-Metadata($Mail, $StoreId) {
-    $attachments = Track ($Mail.Attachments)
+function Mail-Metadata($Mail, $StoreId, $SenderInfo = $null, $Attachments = $null) {
+    if ($null -eq $Attachments) { $Attachments = Track ($Mail.Attachments) }
+    if ($null -eq $SenderInfo) { $SenderInfo = Sender-Info $Mail }
     return @{
         id = Make-Id 'message' $Mail.EntryID $StoreId
         subject = [string]$Mail.Subject
-        sender = Sender-Info $Mail
+        sender = $SenderInfo
         received_at = Iso-Date $Mail.ReceivedTime
         unread = [bool]$Mail.UnRead
         size_bytes = [int]$Mail.Size
@@ -74,8 +75,8 @@ function Mail-Metadata($Mail, $StoreId) {
         download_state = [int]$Mail.DownloadState
     }
 }
-function Attachment-List($Mail) {
-    $attachments = Track ($Mail.Attachments)
+function Attachment-List($Mail, $Attachments = $null) {
+    if ($null -eq $Attachments) { $Attachments = Track ($Mail.Attachments) }
     return @(for ($i = 1; $i -le $attachments.Count; $i++) {
         $a = Track ($attachments.Item($i))
         @{ index = $i; filename = [string]$a.FileName; size_bytes = [int]$a.Size; type = [int]$a.Type }
@@ -94,7 +95,98 @@ function Folder-Info($Folder) {
     }
 }
 function Contains-Text($Value, $Query) {
-    return ([string]$Value).IndexOf($Query, [StringComparison]::OrdinalIgnoreCase) -ge 0
+    return (-not [string]::IsNullOrEmpty($Query) -and ([string]$Value).IndexOf($Query, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+function Recipient-Info($Recipient) {
+    $type = $null
+    try { $type = [int]$Recipient.Type } catch { return $null }
+    if ($type -ne 1 -and $type -ne 2) { return $null }
+    $name = $null
+    $address = $null
+    $addressType = $null
+    $smtp = $null
+    try { $name = [string]$Recipient.Name } catch { }
+    try { $address = [string]$Recipient.Address } catch { }
+    $entry = $null
+    try {
+        $entry = Track ($Recipient.AddressEntry)
+        if ($entry) {
+            try { $addressType = [string]$entry.Type } catch { }
+            if ($addressType -eq 'SMTP' -and $address) { $smtp = $address }
+            if (-not $smtp) {
+                try {
+                    if ($entry.AddressEntryUserType -eq 0 -or $entry.AddressEntryUserType -eq 5) {
+                        $exchangeUser = Track ($entry.GetExchangeUser())
+                        if ($exchangeUser) { $smtp = $exchangeUser.PrimarySmtpAddress }
+                    } elseif ($entry.AddressEntryUserType -eq 1) {
+                        $distribution = Track ($entry.GetExchangeDistributionList())
+                        if ($distribution) { $smtp = $distribution.PrimarySmtpAddress }
+                    }
+                } catch { }
+            }
+            if (-not $smtp) {
+                try {
+                    $accessor = Track ($entry.PropertyAccessor)
+                    $smtp = $accessor.GetProperty('http://schemas.microsoft.com/mapi/proptag/0x39FE001E')
+                } catch { }
+            }
+        }
+    } catch { }
+    if ([string]::IsNullOrEmpty($smtp) -and $address -and $address -match '@') { $smtp = $address }
+    return @{
+        role = if ($type -eq 1) { 'to' } else { 'cc' }
+        name = if ([string]::IsNullOrEmpty($name)) { $null } else { $name }
+        address = if ([string]::IsNullOrEmpty($address)) { $null } else { $address }
+        address_type = if ([string]::IsNullOrEmpty($addressType)) { $null } else { $addressType }
+        smtp_address = if ([string]::IsNullOrEmpty($smtp)) { $null } else { [string]$smtp }
+    }
+}
+function Person-Match($Mail, $Person, $Role, $SenderInfo = $null) {
+    $matchedRoles = [Collections.Generic.List[string]]::new()
+    $incomplete = $false
+    $sender = $null
+    if ($Role -eq 'any' -or $Role -eq 'sender') {
+        if ($null -eq $SenderInfo) {
+            try { $SenderInfo = Sender-Info $Mail } catch { $SenderInfo = $null }
+        }
+        $sender = $SenderInfo
+        $senderValues = @($sender.name, $sender.address, $sender.smtp_address)
+        $senderNameAvailable = -not [string]::IsNullOrEmpty($sender.name)
+        $senderSmtpAvailable = -not [string]::IsNullOrEmpty($sender.smtp_address)
+        if (-not $senderNameAvailable -or -not $senderSmtpAvailable) { $incomplete = $true }
+        if ($senderValues | Where-Object { Contains-Text $_ $Person }) { $matchedRoles.Add('sender') }
+    }
+    if ($Role -eq 'any' -or $Role -eq 'to' -or $Role -eq 'cc') {
+        $recipients = $null
+        try { $recipients = Track ($Mail.Recipients) } catch { $incomplete = $true }
+        if ($null -eq $recipients) {
+            $incomplete = $true
+        } else {
+            try {
+                for ($i = 1; $i -le $recipients.Count; $i++) {
+                    $recipient = Track ($recipients.Item($i))
+                    $info = Recipient-Info $recipient
+                    if ($null -eq $info) {
+                        try {
+                            $type = [int]$recipient.Type
+                            if ($type -eq 1 -or $type -eq 2) { $incomplete = $true }
+                        } catch { $incomplete = $true }
+                        continue
+                    }
+                    if ($Role -ne 'any' -and $info.role -ne $Role) { continue }
+                    $values = @($info.name, $info.address, $info.smtp_address)
+                    $nameAvailable = -not [string]::IsNullOrEmpty($info.name)
+                    $smtpAvailable = -not [string]::IsNullOrEmpty($info.smtp_address)
+                    if (-not $nameAvailable -or -not $smtpAvailable) { $incomplete = $true }
+                    if (($values | Where-Object { Contains-Text $_ $Person }) -and -not $matchedRoles.Contains($info.role)) {
+                        $matchedRoles.Add($info.role)
+                    }
+                }
+            } catch { $incomplete = $true }
+        }
+    }
+    $orderedRoles = @('sender', 'to', 'cc') | Where-Object { $matchedRoles.Contains($_) }
+    return @{ matched = ($matchedRoles.Count -gt 0); matched_roles = @($orderedRoles); incomplete = $incomplete; sender = $sender }
 }
 function Run-Operation($Method, $Params) {
     try { $app = Track ([Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')) }
@@ -145,33 +237,59 @@ function Run-Operation($Method, $Params) {
             if ($clauses.Count) { $items = Track ($items.Restrict(($clauses -join ' AND '))) }
             $items.Sort('[ReceivedTime]', $true)
             $total = [int]$items.Count
+            $afterUtc = if ($Params.after) { ([DateTimeOffset]::Parse($Params.after)).UtcDateTime } else { $null }
+            $beforeUtc = if ($Params.before) { ([DateTimeOffset]::Parse($Params.before)).UtcDateTime } else { $null }
             $position = [Math]::Min([int]$Params.offset, $total)
             $scanned = 0
             $matches = [Collections.Generic.List[object]]::new()
+            $query = if ($null -eq $Params.query) { '' } else { [string]$Params.query }
+            $person = if ($null -eq $Params.person) { '' } else { [string]$Params.person }
+            $personActive = -not [string]::IsNullOrEmpty($person)
+            $personRole = if ($Params.person_role) { [string]$Params.person_role } else { 'any' }
+            if ($Method -eq 'search' -and @('any', 'sender', 'to', 'cc') -notcontains $personRole) { throw 'INVALID_ARGUMENT: person_role must be one of any, sender, to, cc' }
+            $personIncomplete = $false
             while ($position -lt $total -and $scanned -lt $Params.scan_limit -and $matches.Count -lt $Params.limit) {
                 $position++
                 $scanned++
                 $mail = Track ($items.Item($position))
                 if ($mail.Class -ne 43) { continue }
-                $receivedUtc = ([DateTime]$mail.ReceivedTime).ToUniversalTime()
-                if ($Params.after -and $receivedUtc -lt ([DateTimeOffset]::Parse($Params.after)).UtcDateTime) { continue }
-                if ($Params.before -and $receivedUtc -ge ([DateTimeOffset]::Parse($Params.before)).UtcDateTime) { continue }
-                $metadata = Mail-Metadata $mail $folder.StoreID
-                $match = $true
-                if ($Method -eq 'search') {
-                    $match = (Contains-Text $metadata.subject $Params.query) -or (Contains-Text $metadata.sender.name $Params.query) -or (Contains-Text $metadata.sender.address $Params.query) -or (Contains-Text $metadata.sender.smtp_address $Params.query)
-                    if (-not $match -and $Params.search_body) { $match = Contains-Text $mail.Body $Params.query }
+                if ($afterUtc -or $beforeUtc) {
+                    $receivedUtc = ([DateTime]$mail.ReceivedTime).ToUniversalTime()
+                    if ($afterUtc -and $receivedUtc -lt $afterUtc) { continue }
+                    if ($beforeUtc -and $receivedUtc -ge $beforeUtc) { continue }
                 }
-                if ($match) { $matches.Add($metadata) }
+                $match = $true
+                $senderInfo = $null
+                $personMatch = $null
+                if ($Method -eq 'search') {
+                    $match = [string]::IsNullOrEmpty($query) -or (Contains-Text $mail.Subject $query) -or (Contains-Text $mail.SenderName $query) -or (Contains-Text $mail.SenderEmailAddress $query)
+                    if (-not $match -and $query) {
+                        $senderInfo = Sender-Info $mail
+                        $match = Contains-Text $senderInfo.smtp_address $query
+                    }
+                    if (-not $match -and $Params.search_body) { $match = Contains-Text $mail.Body $query }
+                    if ($match -and $personActive) {
+                        $personMatch = Person-Match $mail $person $personRole $senderInfo
+                        $personIncomplete = $personIncomplete -or $personMatch.incomplete
+                        $match = $personMatch.matched
+                    }
+                }
+                if ($match) {
+                    if ($personMatch -and $personMatch.sender) { $senderInfo = $personMatch.sender }
+                    $metadata = Mail-Metadata $mail $folder.StoreID $senderInfo
+                    if ($personActive -and $personMatch) { $metadata.matched_person_roles = @($personMatch.matched_roles) }
+                    $matches.Add($metadata)
+                }
             }
             $next = $null
             if ($position -lt $total) { $next = $position }
-            return @{ messages = @($matches.ToArray()); scanned = $scanned; filtered_item_count = $total; next_offset = $next; complete = ($null -eq $next); scope = 'single_folder'; pagination = 'live_offset_not_snapshot' }
+            return @{ messages = @($matches.ToArray()); scanned = $scanned; filtered_item_count = $total; next_offset = $next; complete = ($null -eq $next); scope = 'single_folder'; pagination = 'live_offset_not_snapshot'; person_search_incomplete = if ($personActive) { $personIncomplete } else { $false } }
         }
         'read' {
             $mail = Get-Mail $Params.id
             $decoded = Parse-Id $Params.id 'message'
-            $result = Mail-Metadata $mail $decoded.store
+            $attachments = Track ($mail.Attachments)
+            $result = Mail-Metadata $mail $decoded.store $null $attachments
             if ($Params.format -eq 'html') { $body = [string]$mail.HTMLBody } else { $body = [string]$mail.Body }
             $offset = [Math]::Min([int]$Params.body_offset, $body.Length)
             $length = [Math]::Min([int]$Params.max_chars, $body.Length - $offset)
@@ -180,7 +298,7 @@ function Run-Operation($Method, $Params) {
             $result.body = @{ format = $Params.format; text = $body.Substring($offset, $length); total_chars = $body.Length; offset = $offset; next_offset = $next; truncated = ($null -ne $next) }
             $result.to = [string]$mail.To
             $result.cc = [string]$mail.CC
-            $result.attachments = @(Attachment-List $mail)
+            $result.attachments = @(Attachment-List $mail $attachments)
             return $result
         }
         'attachments' { return @{ attachments = @(Attachment-List (Get-Mail $Params.id)) } }

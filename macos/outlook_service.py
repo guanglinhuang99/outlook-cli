@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import date, datetime, timezone
 import fcntl
 import json
@@ -10,19 +11,26 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import tempfile
 import time
 from types import SimpleNamespace
 import uuid
 
 import outlook_local as core
+from osa_scope import LogParseCache
 
-VIEW_VERSION = 3
+VIEW_VERSION = 5
 RETAINED_VIEWS = 3
 MAX_EXPORT_FILES = 64
 MAX_EXPORT_BYTES = 512 * 1024**2
 BUNDLE_SOURCE_BYTES = 64 * 1024**2
 BUNDLE_VERIFY_BYTES = 64 * 1024**2
+INDEX_CACHE_LIMIT = 3
+INDEX_FINGERPRINT_FIELDS = (
+    "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns",
+    "st_mode", "st_nlink", "st_uid", "st_gid",
+)
 VERIFIED_MEMBERSHIP = {"verified_latest_observation", "verified_hx_folder_membership"}
 TOKEN = re.compile(r"[a-f0-9]{24}\Z")
 COVERAGE = ("Locally recoverable cache only; Inbox and Sent Items with all known descendants. "
@@ -75,6 +83,9 @@ class MailService:
         self.from_date = from_date
         self.refresh_seconds = refresh_seconds
         self._attachment_exports = OrderedDict()
+        self._index_cache = OrderedDict()
+        # The cache opens lazily during refresh, after the private state guard.
+        self._osa_parse_cache = LogParseCache(path=self.state / "osa-metadata.sqlite3")
 
     @contextmanager
     def _lock(self):
@@ -95,27 +106,48 @@ class MailService:
         finally:
             os.close(descriptor)
 
-    def _load(self, snapshot=None):
-        core.state_root(self.state)
-        if any((self.state / name).is_symlink() for name in ("CURRENT_SCOPE", "views", "snapshots")):
-            raise ValueError("state roots and pointer must not be symbolic links")
-        if snapshot is None:
-            snapshot = (self.state / "CURRENT_SCOPE").read_text().strip()
-        if not TOKEN.fullmatch(snapshot):
-            raise ValueError("invalid snapshot identifier")
-        view = self.state / "views" / snapshot
-        if view.exists() or view.is_symlink():
-            core._private_directory(view, "scoped view directory")
-        if view.is_symlink() or (view / "index.json").is_symlink():
-            raise ValueError("snapshot entries must not be symbolic links")
-        index = json.loads((view / "index.json").read_text())
+    @staticmethod
+    def _index_fingerprint(status):
+        return tuple(getattr(status, field) for field in INDEX_FINGERPRINT_FIELDS)
+
+    @classmethod
+    def _read_index(cls, path):
+        """Read one immutable index, retrying once if its file changes."""
+        for attempt in range(2):
+            core._private_file(path, "scoped snapshot index")
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            owned = True
+            try:
+                before_status = os.fstat(descriptor)
+                if not stat.S_ISREG(before_status.st_mode):
+                    raise ValueError("scoped snapshot index must be a regular file")
+                before = cls._index_fingerprint(before_status)
+                with os.fdopen(descriptor, "rb") as handle:
+                    owned = False
+                    raw = handle.read()
+                    after_status = os.fstat(handle.fileno())
+                after = cls._index_fingerprint(after_status)
+            finally:
+                if owned:
+                    os.close(descriptor)
+            core._private_file(path, "scoped snapshot index")
+            path_fingerprint = cls._index_fingerprint(path.stat())
+            if before != after or after != path_fingerprint:
+                if attempt == 0:
+                    continue
+                raise ValueError("scoped snapshot index changed during read")
+            return json.loads(raw), after
+        raise ValueError("scoped snapshot index changed during read")
+
+    def _validate_index(self, snapshot, view, index, profile, *, verify_checksum):
         if (index.get("view_version") != VIEW_VERSION or index.get("snapshot") != snapshot
                 or index.get("schema_version") != core.VERSION):
             raise ValueError("unsupported or mismatched scoped snapshot")
-        content = {k: v for k, v in index.items() if k != "snapshot"}
-        if core.sha(json.dumps(content, sort_keys=True, ensure_ascii=False).encode())[:24] != snapshot:
-            raise ValueError("scoped snapshot checksum mismatch")
-        if Path(index["profile"]).resolve() != core.discover_profile(self.profile):
+        if verify_checksum:
+            content = {k: v for k, v in index.items() if k != "snapshot"}
+            if core.sha(json.dumps(content, sort_keys=True, ensure_ascii=False).encode())[:24] != snapshot:
+                raise ValueError("scoped snapshot checksum mismatch")
+        if Path(index["profile"]).resolve() != profile:
             raise ValueError("snapshot belongs to a different Outlook profile; refresh before reading")
         base = index["source_snapshot"]
         if not TOKEN.fullmatch(base):
@@ -130,12 +162,48 @@ class MailService:
         if directory.is_symlink() or (directory / "payloads").is_symlink():
             raise ValueError("source snapshot entries must not be symbolic links")
         core.outside_source(self.state, index["profile"])
-        return directory, index
+        return directory
+
+    def _load(self, snapshot=None, *, copy_index=True):
+        core.state_root(self.state)
+        if any((self.state / name).is_symlink() for name in ("CURRENT_SCOPE", "views", "snapshots")):
+            raise ValueError("state roots and pointer must not be symbolic links")
+        if snapshot is None:
+            pointer = self.state / "CURRENT_SCOPE"
+            core._private_file(pointer, "scoped snapshot pointer")
+            snapshot = pointer.read_text().strip()
+        if not TOKEN.fullmatch(snapshot):
+            raise ValueError("invalid snapshot identifier")
+        view = self.state / "views" / snapshot
+        if view.exists() or view.is_symlink():
+            core._private_directory(view, "scoped view directory")
+        index_path = view / "index.json"
+        if view.is_symlink() or index_path.is_symlink():
+            raise ValueError("snapshot entries must not be symbolic links")
+        if not index_path.exists():
+            raise FileNotFoundError(index_path)
+        core._private_file(index_path, "scoped snapshot index")
+        profile = core.discover_profile(self.profile)
+        fingerprint = self._index_fingerprint(index_path.stat())
+        cached = self._index_cache.get(snapshot)
+        if cached is not None and cached["fingerprint"] == fingerprint:
+            index = cached["index"]
+            directory = self._validate_index(snapshot, view, index, profile, verify_checksum=False)
+            self._index_cache.move_to_end(snapshot)
+            return directory, deepcopy(index) if copy_index else index
+
+        index, fingerprint = self._read_index(index_path)
+        directory = self._validate_index(snapshot, view, index, profile, verify_checksum=True)
+        self._index_cache[snapshot] = {"fingerprint": fingerprint, "index": index}
+        self._index_cache.move_to_end(snapshot)
+        while len(self._index_cache) > INDEX_CACHE_LIMIT:
+            self._index_cache.popitem(last=False)
+        return directory, deepcopy(index) if copy_index else index
 
     def _fresh(self):
         try:
             check = json.loads((self.state / "REFRESH.json").read_text())
-            _, index = self._load()
+            _, index = self._load(copy_index=False)
             return (check["snapshot"] == index["snapshot"] and
                     0 <= time.time() - check["checked_unix"] < self.refresh_seconds and
                     core.day_start(index["summary"]["scope_from_date"]) <= core.day_start(self.from_date))
@@ -178,7 +246,7 @@ class MailService:
             _, base = core.load_index(self.state)
             from osa_scope import read_scope
             try:
-                scope = read_scope(profile, base["items"])
+                scope = read_scope(profile, base["items"], parse_cache=self._osa_parse_cache)
                 folders = folder_tree(scope["folders"])
                 if not folders:
                     raise ValueError("no verified Inbox or Sent folder tree is available in the local cache; previous view retained")
@@ -201,12 +269,16 @@ class MailService:
                 if received is not None and received < cutoff:
                     continue
                 items.append({**row, "received_unix": received,
+                              **core.merge_participants(row, membership),
                               "received_time_status": membership.get("received_time_status", "missing"),
                               "received_time_method": membership.get("received_time_method"),
                               "folder_id": identifier, "folder_path": folders[identifier]["path"],
                               "folder_status": membership["folder_status"],
                               "folder_evidence": membership.get("evidence", {}),
                               "mailbox_state": "inbox_or_sent_latest_local_observation"})
+                # Keep object-key/version diagnostics in the source snapshot,
+                # without copying the full contact collection twice per view.
+                items[-1].pop("hx_participants", None)
             items.sort(key=core.received_sort_key)
             folder_rows = sorted(folders.values(), key=lambda f: (f["scope_root_id"], f["path"], f["id"]))
             cached_message_counts = Counter(row["folder_id"] for row in items)
@@ -436,7 +508,7 @@ class MailService:
             return {"ready": False, "scope": "Inbox and Sent Items, including descendants; excluding Deleted Items",
                     "state": str(self.state), "next_step": "call outlook_local_refresh or outlook_local_search"}
         try:
-            _, index = self._load()
+            _, index = self._load(copy_index=False)
         except (OSError, ValueError, KeyError, TypeError) as error:
             return {"ready": False, "state": str(self.state), "error": str(error),
                     "next_step": "call outlook_local_refresh or outlook_local_search"}
@@ -454,9 +526,11 @@ class MailService:
     def _current(self, snapshot=None):
         if not self._fresh():
             self._refresh(automatic=True)
-        directory, index = self._load(snapshot)
+        # Internal readers borrow the validated snapshot; public results are
+        # copied at the call boundary so clients cannot mutate cached records.
+        directory, index = self._load(snapshot, copy_index=False)
         if snapshot is not None:
-            _, latest = self._load()
+            _, latest = self._load(copy_index=False)
             allowed = {row["id"] for row in latest["items"]}
             folders = {row["id"]: row for row in latest["folders"]}
             if (any(row["id"] not in allowed for row in index["items"])
@@ -508,6 +582,7 @@ class MailService:
                     allowed.update(children)
             filtered = {**index, "items": [r for r in index["items"] if r["folder_id"] in allowed]}
         options = SimpleNamespace(query=arguments.get("query", ""), field=arguments.get("field", "subject"),
+                                  person=arguments.get("person"), person_role=arguments.get("person_role", "any"),
                                   from_date=arguments.get("from_date"), to_date=arguments.get("to_date"),
                                   limit=arguments.get("limit", 20), cursor=raw_cursor)
         result = core.search(filtered, options)
@@ -521,6 +596,57 @@ class MailService:
     def _attachment(self, directory, index, arguments):
         with self._lock():
             return self._export_attachment(directory, index, arguments)
+
+    def _digest(self, arguments):
+        page = self._search({**arguments, "limit": arguments.get("limit", 25)})
+        directory, index = self._current(page["snapshot"])
+        maximum = arguments.get("body_max_chars", 12000)
+        known_versions = set(arguments.get("known_versions", []))
+        known_bodies = set(arguments.get("known_bodies", []))
+        items, unchanged, bodies, errors = [], [], {}, []
+        source_budget = {"remaining": BUNDLE_SOURCE_BYTES,
+                         "verification_remaining": BUNDLE_VERIFY_BYTES}
+        fields = (
+            "id", "subject", "subject_status", "sender", "sender_name", "sender_status",
+            "participants", "participants_status", "preview", "sent_at", "received_at",
+            "received_time_status", "folder_id", "folder_path", "folder_status",
+            "attachment_count", "attachments_complete",
+        )
+        for row in page["items"]:
+            try:
+                with core.source_read_budget(source_budget):
+                    message = self._read(directory, index, row["id"], maximum)
+                item = {key: message.get(key) for key in fields}
+                item["attachments"] = [
+                    {key: attachment.get(key) for key in ("id", "name", "status")}
+                    for attachment in message.get("attachments", [])
+                ]
+                body = message["body"]
+                item["body"] = {key: body.get(key) for key in (
+                    "status", "diagnosis", "text_chars", "truncated", "text_sha256")}
+                content = None
+                if "text" in body:
+                    content = {key: body.get(key) for key in (
+                        "text", "truncated", "text_sha256", "text_chars")}
+                    # A matching prefix alone cannot prove identical full bodies.
+                    identity = [content, None if body.get("text_sha256") else row["id"]]
+                    content_id = core.sha(json.dumps(identity, sort_keys=True, ensure_ascii=False).encode())
+                    item["body"]["content_id"] = content_id
+                version = core.sha(json.dumps(["digest-v1", item], sort_keys=True,
+                                              ensure_ascii=False).encode())
+                item["version"] = version
+                if version in known_versions:
+                    unchanged.append({"id": row["id"], "version": version})
+                else:
+                    items.append(item)
+                    if content is not None and content_id not in known_bodies:
+                        bodies[content_id] = content
+            except (ValueError, OSError) as error:
+                errors.append({"id": row["id"], "error": str(error)})
+        return {**page, "page_ids": [row["id"] for row in page["items"]],
+                "items": items, "unchanged": unchanged, "bodies": bodies, "errors": errors,
+                "body_text_chars": sum(len(body["text"]) for body in bodies.values()),
+                "coverage": COVERAGE}
 
     def _export_attachment(self, directory, index, arguments):
         export_root = self.state / "exports"
@@ -604,6 +730,9 @@ class MailService:
         return result
 
     def call(self, name, arguments):
+        return deepcopy(self._call(name, arguments))
+
+    def _call(self, name, arguments):
         if name == "outlook_local_status":
             return self._status()
         if name == "outlook_local_refresh":
@@ -612,6 +741,8 @@ class MailService:
             return self._search(arguments)
         if name == "outlook_local_today":
             return self._today(arguments)
+        if name == "outlook_local_digest":
+            return self._digest(arguments)
         directory, index = self._current(arguments.get("snapshot"))
         if name == "outlook_local_folders":
             return {"snapshot": index["snapshot"], "items": index["folders"], "coverage": COVERAGE}

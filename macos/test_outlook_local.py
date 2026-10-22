@@ -1417,6 +1417,34 @@ class OutlookLocalTests(unittest.TestCase):
         self.assertNotIn("只有本次回复", result["body"]["text"])
         self.assertEqual(self.profile_tree(), before)
 
+    def test_new_inline_layout_requires_preview_in_eager_and_deferred_reads(self):
+        full = f"<html><body>{PREVIEW}。新增格式的完整正文🧪。</body></html>".encode()
+        self.set_block_data(
+            self.inline_header(0x919, "<new-layout@example.test>", PREVIEW),
+            inline_body_frame(0x919, full, unique_html=b"<html>reply only</html>",
+                              extra_pool_variant=5),
+        )
+        before = self.profile_tree()
+        _, eager_dir, eager = self.snapshot()
+        eager_row = self.row(eager, "<new-layout@example.test>")
+        self.assertEqual(eager_row["body"]["status"], "cached_html")
+        self.assertTrue(eager_row["body"]["association"]["requires_preview_match"])
+        _, directory, index = self.deferred_snapshot()
+        row = self.row(index, "<new-layout@example.test>")
+        self.assertTrue(row["body"]["deferred"]["inline_frames"][0]["requires_preview_match"])
+        result = outlook_local.read_message(directory, index, row["id"], 20000)
+        self.assertEqual(result["body"]["sha256"], hashlib.sha256(full).hexdigest())
+        self.assertIn("新增格式的完整正文🧪", result["body"]["text"])
+        self.assertNotIn("reply only", result["body"]["text"])
+        for preview, status in ((None, "preview_missing"), ("不相关的另一封邮件", "preview_mismatch")):
+            with self.subTest(preview=preview):
+                row["preview"] = preview
+                rejected = outlook_local.read_message(directory, index, row["id"], 20000)
+                self.assertEqual(rejected["body"]["status"], "unavailable")
+                self.assertIn(status, {check["status"] for check in rejected["body"]["checks"]})
+                self.assertNotIn("text", rejected["body"])
+        self.assertEqual(self.profile_tree(), before)
+
     def test_deferred_adjacent_cross_key_inline_bodies_use_real_frozen_source(self):
         # The normal fixture uses a synthetic block reader for fast parser
         # tests. Stop both patches here so deferred recovery exercises the

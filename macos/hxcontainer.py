@@ -117,10 +117,20 @@ def decode_lz4(src: bytes, expected: int) -> bytes:
         if match_length > expected - len(out):
             raise _bad("match exceeds expected output")
 
-        # Copy one byte at a time so legal overlapping matches can expand runs.
+        # A non-overlapping match is already contiguous in the decoded output.
+        # For an overlapping match, repeat the distance-sized pattern.  Both
+        # paths preserve LZ4's left-to-right semantics while avoiding a Python
+        # loop for every match byte (large HxStore blocks contain many long
+        # matches).
         match_start = len(out) - distance
-        for copy_index in range(match_length):
-            out.append(out[match_start + copy_index])
+        if distance >= match_length:
+            out.extend(out[match_start : match_start + match_length])
+        else:
+            pattern = bytes(out[match_start : match_start + distance])
+            repeats, remainder = divmod(match_length, distance)
+            out.extend(pattern * repeats)
+            if remainder:
+                out.extend(pattern[:remainder])
         if len(out) == expected:
             if index != len(source):
                 raise _bad("trailing input after final match")

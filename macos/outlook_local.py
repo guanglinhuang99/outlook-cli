@@ -28,10 +28,11 @@ from zoneinfo import ZoneInfo
 
 from hxcontainer import iter_blocks
 from hxrecords import (entry_ids, file_references, iter_frames, normalize_subject,
-                       parse_attachment, parse_header, parse_inline_body, typed_references)
+                       parse_attachment, parse_header, parse_inline_body, typed_references,
+                       parse_person, person_parent)
 
 
-VERSION = 19
+VERSION = 21
 MAX_BODY = 64 * 1024 * 1024
 MAX_ATTACHMENT = 256 * 1024 * 1024
 MAX_IN_MEMORY_SOURCE = 64 * 1024**2
@@ -466,6 +467,9 @@ def freeze_body(directory, profile, header, references, inline=(), body_objects=
         text, encoding = decode_body(data)
         preview = folded(header.get("preview"))
         verified = bool(preview) and preview[:60] in folded(text[:12000])
+        if metadata.get("association", {}).get("requires_preview_match") and not preview:
+            errors.append({**metadata, "status": "preview_missing"})
+            return
         if preview and not verified:
             source = {"path": metadata["source_path"]} if "source_path" in metadata else metadata
             errors.append({**source, "status": "preview_mismatch"})
@@ -583,6 +587,68 @@ def discover_profile(value):
     return profile
 
 
+def _record_person(records, frame):
+    parent = person_parent(frame)
+    contact = parse_person(frame)
+    record = records.setdefault(frame.key, {"parents": set(), "values": set(), "invalid": False})
+    if parent is not None:
+        record["parents"].add(parent)
+    if contact is None:
+        record["invalid"] = True
+    else:
+        record["values"].add((contact["name"], contact["address"]))
+
+
+def _person_collections(records):
+    collections = defaultdict(dict)
+    for key, record in sorted(records.items()):
+        conflict = len(record["parents"]) != 1 or len(record["values"]) > 1
+        for role, owner in record["parents"]:
+            group = collections[owner].setdefault(role, {"contacts": [], "rejected": 0, "conflict": False})
+            if conflict:
+                group["conflict"] = True
+            if conflict or record["invalid"] or not record["values"]:
+                group["rejected"] += 1
+            else:
+                name, address = next(iter(record["values"]))
+                group["contacts"].append({"name": name, "address": address, "person_key": key})
+    return collections
+
+
+def merge_participants(row, membership):
+    """Supplement redacted/missing Osa roles using exact Hx parent collections."""
+    participants = dict(membership.get("participants") or {})
+    statuses = dict(membership.get("participants_status") or {})
+    evidence = {}
+    counts = membership.get("participant_counts") or {}
+    hx = row.get("hx_participants") or {}
+    for role in ("to", "cc"):
+        if statuses.get(role) == "verified" or statuses.get(role) == "conflict":
+            continue
+        group = hx.get(role)
+        count = counts.get(role) or {}
+        expected = count.get("count") if count.get("status") == "verified" else None
+        if group is None:
+            continue
+        evidence[role] = {"source": "hx_person_parent_collection",
+                          "message_data_key": hx["message_data_key"],
+                          "parsed_count": len(group["contacts"]), "expected_count": expected,
+                          "rejected_count": group["rejected"],
+                          "count_status": count.get("status", "missing")}
+        if group["conflict"] or count.get("status") == "conflict":
+            participants[role], statuses[role] = None, "conflict"
+            continue
+        contacts = [{"name": item["name"], "address": item["address"]} for item in group["contacts"]]
+        if not contacts and expected != 0:
+            if group["rejected"]:
+                participants[role], statuses[role] = None, "partial"
+            continue
+        participants[role] = contacts
+        statuses[role] = ("verified" if expected == len(contacts) and not group["rejected"] else "partial")
+    return {"participants": participants, "participants_status": statuses,
+            "participants_evidence": evidence}
+
+
 def make_snapshot(args):
     started = clock.monotonic()
     profile = discover_profile(args.profile)
@@ -682,6 +748,7 @@ def make_snapshot(args):
         inline_body_evidence = defaultdict(list)
         unparsed_bodies = defaultdict(int)
         header_body_evidence = {}
+        person_records = {}
         file_records = []
         stats, frame_counts = {}, defaultdict(int)
         source_block_bytes = {}
@@ -691,7 +758,9 @@ def make_snapshot(args):
                 source_block_bytes[str(block.offset)] = len(block.data)
                 for frame in iter_frames(block):
                     frame_counts[str(frame.kind)] += 1
-                    if frame.kind == 201:
+                    if frame.kind == 85:
+                        _record_person(person_records, frame)
+                    elif frame.kind == 201:
                         header = parse_header(frame)
                         if header:
                             headers[frame.key].append(header)
@@ -765,6 +834,11 @@ def make_snapshot(args):
             raise ValueError("no verified HxStore blocks; cache is unsupported or damaged")
         if not headers:
             raise ValueError("no recognizable mail headers; cannot infer an empty mailbox")
+        people = _person_collections(person_records)
+        target_owners = defaultdict(set)
+        for owner, targets in header_body_targets.items():
+            for target in targets:
+                target_owners[target].add(owner)
         cutoff, chosen, conflicts, unresolved_times, time_conflicts = day_start(args.from_date), {}, 0, 0, 0
         for key, versions in headers.items():
             identities = {row["message_id"] for row in versions}
@@ -795,6 +869,12 @@ def make_snapshot(args):
             row["attachments"] = []
             row["mailbox_state"] = "unverified"
             targets = header_body_targets[key]
+            if len(targets) == 1:
+                target = next(iter(targets))
+                if target_owners[target] == {key}:
+                    row["hx_participants"] = {"message_data_key": target, **{
+                        role: people.get(target, {}).get(role, {"contacts": [], "rejected": 0, "conflict": False})
+                        for role in ("to", "cc")}}
             body_key = key
             reference = None
             if exact_body_paths[key]:
@@ -976,6 +1056,9 @@ def metadata(row):
                    if received is not None else None)
     return {**{k: row[k] for k in ("id", "message_id", "subject", "subject_status", "sender", "sender_status", "sender_name", "preview", "mailbox_state")},
             "preview_method": row.get("preview_method", "after_class_candidate"),
+            "participants": row.get("participants"),
+            "participants_status": row.get("participants_status"),
+            "participants_evidence": row.get("participants_evidence"),
             "sent_at": sent.isoformat(), "received_at": received_at,
             "received_time_status": row.get("received_time_status", "missing"),
             "received_time_method": row.get("received_time_method"),
@@ -983,6 +1066,40 @@ def metadata(row):
             "body_status": row["body"]["status"], "body_diagnosis": row["body"]["diagnosis"]["code"],
             "attachment_count": len(row["attachments"]),
             "attachments_complete": False}
+
+
+def person_matches(row, person, role="any"):
+    """Match typed participant evidence only; None means unknown, [] known empty."""
+    if role not in ("any", "sender", "to", "cc"):
+        raise ValueError("invalid person_role")
+    if person is not None and (not isinstance(person, str) or not person.strip() or len(person) > 500):
+        raise ValueError("person must be 1..500 nonblank characters")
+    if role != "any" and not person:
+        raise ValueError("person_role requires person")
+    if not person:
+        return [], False
+    roles = ("sender", "to", "cc") if role == "any" else (role,)
+    participants = row.get("participants") or {}
+    matched, incomplete = [], False
+    for key in roles:
+        contacts = participants.get(key)
+        if (row.get("participants_status") or {}).get(key) in {"partial", "conflict", "malformed"}:
+            incomplete = True
+        sender_unobserved = (key not in participants or
+                             (row.get("participants_status") or {}).get("sender") in {"missing", "redacted"})
+        if key == "sender" and contacts is None and sender_unobserved and row.get("sender"):
+            contacts = [{"name": row.get("sender_name"), "address": row["sender"]}]
+        if contacts is None:
+            incomplete = True
+            continue
+        if any(not contact.get("name") or not contact.get("address")
+               or "@" not in contact.get("address", "") for contact in contacts):
+            # A raw Exchange address does not establish a searchable SMTP alias.
+            incomplete = True
+        if any(person.casefold() in (contact.get(field) or "").casefold()
+               for contact in contacts for field in ("name", "address")):
+            matched.append(key)
+    return matched, incomplete
 
 
 def search(index, args):
@@ -996,18 +1113,26 @@ def search(index, args):
     if start is not None and end is not None and start >= end:
         raise ValueError("from-date must not exceed to-date")
     query, matched = args.query.casefold(), []
+    person = getattr(args, "person", None)
+    role = getattr(args, "person_role", "any")
+    person_incomplete = False
     unknown_times = sum(row.get("received_unix") is None for row in index["items"])
     for row in sorted(index["items"], key=received_sort_key):
         received = row.get("received_unix")
         if start is not None or end is not None:
             if received is None or (start is not None and received < start) or (end is not None and received >= end):
                 continue
-        fields = [args.field] if args.field != "all" else ["subject", "sender", "sender_name", "preview"]
+        fields = (["subject", "sender", "sender_name", "preview"] if args.field == "all"
+                  else ["sender", "sender_name"] if args.field == "sender" else [args.field])
         hits = [field for field in fields if query in (row.get(field) or "").casefold()]
         if query and not hits:
             continue
-        matched.append({**metadata(row), "matched_fields": hits if query else []})
-    signature = sha(json.dumps([index["snapshot"], args.query, args.field, args.from_date, args.to_date, args.limit]).encode())[:16]
+        person_roles, incomplete = person_matches(row, person, role)
+        person_incomplete |= incomplete
+        if person and not person_roles:
+            continue
+        matched.append((row, hits if query else [], person_roles))
+    signature = sha(json.dumps([index["snapshot"], args.query, args.field, args.from_date, args.to_date, args.limit, person, role]).encode())[:16]
     offset = 0
     if args.cursor:
         cursor_signature, offset_value = args.cursor.split(":")
@@ -1016,12 +1141,17 @@ def search(index, args):
         offset = int(offset_value)
         if offset < 0 or offset > len(matched):
             raise ValueError("invalid cursor offset")
-    items = matched[offset:offset + args.limit]
+    # Format only the requested page: dates and public metadata are relatively
+    # expensive, and broad keyword/person searches can match thousands of rows.
+    items = [{**metadata(row), "matched_fields": hits,
+              **({"matched_person_roles": roles} if person else {})}
+             for row, hits, roles in matched[offset:offset + args.limit]]
     next_offset = offset + len(items)
     return {"snapshot": index["snapshot"], "items": items, "total_matched": len(matched),
             "scope_from_date": index["summary"]["scope_from_date"], "captured_at": index["created_at"],
             "date_basis": "received_at", "received_time_unknown": unknown_times,
             "date_filter_incomplete": bool(unknown_times and (start is not None or end is not None)),
+            "person_search_incomplete": person_incomplete,
             "complete": next_offset >= len(matched),
             "next_cursor": f"{signature}:{next_offset}" if next_offset < len(matched) else None,
             "coverage": index["summary"]["coverage"]}
@@ -1406,6 +1536,8 @@ def main(argv=None):
     commands.add_parser("status")
     query = commands.add_parser("search")
     query.add_argument("--query", default="")
+    query.add_argument("--person")
+    query.add_argument("--person-role", choices=("any", "sender", "to", "cc"), default="any")
     query.add_argument("--field", choices=("all", "subject", "sender", "preview"), default="subject")
     query.add_argument("--from-date")
     query.add_argument("--to-date")

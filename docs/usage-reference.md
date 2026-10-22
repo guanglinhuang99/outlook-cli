@@ -228,6 +228,8 @@ ID 编码了后端和对象身份，Mac ID 还绑定缓存快照；调用方应�
 - `today` 使用 `Asia/Singapore` 的当天零点至次日零点。 显式 `date` 支持 `1970-01-01` 至 `9999-12-30`，按历史时区规则计算零点。翻页时传回第一页返回的 `date` 和 `next_offset`，防止跨午夜后切换日期。例如 `node bin/outlook.mjs today --date 2026-10-20 --offset 25`。默认只查收件箱根目录；已发送用 `--folder sent`，子目录传对应 ID。
 - 每页默认 25，最多 200。每次最多检查 `scan_limit` 个项目，默认 500，上限 2,000。
 - **搜索只覆盖指定文件夹。** 查询是大小写不敏感的字面子串，不是 SQL 或正则表达式。`search_body` 默认 false。
+- `search --person '姓名或邮箱' --person-role any|sender|to|cc` 支持单独按人员搜索；可与 `--query` 同用，按 AND 组合。`any` 在三个角色间按 OR 匹配，不包含密送人。命中角色见 `matched_person_roles`；缺少角色证据时 `person_search_incomplete=true`，不能把未命中解释为不存在。人员只来自结构化邮件头/收件人字段，不从正文猜测。
+- 人员搜索也先应用文件夹和接收时间范围。继续读取所有 `next_offset` 页面；`complete` 只表示本轮候选扫描结束，不能覆盖本地未缓存的邮件或参与人信息。
 - 返回 `next_offset` 非空时，用相同筛选参数、该 offset 再请求。**本页没有结果不代表搜索完成**，应检查 `next_offset` 或 `complete`。
 - offset 是经过日期/未读粗筛后检查的项目位置，不是匹配结果数量。`filtered_item_count` 包含非邮件项目及精确日期复核前的候选项目，不是最终命中数。
 - 邮箱是实时变化的，分页不是快照。新邮件、移动、删除可能使不同页之间重复或遗漏；抓取时按 `id` 去重，重要批量导出应选择稳定时间窗口。

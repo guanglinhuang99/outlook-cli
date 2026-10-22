@@ -14,9 +14,12 @@ from hxrecords import (  # noqa: E402
     FRAME_PREFIX,
     Frame,
     INLINE_BODY_CLASS_OFFSET,
+    INLINE_BODY_EXTRA_VARIANT,
     INLINE_BODY_EXTRA_POOL_LENGTH,
     INLINE_BODY_EXTRA_POOL_OFFSET,
     INLINE_BODY_PAYLOAD_BASE,
+    INLINE_BODY_STANDARD_VARIANT,
+    INLINE_BODY_VARIANT_5,
     INLINE_BODY_VARIANT,
     MAX_SUPPORTED_TICKS_EXCLUSIVE,
     MIN_SUPPORTED_TICKS,
@@ -26,6 +29,8 @@ from hxrecords import (  # noqa: E402
     parse_attachment,
     parse_header,
     parse_inline_body,
+    parse_person,
+    person_parent,
     typed_references,
 )
 
@@ -207,7 +212,10 @@ def inline_body_frame(key, full_html, unique_html=None, owner=None, **overrides)
         owner_cursor += len(marker_prefix) + 8
 
     payload_base = INLINE_BODY_PAYLOAD_BASE
-    if (extra_variant, extra_offset, extra_length) == (1, 18, 16):
+    if (extra_variant in (INLINE_BODY_EXTRA_VARIANT,
+                          INLINE_BODY_STANDARD_VARIANT,
+                          INLINE_BODY_VARIANT_5)
+            and extra_offset == 18 and extra_length == 16):
         payload_base = INLINE_BODY_CLASS_OFFSET + extra_offset + extra_length
 
     # Avoid allocating unbounded memory for a deliberately invalid offset.
@@ -221,6 +229,49 @@ def inline_body_frame(key, full_html, unique_html=None, owner=None, **overrides)
         put(extra_class_cursor, value)
         extra_class_cursor += len(value)
     return serialized_frame(202, key, bytes(payload))
+
+
+def person_frame(key, owner, role="to", name="张伟", address="zhang@example.com",
+                 *, variant=1):
+    """Build a verified HxPerson frame at the researched fixed offsets."""
+    parent_type = {"to": 204, "cc": 205}.get(role, role)
+    email = wide(address)
+    display_name = wide(name)
+    email_offset = 53
+    name_offset = email_offset + len(email)
+    frame_length = 360 + name_offset + len(display_name) + 5
+    payload = bytearray(frame_length - 38)
+
+    def put(offset, value):
+        index = offset - 38
+        payload[index:index + len(value)] = value
+
+    def put_u16(offset, value):
+        put(offset, struct.pack("<H", value))
+
+    def put_u32(offset, value):
+        put(offset, struct.pack("<I", value))
+
+    def put_u64(offset, value):
+        put(offset, struct.pack("<Q", value))
+
+    email_length, name_length = len(email), len(display_name)
+    put_u32(38, parent_type)
+    put_u64(42, owner)
+    put_u64(50, key)
+    put_u64(58, owner)
+    put_u16(68, parent_type)
+    put_u64(78, owner)
+    put_u32(302, name_offset)
+    put_u32(306, 0x80000000 | name_length)
+    put_u32(310, email_offset)
+    put_u32(314, 0x80000000 | email_length)
+    put_u32(322, 0x80000000 | email_offset)
+    put_u32(326, variant)
+    put(360 + email_offset - 5, b"\x01" * 4)
+    put(360 + email_offset, email)
+    put(360 + name_offset, display_name)
+    return serialized_frame(85, key, bytes(payload))
 
 
 class HxRecordTests(unittest.TestCase):
@@ -774,6 +825,28 @@ class HxRecordTests(unittest.TestCase):
         self.assertEqual(parsed["evidence"]["extra_pool_field"]["variant"], 1)
         self.assertEqual(parsed["evidence"]["extra_pool_field"]["offset"], 0)
         self.assertEqual(parsed["evidence"]["extra_pool_field"]["length"], 0)
+        self.assertNotIn("requires_preview_match", parsed["evidence"])
+
+    def test_inline_body_accepts_variant_five_standard_with_preview_guard(self):
+        key = 0xA112
+        full = "<html><body>新布局完整正文中文😀。</body></html>".encode()
+        unique = "<html><body>新布局唯一版本。</body></html>".encode()
+        raw = inline_body_frame(
+            key,
+            full,
+            unique_html=unique,
+            extra_pool_variant=INLINE_BODY_VARIANT_5,
+        )
+
+        parsed = parse_inline_body(as_frame(raw, kind=202, key=key))
+
+        self.assertEqual(parsed["data"], full)
+        self.assertEqual(parsed["evidence"]["payload_base"], 1898)
+        self.assertTrue(parsed["evidence"]["requires_preview_match"])
+
+        metadata = parse_inline_body(as_frame(raw, kind=202, key=key), include_data=False)
+        self.assertNotIn("data", metadata)
+        self.assertTrue(metadata["evidence"]["requires_preview_match"])
 
     def test_inline_body_uses_verified_extra_pool_payload_base(self):
         key = 0xA12
@@ -815,16 +888,77 @@ class HxRecordTests(unittest.TestCase):
                 "length_field": INLINE_BODY_EXTRA_POOL_LENGTH,
             },
         )
+        self.assertNotIn("requires_preview_match", parsed["evidence"])
+
+    def test_inline_body_uses_new_variant_extra_pool_payload_bases(self):
+        pool = b"\x00\xff\x01\xfe\x80\x81\x00\xfe\xff\x10\x11\x00\x90\xa0\xb0\xc0"
+        for offset, variant in enumerate((INLINE_BODY_STANDARD_VARIANT,
+                                           INLINE_BODY_VARIANT_5), 1):
+            key = 0xA120 + offset
+            full = f"<html><body>变体{variant}完整中文正文😀。</body></html>".encode()
+            unique = f"<html><body>变体{variant}唯一版本。</body></html>".encode()
+            raw = inline_body_frame(
+                key,
+                full,
+                unique_html=unique,
+                extra_pool=pool,
+                extra_pool_variant=variant,
+                full_offset=23,
+            )
+
+            self.assertEqual(raw[1898:1914], pool)
+            parsed = parse_inline_body(as_frame(raw, kind=202, key=key))
+
+            self.assertEqual(parsed["data"], full)
+            self.assertEqual(parsed["evidence"]["payload_base"], 1914)
+            self.assertTrue(parsed["evidence"]["requires_preview_match"])
 
     def test_inline_body_rejects_unknown_extra_pool_layouts(self):
         key = 0xA13
         body = b"<html><body>unknown layout</body></html>"
         pool = b"\x00\xff\x01\xfe\x80\x81\x00\xfe\xff\x10\x11\x00\x90\xa0\xb0\xc0"
         cases = (
-            inline_body_frame(key, body, extra_pool=pool, extra_pool_variant=4),
+            inline_body_frame(key, body, extra_pool=pool, extra_pool_variant=6),
             inline_body_frame(key, body, extra_pool=pool, extra_pool_offset=19),
             inline_body_frame(key, body, extra_pool=pool, extra_pool_length=15),
             inline_body_frame(key, body, extra_pool_variant=2),
+        )
+
+        for raw in cases:
+            self.assertIsNone(parse_inline_body(as_frame(raw, kind=202, key=key)))
+
+    def test_inline_body_new_variants_retain_owner_and_bounds_guards(self):
+        key = 0xA14
+        body = "<html><body>新变体中文正文</body></html>"
+        pool = b"\x00\xff\x01\xfe\x80\x81\x00\xfe\xff\x10\x11\x00\x90\xa0\xb0\xc0"
+        cases = (
+            inline_body_frame(
+                key,
+                body,
+                extra_pool_variant=INLINE_BODY_VARIANT_5,
+                owner=key + 1,
+            ),
+            inline_body_frame(
+                key,
+                body,
+                extra_pool=pool,
+                extra_pool_variant=INLINE_BODY_STANDARD_VARIANT,
+                full_offset=0x100001,
+            ),
+            inline_body_frame(
+                key,
+                body,
+                extra_pool=pool,
+                extra_pool_variant=INLINE_BODY_VARIANT_5,
+                extra_pool_offset=17,
+            ),
+            inline_body_frame(
+                key,
+                body,
+                extra_pool=pool,
+                extra_pool_variant=INLINE_BODY_VARIANT_5,
+                extra_pool_length=15,
+            ),
         )
 
         for raw in cases:
@@ -933,6 +1067,124 @@ class HxRecordTests(unittest.TestCase):
         parsed = parse_inline_body(as_frame(bytes(raw), kind=202, key=key))
 
         self.assertEqual(parsed["data"], full)
+
+    def test_hxperson_parses_utf16le_name_and_to_cc_roles(self):
+        for role, owner in (("to", 0xC001), ("cc", 0xC002)):
+            key = owner + 1
+            raw = person_frame(
+                key,
+                owner,
+                role=role,
+                name="张伟😀",
+                address=f"person-{role}@example.com",
+                variant=2,
+            )
+            frame = next(iter_frames(SimpleNamespace(offset=19, data=raw)))
+
+            self.assertEqual(person_parent(frame), (role, owner))
+            parsed = parse_person(frame)
+            self.assertEqual(
+                parsed["key"], key,
+            )
+            self.assertEqual(
+                {parsed[field] for field in ("owner", "role", "name", "address")},
+                {owner, role, "张伟😀", f"person-{role}@example.com"},
+            )
+            self.assertEqual(parsed["evidence"]["kind"], 85)
+            self.assertEqual(parsed["evidence"]["frame_bytes"], len(raw))
+            self.assertEqual(parsed["evidence"]["block"], 19)
+            self.assertEqual(parsed["evidence"]["frame_offset"], 0)
+            self.assertEqual(len(parsed["evidence"]["frame_sha256"]), 64)
+            self.assertEqual(
+                parsed["evidence"]["method"], "verified_hxperson_layout_utf16le"
+            )
+
+    def test_hxperson_rejects_parent_type_and_field_contamination(self):
+        valid = person_frame(0xD01, 0xD10)
+        mutations = []
+
+        wrong_parent = bytearray(valid)
+        struct.pack_into("<I", wrong_parent, 38, 413)
+        struct.pack_into("<H", wrong_parent, 68, 413)
+        mutations.append(wrong_parent)
+
+        bcc_parent = bytearray(valid)
+        struct.pack_into("<I", bcc_parent, 38, 206)
+        struct.pack_into("<H", bcc_parent, 68, 206)
+        mutations.append(bcc_parent)
+
+        for offset in (22, 66, 70):
+            polluted = bytearray(valid)
+            polluted[offset] = 1
+            mutations.append(polluted)
+
+        for offset, value in ((42, 0xD11), (50, 0xD11), (58, 0xD11), (78, 0xD11)):
+            polluted = bytearray(valid)
+            struct.pack_into("<Q", polluted, offset, value)
+            mutations.append(polluted)
+
+        for raw in mutations:
+            frame = next(iter_frames(SimpleNamespace(offset=23, data=bytes(raw))))
+            self.assertIsNone(person_parent(frame))
+            self.assertIsNone(parse_person(frame))
+
+    def test_hxperson_rejects_descriptor_boundary_and_content_failures(self):
+        valid = person_frame(0xD21, 0xD22)
+        mutations = []
+
+        for offset, value in (
+            (306, 0x80000000),
+            (314, 0x80000000),
+            (322, 0x80000000 | 54),
+            (326, 4),
+        ):
+            polluted = bytearray(valid)
+            struct.pack_into("<I", polluted, offset, value)
+            mutations.append(polluted)
+
+        bad_separator = bytearray(valid)
+        bad_separator[360 + 53 - 5] = 0
+        mutations.append(bad_separator)
+
+        bad_email_terminator = bytearray(valid)
+        bad_email_terminator[360 + 53 + len(wide("zhang@example.com")) - 2] = 1
+        mutations.append(bad_email_terminator)
+
+        bad_offset = bytearray(valid)
+        struct.pack_into("<I", bad_offset, 310, 0x7FFFFFF0)
+        mutations.append(bad_offset)
+
+        for raw in mutations:
+            frame = next(iter_frames(SimpleNamespace(offset=29, data=bytes(raw))))
+            self.assertIsNone(parse_person(frame))
+
+        for name, address in (
+            ("pii:display", "valid@example.com"),
+            ("显示\x01名", "valid@example.com"),
+            ("显示名", "pii:address@example.com"),
+            ("显示名", "invalid@example"),
+            ("显示名", "invalid@@example.com"),
+        ):
+            raw = person_frame(0xD30, 0xD31, name=name, address=address)
+            frame = next(iter_frames(SimpleNamespace(offset=29, data=raw)))
+            self.assertIsNone(parse_person(frame))
+
+    def test_hxperson_kind_support_and_nested_frame_boundaries(self):
+        key, owner = 0xD41, 0xD42
+        raw = person_frame(key, owner)
+        frames = list(iter_frames(SimpleNamespace(offset=31, data=raw)))
+        self.assertEqual([(frame.kind, frame.key) for frame in frames], [(85, key)])
+
+        wrong_kind = bytearray(raw)
+        struct.pack_into("<H", wrong_kind, 20, 999)
+        self.assertEqual(
+            list(iter_frames(SimpleNamespace(offset=31, data=bytes(wrong_kind)))), []
+        )
+        self.assertIsNone(parse_person(as_frame(raw, kind=201, key=key)))
+
+        nested = serialized_frame(201, 0xD43, b"prefix" + raw + b"suffix")
+        frames = list(iter_frames(SimpleNamespace(offset=31, data=nested)))
+        self.assertEqual([(frame.kind, frame.key) for frame in frames], [(201, 0xD43)])
 
 
 if __name__ == "__main__":

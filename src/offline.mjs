@@ -29,6 +29,48 @@ function utc(value) {
 function sender(name, address) {
   return { name: name ?? null, address: address ?? null, address_type: address?.includes('@') ? 'SMTP' : address ? 'EX' : null, smtp_address: address?.includes('@') ? address : null };
 }
+function contains(value, query) {
+  return query.length > 0 && String(value ?? '').toLowerCase().includes(query.toLowerCase());
+}
+function personMatch(record, person, role) {
+  const matchedRoles = [];
+  let incomplete = false;
+  const senderValues = [record?.sender_name, record?.sender_email];
+  if (role === 'any' || role === 'sender') {
+    const senderFields = senderValues.filter(value => value !== null && value !== undefined && String(value).length > 0);
+    if (senderFields.length > 0) {
+      if (senderFields.length < senderValues.length) incomplete = true;
+      if (senderValues.some(value => contains(value, person))) matchedRoles.push('sender');
+    } else {
+      incomplete = true;
+    }
+  }
+
+  if (role === 'any' || role === 'to' || role === 'cc') {
+    const recipients = record?.recipients;
+    if (!Array.isArray(recipients)) {
+      incomplete = true;
+    } else {
+      for (const recipient of recipients) {
+        const kind = recipient?.kind;
+        if (kind !== 'to' && kind !== 'cc' && kind !== 'bcc') {
+          incomplete = true;
+          continue;
+        }
+        if (kind === 'bcc' || (role !== 'any' && kind !== role)) continue;
+        const values = [recipient.name, recipient.email];
+        const contactFields = values.filter(value => value !== null && value !== undefined && String(value).length > 0);
+        if (contactFields.length < values.length) incomplete = true;
+        if (contactFields.length === 0) {
+          incomplete = true;
+          continue;
+        }
+        if (values.some(value => contains(value, person)) && !matchedRoles.includes(kind)) matchedRoles.push(kind);
+      }
+    }
+  }
+  return { matched: matchedRoles.length > 0, matched_roles: ['sender', 'to', 'cc'].filter(roleName => matchedRoles.includes(roleName)), incomplete };
+}
 export function asText(message) {
   if (message.body === null || message.body_format === 'plain') return message.body;
   if (message.body_format !== 'html') throw localError('OFFLINE_BODY_FORMAT', 'Only RTF is cached; use COM to convert this message');
@@ -130,8 +172,8 @@ export class LocalFileBridge {
     if (!store) throw localError('OFFLINE_STORE_CHANGED', 'The store for this ID was removed or replaced. List stores/messages again.');
     return { store, nid: id.nid };
   }
-  metadata(row, store) {
-    return { id: encodeLocalId('message', store.key, row.nid), subject: row.subject ?? null, sender: sender(row.sender_name, row.sender_email), received_at: utc(row.delivered), unread: row.unread, size_bytes: row.size, attachment_count: row.has_attachments === false ? 0 : null, has_attachments: row.has_attachments ?? null, download_state: null };
+  metadata(row, store, attachmentCount = null) {
+    return { id: encodeLocalId('message', store.key, row.nid), subject: row.subject ?? null, sender: sender(row.sender_name, row.sender_email), received_at: utc(row.delivered), unread: row.unread, size_bytes: row.size, attachment_count: attachmentCount ?? (row.has_attachments === false ? 0 : null), has_attachments: row.has_attachments ?? null, download_state: null };
   }
   async message(store, nid, maxChars = 1) {
     return this.invoke([store.path, '--message', String(nid), '--max-body-chars', String(maxChars)]);
@@ -191,28 +233,53 @@ export class LocalFileBridge {
         const matches = [];
         let scanned = 0;
         let incompleteBodies = 0;
+        let incompletePersons = false;
+        const query = typeof params.query === 'string' ? params.query : '';
+        const person = typeof params.person === 'string' && params.person.length > 0 ? params.person : null;
+        const allowedPersonRoles = ['any', 'sender', 'to', 'cc'];
+        if (method === 'search' && Object.hasOwn(params, 'person_role') && !allowedPersonRoles.includes(params.person_role)) {
+          throw localError('INVALID_ARGUMENT', 'person_role must be one of any, sender, to, cc');
+        }
+        const personRole = params.person_role ?? 'any';
         for (const row of rows.slice(0, budget)) {
           scanned++;
           let message;
+          let personResult;
           let match = true;
           if (method === 'search') {
-            const contains = value => String(value ?? '').toLowerCase().includes(params.query.toLowerCase());
-            match = [row.subject, row.sender_name, row.sender_email].some(contains);
+            match = query.length === 0 || [row.subject, row.sender_name, row.sender_email].some(value => contains(value, query));
             if (!match && (!row.sender_name || !row.sender_email || params.search_body)) {
               message = await this.message(store, row.nid, params.search_body ? 2000000 : 1);
-              match = [message.sender_name, message.sender_email].some(contains) || (params.search_body && contains(asText(message)));
+              match = [message.sender_name, message.sender_email].some(value => contains(value, query)) || (params.search_body && contains(asText(message), query));
               if (params.search_body && (message.body_truncated || message.body === null)) incompleteBodies++;
+            }
+            if (match && person) {
+              const rowHasSender = row.sender_name !== null && row.sender_name !== undefined && row.sender_name !== '' && row.sender_email !== null && row.sender_email !== undefined && row.sender_email !== '';
+              const rowHasRecipients = Array.isArray(row.recipients);
+              const rowHasPersonFields = personRole === 'sender' ? rowHasSender : personRole === 'to' || personRole === 'cc' ? rowHasRecipients : rowHasSender && rowHasRecipients;
+              if (!message && !rowHasPersonFields) message = await this.message(store, row.nid, 1);
+              personResult = personMatch(message ? {
+                sender_name: message.sender_name ?? row.sender_name,
+                sender_email: message.sender_email ?? row.sender_email,
+                recipients: message.recipients ?? row.recipients
+              } : row, person, personRole);
+              incompletePersons ||= personResult.incomplete;
+              match = personResult.matched;
             }
           }
           if (match) {
             const item = this.metadata(row, store);
-            if (message) { item.sender = sender(message.sender_name, message.sender_email); item.attachment_count = message.attachments.length; }
+            if (message) {
+              item.sender = sender(message.sender_name ?? row.sender_name, message.sender_email ?? row.sender_email);
+              if (Array.isArray(message.attachments)) item.attachment_count = message.attachments.length;
+            }
+            if (person && personResult) item.matched_person_roles = personResult.matched_roles;
             matches.push(item);
             if (matches.length >= params.limit) break;
           }
         }
         const next = scanned < rows.length ? params.offset + scanned : null;
-        result = { messages: matches, scanned, scan_limit_applied: budget, filtered_item_count: rows[0]?.total ?? null, next_offset: next, complete: next === null, scope: 'single_folder', pagination: 'live_offset_not_snapshot', body_search_incomplete: incompleteBodies > 0 };
+        result = { messages: matches, scanned, scan_limit_applied: budget, filtered_item_count: rows[0]?.total ?? null, next_offset: next, complete: next === null, scope: 'single_folder', pagination: 'live_offset_not_snapshot', body_search_incomplete: incompleteBodies > 0, person_search_incomplete: person ? incompletePersons : false };
       } else if (method === 'read') {
         if (params.body_offset + params.max_chars > 2000000) throw localError('OFFLINE_BODY_LIMIT', 'Local reader supports the first 2,000,000 body characters per message');
         // Convert a stable source prefix before pagination; independently converting
@@ -226,7 +293,7 @@ export class LocalFileBridge {
         const start = body === null ? 0 : Math.min(params.body_offset, body.length);
         const end = body === null ? 0 : Math.min(start + params.max_chars, body.length);
         const next = body !== null && end < body.length ? end : null;
-        result = { ...this.metadata(m, store), sender: sender(m.sender_name, m.sender_email), to: m.to, cc: m.cc, attachment_count: m.attachments.length, attachments: this.attachmentMetadata(m.attachments), body: { format: params.format, derived_from: actualFormat, text: body === null ? null : body.slice(start, end), available: body !== null, total_chars: sourceTruncated ? null : body?.length ?? null, offset: start, next_offset: next, truncated: next !== null || sourceTruncated, source_truncated: sourceTruncated } };
+        result = { ...this.metadata(m, store, m.attachments.length), to: m.to, cc: m.cc, attachments: this.attachmentMetadata(m.attachments), body: { format: params.format, derived_from: actualFormat, text: body === null ? null : body.slice(start, end), available: body !== null, total_chars: sourceTruncated ? null : body?.length ?? null, offset: start, next_offset: next, truncated: next !== null || sourceTruncated, source_truncated: sourceTruncated } };
       } else {
         const attachments = await this.invoke([store.path, '--attachments', String(nid)]);
         if (method === 'attachments') result = { attachments: this.attachmentMetadata(attachments) };

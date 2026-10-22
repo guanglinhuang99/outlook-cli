@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+from copy import deepcopy
 from datetime import datetime
 import json
 import os
@@ -67,7 +68,7 @@ FIELDS = {
     "health": set(), "stores": set(),
     "folders": {"folder", "offset", "limit"},
     "messages": {"folder", "offset", "limit", "unread", "after", "before", "scan_limit"},
-    "search": {"folder", "offset", "limit", "unread", "after", "before", "scan_limit", "query", "search_body"},
+    "search": {"folder", "offset", "limit", "unread", "after", "before", "scan_limit", "query", "search_body", "person", "person_role"},
     "read": {"id", "format", "body_offset", "max_chars"},
     "attachments": {"id"},
     "read_attachment": {"id", "index", "max_bytes", "byte_offset", "chunk_bytes"},
@@ -147,6 +148,9 @@ class CommonReader:
                 "received_at": native["received_at"], "sent_at": native["sent_at"],
                 "received_time_status": native["received_time_status"],
                 "received_time_method": native["received_time_method"], "unread": None,
+                "participants": row.get("participants"),
+                "participants_status": row.get("participants_status"),
+                "participants_evidence": row.get("participants_evidence"),
                 "size_bytes": None, "download_state": None, "preview": row.get("preview"),
                 "body_status": row["body"]["status"], "attachment_count": len(row["attachments"]),
                 "attachments_complete": False,
@@ -161,6 +165,9 @@ class CommonReader:
                  "status": a["status"]} for position, a in enumerate(row["attachments"], 1)]
 
     def perform(self, method, params):
+        return deepcopy(self._perform(method, params))
+
+    def _perform(self, method, params):
         if method not in FIELDS or not isinstance(params, dict) or set(params) - FIELDS[method]:
             fail("INVALID_ARGUMENT", "Unknown operation or parameters")
         if "unread" in params:
@@ -169,6 +176,15 @@ class CommonReader:
             fail("UNSUPPORTED_FILTER", "Common macOS search supports subject/sender; cached body text is available via read")
         if params.get("format", "text") != "text":
             fail("UNSUPPORTED_FORMAT", "Common macOS reads currently return text only")
+        person, role = params.get("person"), params.get("person_role", "any")
+        if method == "search":
+            query = params.get("query", "")
+            if not isinstance(query, str) or len(query) > 500 or (not query.strip() and not person):
+                fail("INVALID_ARGUMENT", "search requires query or person (1..500 characters)")
+            try:
+                core.person_matches({}, person, role)
+            except ValueError as error:
+                fail("INVALID_ARGUMENT", str(error))
         value = params.get("id", params.get("folder", "inbox"))
         kind = "message" if "id" in params else "folder"
         identity = None if value in ("inbox", "sent", "deleted", "drafts", "junk", "outbox") else decode_id(value, kind)
@@ -215,19 +231,26 @@ class CommonReader:
             limit = number(params, "limit", 25, 1, 200)
             scan = number(params, "scan_limit", 500, 1, 2000)
             query = params.get("query", "")
-            if method == "search" and (not isinstance(query, str) or not 1 <= len(query) <= 500):
-                fail("INVALID_ARGUMENT", "query must be 1..500 characters")
+            query = query.casefold()
+            person_incomplete = False
             matched, position = [], min(offset, len(rows))
             while position < len(rows) and position - offset < scan and len(matched) < limit:
                 row = rows[position]
                 position += 1
-                if method != "search" or any(query.casefold() in (row.get(field) or "").casefold()
-                                             for field in ("subject", "sender", "sender_name")):
-                    matched.append(self.metadata(row, index))
+                if method == "search" and query and not any(query in (row.get(field) or "").casefold()
+                                             for field in ("subject", "sender", "sender_name", "preview")):
+                    continue
+                roles, incomplete = core.person_matches(row, person, role)
+                person_incomplete |= incomplete
+                if person and not roles:
+                    continue
+                matched.append({**self.metadata(row, index),
+                                **({"matched_person_roles": roles} if person else {})})
             return {**context, "messages": matched, "scanned": max(0, position - offset),
                     "filtered_item_count": len(rows), "next_offset": position if position < len(rows) else None,
                     "complete": position >= len(rows), "scope": "single_folder",
                     "pagination": "live_offset_not_snapshot", "body_search_incomplete": False,
+                    "person_search_incomplete": person_incomplete,
                     "received_time_unknown": unknown_times,
                     "date_filter_incomplete": bool(dated and unknown_times)}
         if not identity or kind != "message":
@@ -247,7 +270,10 @@ class CommonReader:
             total = None if page is None else page["total_chars"]
             start = 0 if page is None else page["offset"]
             next_offset = None if page is None else page["next_offset"]
-            return {**context, **self.metadata(row, index), "to": None, "cc": None,
+            display = {role: ("; ".join(f"{p['name']} <{p['address']}>" for p in row['participants'][role])
+                              if (row.get('participants_status') or {}).get(role) == 'verified'
+                              else None) for role in ('to', 'cc')}
+            return {**context, **self.metadata(row, index), **display,
                     "attachments": attachments, "body": {"format": "text", "derived_from": "html" if text is not None else None,
                     "text": text, "available": text is not None, "total_chars": total, "offset": start,
                     "next_offset": next_offset, "truncated": next_offset is not None, "source_truncated": False,

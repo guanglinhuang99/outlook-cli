@@ -54,13 +54,63 @@ class ServiceTests(unittest.TestCase):
                 received_unix=row['sent_unix'] + 60,
                 received_time_status='verified', received_time_method='osa_last_delivery_time')
         module = types.ModuleType('osa_scope')
-        module.read_scope = lambda profile, items: copy.deepcopy(self.scope)
+        module.read_scope = lambda profile, items, **kwargs: copy.deepcopy(self.scope)
         self.addCleanup(patch.stopall)
         patch.dict(sys.modules, {'osa_scope': module}).start()
         self.client = service.MailService(self.fixture.state, self.fixture.profile)
 
     def refresh(self):
         return self.client.call('outlook_local_refresh', {})
+
+    def test_refresh_passes_private_persistent_cache_to_scope_reader(self):
+        original = self.fixture.profile_tree()
+        with patch.object(service, 'LogParseCache') as factory:
+            client = service.MailService(self.fixture.state, self.fixture.profile)
+            factory.assert_called_once_with(path=self.fixture.state.resolve() / 'osa-metadata.sqlite3')
+            with patch.object(sys.modules['osa_scope'], 'read_scope',
+                              return_value=copy.deepcopy(self.scope)) as read_scope:
+                client.call('outlook_local_refresh', {})
+            self.assertIs(read_scope.call_args.kwargs['parse_cache'], factory.return_value)
+        self.assertEqual(self.fixture.profile_tree(), original)
+
+    def test_participant_evidence_survives_scope_and_drives_person_search(self):
+        identifier = self.ids[0]
+        self.scope['messages'][identifier].update(
+            participants={'sender': None, 'to': [{'name': '李四', 'address': 'li@example.test'}], 'cc': []},
+            participants_status={'sender': 'redacted', 'to': 'verified', 'cc': 'verified'})
+        original = self.fixture.profile_tree()
+        self.refresh()
+        result = self.client.call('outlook_local_search', {'person': '李四', 'person_role': 'to'})
+        self.assertEqual([item['id'] for item in result['items']], [identifier])
+        self.assertEqual(result['items'][0]['matched_person_roles'], ['to'])
+        self.assertEqual(result['items'][0]['participants_status']['to'], 'verified')
+        self.assertEqual(self.fixture.profile_tree(), original)
+
+    def test_hx_people_reach_scoped_search_without_expanding_bodies(self):
+        import struct
+        from test_hxrecords import person_frame, serialized_frame
+        key = self.base['items'][0]['key']
+        header = next(f for f in service.core.iter_frames(self.fixture.block) if f.kind == 201 and f.key == key)
+        ref = struct.pack('<H', 202) + b'\0' * 8 + struct.pack('<Q', key)
+        self.fixture.block.data += serialized_frame(201, key, header.data[38:] + ref)
+        self.fixture.block.data += person_frame(11, owner=key, name='中文收件人', address='person@example.test')
+        self.fixture.source_cache.write_bytes(b'changed synthetic source with Person objects')
+        self.scope['messages'][self.ids[0]].update(
+            participants={'to': None, 'cc': None}, participants_status={'to': 'redacted', 'cc': 'redacted'},
+            participant_counts={'to': {'count': 1, 'status': 'verified'}, 'cc': {'count': 0, 'status': 'verified'}})
+        original = self.fixture.profile_tree()
+        with patch.object(service.core, 'freeze_body', wraps=service.core.freeze_body) as freeze:
+            self.refresh()
+            result = self.client.call('outlook_local_search', {'person': '中文收件人', 'person_role': 'to'})
+            self.assertEqual(freeze.call_count, 0)
+        self.assertEqual([r['id'] for r in result['items']], [self.ids[0]])
+        item = result['items'][0]
+        self.assertEqual(item['participants']['to'][0]['address'], 'person@example.test')
+        self.assertEqual(item['participants_status']['to'], 'verified')
+        self.assertEqual(item['participants_evidence']['to']['source'], 'hx_person_parent_collection')
+        _, index = self.client._load()
+        self.assertTrue(all('hx_participants' not in row for row in index['items']))
+        self.assertEqual(self.fixture.profile_tree(), original)
 
     def test_receipt_scope_does_not_drop_mail_sent_before_cutoff(self):
         # These headers were sent in 2000 but delivered in 2001.
