@@ -99,6 +99,8 @@ _SEARCH_PROPERTIES = {
         "Text to search for in Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Empty searches the scoped mailbox.",
         max_length=MAX_QUERY_LENGTH,
     ),
+    "person": _string("Optional literal name or email substring in verified sender/to/cc metadata; combined with query using AND. Missing participant evidence is reported, never guessed.", max_length=500),
+    "person_role": _string("Which participant role to search.", enum=("any", "sender", "to", "cc"), default="any"),
     "field": _string("Search field.", enum=("subject", "sender", "preview", "all"), default="subject"),
     "from_date": _string(
         "Inclusive received date in YYYY-MM-DD form, interpreted in Asia/Singapore.",
@@ -171,6 +173,33 @@ TOOL_SCHEMAS = (
             "body_max_chars": _integer("Maximum returned body characters.", 1, 100_000, default=20_000),
         },
         required=("id",),
+        read_only_hint=False,
+        destructive_hint=True,
+    ),
+    _tool(
+        "outlook_local_digest",
+        "Read compact summary material from the verified Inbox/Sent scope, filtered by received date. "
+        "This does not generate an AI summary. Follow every next_cursor and collect page_ids; only after "
+        "all pages succeed may the caller compare IDs with its previous run for removals. Each changed item "
+        "has a version; reuse a saved summary only for unchanged versions. Bodies are deduplicated using "
+        "verified full-text identity and returned prefix. Keep referenced bodies when supplying known_bodies. "
+        "Missing/empty/truncated bodies stay explicit. Attachments are listed, not expanded. "
+        "Refresh first when new mail must be checked immediately; otherwise the normal refresh interval applies.",
+        {
+            **_SEARCH_PROPERTIES,
+            "limit": _integer("Maximum messages per page; reduce on source budget errors.", 1, 25, default=25),
+            "body_max_chars": _integer("Maximum returned characters per body; truncation is explicit.", 1, 20_000, default=12_000),
+            "known_versions": {
+                "type": "array", "description": "Versions whose summary material the caller still retains. Never acknowledge failed or unsummarized items.",
+                "items": {"type": "string", "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+                "minItems": 0, "maxItems": 5000,
+            },
+            "known_bodies": {
+                "type": "array", "description": "Content IDs whose text the caller still retains, including earlier pages. Omit to receive all bodies needed by changed items.",
+                "items": {"type": "string", "maxLength": 64, "pattern": "^[a-f0-9]{64}$"},
+                "minItems": 0, "maxItems": 5000,
+            },
+        },
         read_only_hint=False,
         destructive_hint=True,
     ),
@@ -316,6 +345,18 @@ def validate_tool_arguments(name: str, arguments: Any) -> dict[str, Any]:
                             f"argument {field!r}[{index}] exceeds maximum length {item_schema['maxLength']}"
                         )
         validated[field] = value
+    if name == "outlook_local_digest":
+        for field in ("known_versions", "known_bodies"):
+            if any(len(token) != 64 or any(char not in "0123456789abcdef" for char in token)
+                   for token in validated.get(field, [])):
+                raise ValidationError(f"{field} must contain lowercase SHA-256 tokens")
+    if name in {"outlook_local_search", "outlook_local_digest"}:
+        if "person" in validated:
+            validated["person"] = validated["person"].strip()
+            if not validated["person"]:
+                raise ValidationError("person must not be blank")
+        if validated.get("person_role", "any") != "any" and not validated.get("person"):
+            raise ValidationError("person_role requires person")
     return validated
 
 

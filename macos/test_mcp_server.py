@@ -46,6 +46,7 @@ class McpServerTests(unittest.TestCase):
             "outlook_local_today",
             "outlook_local_read",
             "outlook_local_messages_bundle",
+            "outlook_local_digest",
             "outlook_local_attachments",
             "outlook_local_attachment",
         }
@@ -85,7 +86,7 @@ class McpServerTests(unittest.TestCase):
         ping = server.handle(request("ping"))
         self.assertEqual(ping["result"], {})
         listing = server.handle(request("tools/list", {}))
-        self.assertEqual(len(listing["result"]["tools"]), 9)
+        self.assertEqual(len(listing["result"]["tools"]), 10)
         self.assertEqual(
             {tool["name"] for tool in listing["result"]["tools"]},
             {tool["name"] for tool in mcp_server.TOOL_SCHEMAS},
@@ -101,7 +102,7 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(service.calls, [
             (
                 "outlook_local_search",
-                {"field": "subject", "include_subfolders": True, "limit": 20},
+                {"field": "subject", "include_subfolders": True, "limit": 20, "person_role": "any"},
             )
         ])
 
@@ -118,6 +119,8 @@ class McpServerTests(unittest.TestCase):
                 {
                     "query": "合规🧪",
                     "field": "all",
+                    "person": "张三",
+                    "person_role": "cc",
                     "from_date": "2026-10-01",
                     "to_date": "2026-10-20",
                     "folder_id": "sent/child",
@@ -163,6 +166,12 @@ class McpServerTests(unittest.TestCase):
             self.assertFalse(response["result"]["isError"], name)
         self.assertEqual(service.calls, list(calls))
 
+    def test_person_arguments_reject_blank_and_role_without_person(self):
+        for arguments in ({"person": " "}, {"person_role": "to"},
+                          {"person": "a", "person_role": "bcc"}):
+            with self.assertRaises(mcp_server.ValidationError):
+                mcp_server.validate_tool_arguments("outlook_local_search", arguments)
+
     def test_today_defaults_and_rejects_date_override(self):
         service = FakeService()
         server = mcp_server.McpServer(service)
@@ -173,6 +182,18 @@ class McpServerTests(unittest.TestCase):
             result = server.handle(request("tools/call", {"name": "outlook_local_today", "arguments": arguments}))["result"]
             self.assertTrue(result["isError"])
         self.assertEqual(len(service.calls), 1)
+
+    def test_digest_bounds_and_incremental_tokens(self):
+        validate = lambda args: mcp_server.validate_tool_arguments("outlook_local_digest", args)
+        result = validate({"known_versions": ["a" * 64], "known_bodies": []})
+        self.assertEqual(result["limit"], 25)
+        self.assertEqual(result["body_max_chars"], 12000)
+        for args in ({"limit": 26}, {"limit": True}, {"body_max_chars": 20001},
+                     {"known_versions": ["a" * 64] * 5001}, {"known_bodies": [None]},
+                     {"known_versions": ["x" * 64]}, {"known_versions": ["a" * 63]},
+                     {"known_versions": ["A" * 64]}, {"person_role": "to"}, {"person": " "}):
+            with self.subTest(args=str(args)[:90]), self.assertRaises(mcp_server.ValidationError):
+                validate(args)
 
     def test_tools_call_rejects_unknown_arguments_and_bool_as_integer(self):
         service = FakeService()

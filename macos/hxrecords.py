@@ -50,8 +50,34 @@ INLINE_BODY_CODEPAGE = 65001
 INLINE_BODY_CLASS = "IPM.Note"
 INLINE_BODY_STANDARD_VARIANT = 4
 INLINE_BODY_EXTRA_VARIANT = 1
+INLINE_BODY_VARIANT_5 = 5
 INLINE_BODY_EXTRA_OFFSET = 18
 INLINE_BODY_EXTRA_LENGTH = 16
+
+# Verified HxPerson layout (Outlook 16.114).  These offsets are relative to
+# the serialized frame, including its 38-byte frame header.
+PERSON_KIND = 85
+PERSON_TO_PARENT = 204
+PERSON_CC_PARENT = 205
+PERSON_BASE_OFFSET = 360
+PERSON_NAME_OFFSET = 302
+PERSON_NAME_LENGTH = 306
+PERSON_EMAIL_OFFSET = 310
+PERSON_EMAIL_LENGTH = 314
+PERSON_DUPLICATE_EMAIL_OFFSET = 322
+PERSON_VARIANT = 326
+PERSON_PARENT_TYPE = 38
+PERSON_PARENT_KEY = 42
+PERSON_SELF_KEY = 50
+PERSON_PARENT_KEY_DUPLICATE = 58
+PERSON_PARENT_REFERENCE = 68
+PERSON_PARENT_TARGET = 78
+PERSON_DESCRIPTOR_FLAG = 0x80000000
+PERSON_VARIANTS = frozenset((1, 2, 3))
+PERSON_ROLES = {PERSON_TO_PARENT: "to", PERSON_CC_PARENT: "cc"}
+PERSON_REDACTED = re.compile(
+    r"\A(?:pii:|\[redacted\]|<redacted>|\(redacted\)|redacted\Z)", re.I
+)
 
 
 @dataclass(frozen=True)
@@ -87,8 +113,142 @@ def iter_frames(block):
         # kind is unsupported or its key is unusable. Only malformed frame
         # candidates may be rescanned for a nested prefix.
         position = end
-        if key and kind in (201, 202, 247, 362):
+        if key and kind in (PERSON_KIND, 201, 202, 247, 362):
             yield Frame(block.offset, start, kind, key, data[start:end])
+
+
+def _person_layout(frame):
+    """Return verified HxPerson parent fields, or ``None`` on any mismatch."""
+    if (frame.kind != PERSON_KIND or type(frame.key) is not int
+            or frame.key <= 0
+            or not isinstance(frame.data, (bytes, bytearray, memoryview))):
+        return None
+    data = bytes(frame.data)
+    if len(data) < PERSON_BASE_OFFSET:
+        return None
+    if (data[:6] != FRAME_PREFIX or data[10:12] != b"\x05\0"
+            or data[18:20] != b"\0\0" or data[22:30] != b"\0" * 8):
+        return None
+    size = struct.unpack_from("<I", data, 6)[0]
+    if (size < 24 or size != struct.unpack_from("<I", data, 14)[0]
+            or len(data) not in (size + 14, size + 15)):
+        return None
+    if (struct.unpack_from("<H", data, 20)[0] != PERSON_KIND
+            or struct.unpack_from("<Q", data, 30)[0] != frame.key):
+        return None
+
+    parent_type = struct.unpack_from("<I", data, PERSON_PARENT_TYPE)[0]
+    parent_key = struct.unpack_from("<Q", data, PERSON_PARENT_KEY)[0]
+    self_key = struct.unpack_from("<Q", data, PERSON_SELF_KEY)[0]
+    parent_key_duplicate = struct.unpack_from(
+        "<Q", data, PERSON_PARENT_KEY_DUPLICATE)[0]
+    reference_type = struct.unpack_from("<H", data, PERSON_PARENT_REFERENCE)[0]
+    reference_target = struct.unpack_from("<Q", data, PERSON_PARENT_TARGET)[0]
+    if parent_type not in PERSON_ROLES or parent_key == 0:
+        return None
+    if (self_key != frame.key or parent_key_duplicate != parent_key
+            or data[66:68] != b"\0\0"
+            or reference_type != parent_type
+            or data[70:78] != b"\0" * 8
+            or reference_target != parent_key):
+        return None
+    return data, parent_type, parent_key
+
+
+def person_parent(frame):
+    """Return the verified To/Cc parent for an HxPerson frame."""
+    parsed = _person_layout(frame)
+    if parsed is None:
+        return None
+    _, parent_type, parent_key = parsed
+    return PERSON_ROLES[parent_type], parent_key
+
+
+def _person_text_is_safe(value):
+    if not isinstance(value, str) or not value or not value.strip():
+        return False
+    if PERSON_REDACTED.match(value.casefold()):
+        return False
+    if re.fullmatch(r"[x*#…]{2,}", value.casefold()):
+        return False
+    return not any(unicodedata.category(char).startswith("C") for char in value)
+
+
+def _person_email_is_safe(value):
+    if not _person_text_is_safe(value) or not EMAIL.fullmatch(value):
+        return False
+    local, domain = value.rsplit("@", 1)
+    if (not local or not domain or local.startswith(".") or local.endswith(".")
+            or ".." in local or "." not in domain
+            or domain.startswith(".") or domain.endswith(".")
+            or ".." in domain):
+        return False
+    return all(part for part in domain.split("."))
+
+
+def parse_person(frame):
+    """Parse one verified HxPerson's bounded UTF-16LE fields."""
+    parsed = _person_layout(frame)
+    if parsed is None:
+        return None
+    data, parent_type, owner = parsed
+    name_offset = struct.unpack_from("<I", data, PERSON_NAME_OFFSET)[0]
+    name_descriptor = struct.unpack_from("<I", data, PERSON_NAME_LENGTH)[0]
+    email_offset = struct.unpack_from("<I", data, PERSON_EMAIL_OFFSET)[0]
+    email_descriptor = struct.unpack_from("<I", data, PERSON_EMAIL_LENGTH)[0]
+    duplicate_offset = struct.unpack_from(
+        "<I", data, PERSON_DUPLICATE_EMAIL_OFFSET)[0]
+    variant = struct.unpack_from("<I", data, PERSON_VARIANT)[0]
+    if variant not in PERSON_VARIANTS:
+        return None
+    if not (name_descriptor & PERSON_DESCRIPTOR_FLAG
+            and email_descriptor & PERSON_DESCRIPTOR_FLAG):
+        return None
+    name_length = name_descriptor & ~PERSON_DESCRIPTOR_FLAG
+    email_length = email_descriptor & ~PERSON_DESCRIPTOR_FLAG
+    if (name_length < 2 or email_length < 2
+            or name_length % 2 or email_length % 2
+            or email_offset > 0x7FFFFFFF or name_offset > 0x7FFFFFFF
+            or duplicate_offset != (PERSON_DESCRIPTOR_FLAG | email_offset)
+            or name_offset != email_offset + email_length):
+        return None
+
+    email_start = PERSON_BASE_OFFSET + email_offset
+    email_end = email_start + email_length
+    name_start = PERSON_BASE_OFFSET + name_offset
+    name_end = name_start + name_length
+    if (email_offset < 5 or email_end < email_start
+            or name_end < name_start or email_end != name_start
+            or name_end > len(data) or email_end > len(data)):
+        return None
+    if (data[email_start - 5:email_start - 1] != b"\x01" * 4
+            or data[email_start - 1:email_start] != b"\0"
+            or data[email_start + email_length - 2:email_end] != b"\0\0"
+            or data[name_start + name_length - 2:name_end] != b"\0\0"):
+        return None
+    try:
+        address = data[email_start:email_end - 2].decode("utf-16le", "strict")
+        name = data[name_start:name_end - 2].decode("utf-16le", "strict")
+    except UnicodeDecodeError:
+        return None
+    if not _person_text_is_safe(name) or not _person_email_is_safe(address):
+        return None
+    evidence = {
+        "block": frame.block,
+        "frame_offset": frame.offset,
+        "frame_bytes": len(data),
+        "frame_sha256": hashlib.sha256(data).hexdigest(),
+        "kind": PERSON_KIND,
+        "method": "verified_hxperson_layout_utf16le",
+    }
+    return {
+        "key": frame.key,
+        "owner": owner,
+        "role": PERSON_ROLES[parent_type],
+        "name": name,
+        "address": address,
+        "evidence": evidence,
+    }
 
 
 def entry_ids(data):
@@ -175,13 +335,24 @@ def parse_inline_body(frame, include_data=True):
     variant = struct.unpack_from("<I", data, INLINE_BODY_VARIANT)[0]
     extra_offset = struct.unpack_from("<I", data, INLINE_BODY_EXTRA_POOL_OFFSET)[0]
     extra_length = struct.unpack_from("<I", data, INLINE_BODY_EXTRA_POOL_LENGTH)[0]
-    if (variant in (INLINE_BODY_STANDARD_VARIANT, INLINE_BODY_EXTRA_VARIANT)
+    # Variant 1/4 standard payloads and variant 1's extra-pool layout are
+    # established layouts.  The newer variant 5 standard payload and variant
+    # 4/5 extra-pool layouts use the same verified offsets, but their body
+    # association is only safe after the caller validates the cached preview.
+    requires_preview_match = False
+    if (variant in (INLINE_BODY_STANDARD_VARIANT, INLINE_BODY_EXTRA_VARIANT,
+                    INLINE_BODY_VARIANT_5)
             and extra_offset == 0 and extra_length == 0):
         payload_base = INLINE_BODY_PAYLOAD_BASE
-    elif (variant, extra_offset, extra_length) == (
-            INLINE_BODY_EXTRA_VARIANT, INLINE_BODY_EXTRA_OFFSET, INLINE_BODY_EXTRA_LENGTH):
+        requires_preview_match = variant == INLINE_BODY_VARIANT_5
+    elif (variant in (INLINE_BODY_EXTRA_VARIANT, INLINE_BODY_STANDARD_VARIANT,
+                      INLINE_BODY_VARIANT_5)
+          and extra_offset == INLINE_BODY_EXTRA_OFFSET
+          and extra_length == INLINE_BODY_EXTRA_LENGTH):
         extra_start = INLINE_BODY_CLASS_OFFSET + extra_offset
         payload_base = extra_start + extra_length
+        requires_preview_match = variant in (INLINE_BODY_STANDARD_VARIANT,
+                                             INLINE_BODY_VARIANT_5)
         if len(data) < payload_base:
             return None
     else:
@@ -234,6 +405,11 @@ def parse_inline_body(frame, include_data=True):
             "unique_offset": unique_offset,
             "unique_descriptor": unique_descriptor,
     }
+    if requires_preview_match:
+        # The parser only establishes the serialized layout.  The body
+        # freezer must compare its decoded text with the message preview
+        # before making this newer association available to callers.
+        evidence["requires_preview_match"] = True
     # Metadata-first callers need the verified layout and source locator, but
     # must not copy every inline body into temporary files during indexing.
     return {**({"data": body} if include_data else {}), "evidence": evidence}

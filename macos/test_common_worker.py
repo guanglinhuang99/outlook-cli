@@ -30,6 +30,39 @@ class CommonWorkerTests(unittest.TestCase):
             common.CommonReader()
         self.assertEqual(service.call_args.kwargs['state'], str(Path.home() / 'Library/Caches/outlook-cli/mac-cache'))
 
+    def test_read_formats_verified_people_and_keeps_partial_structured(self):
+        identifier = self.fixture.ids[0]
+        membership = self.fixture.scope['messages'][identifier]
+        membership.update(participants={'to': [{'name': '中文姓名', 'address': 'person@example.test'}], 'cc': []},
+                          participants_status={'to': 'verified', 'cc': 'verified'})
+        self.fixture.refresh()
+        result = self.reader.perform('read', {'id': self.message_id(identifier)})
+        self.assertEqual(result['to'], '中文姓名 <person@example.test>')
+        self.assertEqual(result['cc'], '')
+        membership['participants_status']['to'] = 'partial'
+        self.fixture.refresh()
+        result = self.reader.perform('read', {'id': self.message_id(identifier)})
+        self.assertIsNone(result['to'])
+        self.assertEqual(result['participants']['to'][0]['name'], '中文姓名')
+
+    def test_public_results_do_not_mutate_shared_snapshot(self):
+        identifier = self.fixture.ids[0]
+        self.fixture.scope['messages'][identifier].update(
+            participants={'to': [{'name': '中文姓名', 'address': 'person@example.test'}]},
+            participants_status={'to': 'verified'})
+        self.fixture.refresh()
+        health = self.reader.perform('health', {})
+        expected_count = health['cache_summary']['messages']
+        health['cache_summary']['messages'] = -1
+        self.assertEqual(self.reader.perform('health', {})['cache_summary']['messages'], expected_count)
+        with patch.object(common, 'deepcopy', wraps=common.deepcopy) as copied:
+            result = self.reader.perform('messages', {'folder': 'inbox', 'limit': 1})
+        self.assertEqual(copied.call_count, 1)
+        self.assertEqual(len(copied.call_args.args[0]['messages']), 1)
+        result['messages'][0]['participants']['to'][0]['name'] = 'changed'
+        again = self.reader.perform('messages', {'folder': 'inbox', 'limit': 1})
+        self.assertEqual(again['messages'][0]['participants']['to'][0]['name'], '中文姓名')
+
     def test_common_contract_discovers_stores_and_restricts_folder_tree(self):
         health = self.reader.perform('health', {})
         self.assertEqual(health['backend'], 'mac-cache')
@@ -86,6 +119,29 @@ class CommonWorkerTests(unittest.TestCase):
         self.assertEqual(self.reader.perform('messages', {'after': '2000-01-02T00:00:00+08:00'})['messages'], [])
         self.assertEqual(len(self.reader.perform('search', {'query': '中文'})['messages']), 1)
         self.assertEqual(self.reader.perform('search', {'query': "' OR 1=1"})['messages'], [])
+
+    def test_person_search_combines_with_keyword_and_never_reads_bodies(self):
+        directory, index = self.fixture.client._current()
+        row = next(item for item in index['items'] if item['folder_id'] == 'inbox')
+        row['participants'] = {'sender': None, 'to': [{'name': '李四', 'address': 'LI@example.test'}], 'cc': []}
+        row['preview'] = '预算讨论'
+        with patch.object(self.fixture.client, '_current', return_value=(directory, index)), \
+                patch.object(common.core, 'resolve_message_body', side_effect=AssertionError('search must not read bodies')):
+            result = self.reader.perform('search', {'query': '预算', 'person': 'li@EXAMPLE', 'person_role': 'to'})
+            self.assertEqual(result['messages'][0]['matched_person_roles'], ['to'])
+            self.assertFalse(result['person_search_incomplete'])
+            self.assertEqual(self.reader.perform('search', {'person': '李四', 'person_role': 'cc'})['messages'], [])
+            self.assertEqual(self.reader.perform('search', {'query': '不存在', 'person': '李四'})['messages'], [])
+            row['participants']['to'] = None
+            missing = self.reader.perform('search', {'person': '李四', 'person_role': 'to'})
+            self.assertEqual(missing['messages'], [])
+            self.assertTrue(missing['person_search_incomplete'])
+
+    def test_invalid_person_search_is_rejected_before_loading_index(self):
+        with patch.object(self.fixture.client, '_current', side_effect=AssertionError('invalid search must fail early')):
+            for params in ({}, {'person': ' '}, {'person': 'x', 'person_role': 'bcc'}, {'person_role': 'to'}):
+                with self.assertRaises(common.ReadError):
+                    self.reader.perform('search', params)
 
     def test_late_delivery_listing_defers_body_until_shared_read(self):
         # The source header was sent in 2000; delivery in 2001 must still match.
