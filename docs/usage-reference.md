@@ -27,7 +27,7 @@ node bin/outlook.mjs stores
 node bin/outlook.mjs mcp-config
 ```
 
-Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 说明](macos.md)。共享命令每次查询一个文件夹；用 `stores` → `folders` 逐级遍历子目录。Mac 缓存无法验证的已读状态、HTML 正文和正文搜索会明确报错。首次建索引可能需要几十秒，索引和附件副本仅写入服务自己的缓存目录，原始邮件只读。
+Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 说明](macos.md)。共享命令每次查询一个文件夹；用 `stores` → `folders` 逐级遍历子目录。Mac 缓存无法验证的已读状态和 HTML 正文会明确报错；正文搜索需显式启用 `search_body`，状态通过 `fulltext` 和 `body_search_incomplete` 返回。首次建索引可能需要几十秒，索引和附件副本仅写入服务自己的缓存目录，原始邮件只读。
 
 ## Windows：Outlook 未打开时读取本地数据
 
@@ -62,7 +62,7 @@ Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 
 - 使用固定版本 `ost-mcp 0.1.0`（MIT），安装时校验 ZIP 和 EXE 的 SHA-256。支持其能够解析的 OST/PST；加密格式及一些 PST 变体不支持，遇到错误会明确报告。已有本地文件时，本地后端无需运行 Outlook；新版 Outlook 自己的缓存不属于此后端的支持范围。
 - 默认文本读取会将 HTML 缓存转换为纯文本，`body.derived_from` 标明来源。不会运行脚本或加载远程图片。解析器优先返回一种正文版本，若无法满足 `format: html` 会报错；仅有 RTF 的正文暂不转换。
 - 每封最多解析前 400 万个原始正文字符、返回其中前 200 万个转换后的字符。超过上限时 `body.source_truncated` 为 true，`total_chars` 为 null；`next_offset` 只用于当前可读部分的分页，为 null 也可能仍有未能解析的内容。
-- 本地搜索每次最多扫描 50 封候选邮件，可跟随 `next_offset` 继续。正文搜索最多检查每封前 200 万个原始字符；遇到缺失/截断正文，`body_search_incomplete` 为 true。内部发件人及其他元数据无法解析时返回 null，不能视作空值或零。
+- 本地搜索每次最多扫描 50 封候选邮件，可跟随 `next_offset` 继续。正文搜索使用独立 SQLite 索引，最多读取每封 1,600 万个原始字符；只有确认完整的正文才入索引，缺失、截断或不支持的正文会使 `body_search_incomplete` 为 true。普通 `read` 的 200 万字符上限不变。内部发件人及其他元数据无法解析时返回 null，不能视作空值或零。
 - 附件沿用 10 MiB 上限和分块协议。部分嵌入对象不能直接读取。
 - 每次查询重新打开文件，并比较操作前后的大小和修改时间；检测到变化返回 `OFFLINE_STORE_CHANGED`。这不是完整的并发一致性保证。默认在 Outlook 关闭后使用文件模式；Outlook 正在同步时优先用 COM。
 
@@ -125,7 +125,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-installe
 
 ## Windows 源码快速使用
 
-推荐使用上述一键安装包。开发者也可克隆源码（需要 Node.js 22 或更新版本），在普通桌面终端运行：
+推荐使用上述一键安装包。开发者也可克隆源码（需要 Node.js 22.13 或更新版本，推荐 24 LTS），在普通桌面终端运行：
 
 ```powershell
 git clone --branch codex/macos-windows-unified https://github.com/guanglinhuang99/outlook-cli.git
@@ -228,6 +228,14 @@ ID 编码了后端和对象身份，Mac ID 还绑定缓存快照；调用方应�
 - `today` 使用 `Asia/Singapore` 的当天零点至次日零点。 显式 `date` 支持 `1970-01-01` 至 `9999-12-30`，按历史时区规则计算零点。翻页时传回第一页返回的 `date` 和 `next_offset`，防止跨午夜后切换日期。例如 `node bin/outlook.mjs today --date 2026-10-20 --offset 25`。默认只查收件箱根目录；已发送用 `--folder sent`，子目录传对应 ID。
 - 每页默认 25，最多 200。每次最多检查 `scan_limit` 个项目，默认 500，上限 2,000。
 - **搜索只覆盖指定文件夹。** 查询是大小写不敏感的字面子串，不是 SQL 或正则表达式。`search_body` 默认 false。
+- Mac 的 `search_body: true` 会先应用文件夹、接收时间和人员条件，再搜索完整纯文本；元数据命中或正文命中均可返回，人员条件仍按 AND 组合，正文命中附带 `body_snippet`。正文只在显式启用时读取，附件内容不纳入索引。
+- Mac 共享搜索的 `fulltext` 统计包含 `candidates`、`indexed`、`missing`、`errors`、`pending`、`updated`、`reused`、`complete`、`revision` 和引擎信息。冷查询受 30 秒、128 MiB 的单次构建预算限制；`pending` 大于 0 或有错误时，重复相同第一页参数，直到 pending 和 errors 都为 0 后再用 `next_offset` 翻页；持续读取错误需要先刷新快照并检查正文诊断。`missing` 表示当前快照下正文未缓存或未能可靠关联；刷新后出现的新正文会重新参与索引，不是 pending；缺失正文、错误或未完成索引会通过 `body_search_incomplete` 明确返回。
+- Mac 正文索引以私有 SQLite 文件持久保存完整纯文本，跨进程复用，数据库上限为 512 MiB；源缓存刷新后会重新考虑新增或变化的正文。三字符及以上 Unicode 查询使用 trigram，一、二字符查询对候选正文做字面扫描。Python 的 SQLite 构建需支持 FTS5/trigram，不支持或达到上限时返回明确索引错误。Windows 使用 Node 内置 SQLite 的独立实现，见下一条；两端均不提供实时服务器状态保证。
+- Windows 的 `search_body: true` 同样支持中文短词、字面匹配、增量持久化和 `body_snippet`。源码部署需 Node 22.13+，推荐 Node 24 LTS；安装器内置版本已满足要求。索引位于服务状态目录的 `fulltext` 子目录，继承当前用户/SYSTEM 的 Windows ACL，数据库上限 512 MiB。只写服务索引，不调用邮件保存、移动或标记已读操作。
+- Windows 每次最多扫描 50 个当前候选项目；先应用收到时间、文件夹和人员条件，再索引完整正文。COM 用邮件 change key 与下载状态识别变化；没有可靠 change key 时本次读取可检索，但不持久复用。离线解析器未暴露逐邮件 change key，因此 OST/PST 的文件大小/修改时间/身份变化后，当前候选正文会重新校验，即使邮件 `modified` 没变。每次都重新枚举候选邮件，不用发送时间或修改时间高水位排除新邮件。
+- Windows 正文索引仅允许已验证的收件箱、已发送及子目录，排除已删除。COM 使用 Outlook 默认目录 ID，离线模式使用解析器的标准目录树和中英文目录名；无法确认范围时返回 `FULLTEXT_FOLDER_SCOPE`。共享接口仍一次查询一个文件夹，不自动递归。
+- Windows `fulltext` 返回本次候选的 `indexed`、`reused`、`updated`、`missing`、`errors`、`pending` 等统计。`retry_required=true` 时用本页原参数重试，`next_offset` 保持本页起点；全部可处理后再翻页。缺失、截断、格式不支持的正文会报告不完整，并在以后查询重试。`complete` 仅表示分页结束，`body_search_incomplete` 表示正文覆盖不足。单次目标预算 30 秒/128 MiB，单封最多 1,600 万 UTF-16 字符；超限正文不保存为完整结果。附件不参与索引。
+- 热查询返回前也会复核来源：COM 重新核对候选邮件的变更标识和当前目录，离线模式重新检查文件版本。检测到同步、编辑或移动会明确报错，重试当前页即可；分页仍不是邮箱快照。COM 的 `Body` 属性会先读取整段正文，然后才检查长度上限，因此 1,600 万字符是索引上限，不是 Outlook 读取时的内存上限。
 - `search --person '姓名或邮箱' --person-role any|sender|to|cc` 支持单独按人员搜索；可与 `--query` 同用，按 AND 组合。`any` 在三个角色间按 OR 匹配，不包含密送人。命中角色见 `matched_person_roles`；缺少角色证据时 `person_search_incomplete=true`，不能把未命中解释为不存在。人员只来自结构化邮件头/收件人字段，不从正文猜测。
 - 人员搜索也先应用文件夹和接收时间范围。继续读取所有 `next_offset` 页面；`complete` 只表示本轮候选扫描结束，不能覆盖本地未缓存的邮件或参与人信息。
 - 返回 `next_offset` 非空时，用相同筛选参数、该 offset 再请求。**本页没有结果不代表搜索完成**，应检查 `next_offset` 或 `complete`。
@@ -259,7 +267,7 @@ Invoke-RestMethod "http://127.0.0.1:$($state.port)/rpc" -Method Post -Headers $h
 
 ## 安装、开发和验证
 
-共享入口需要 Node.js 22+。Windows 需要系统自带 Windows PowerShell 5.1，以及已配置的经典 Outlook 或受支持的本地 OST/PST；新版 Outlook 不支持 COM。Mac 需要 Python 3.11+ 和可解析的 Outlook HxStore 本地缓存，支持范围见 [macOS 说明](macos.md)。Windows PowerShell COM 工作进程使用 STA，仅在该进程中允许执行项目脚本，不修改系统执行策略。
+共享入口需要 Node.js 22+，Windows 全文索引需 22.13+（推荐 24 LTS）。Windows 需要系统自带 Windows PowerShell 5.1，以及已配置的经典 Outlook 或受支持的本地 OST/PST；新版 Outlook 不支持 COM。Mac 需要 Python 3.11+ 和可解析的 Outlook HxStore 本地缓存，支持范围见 [macOS 说明](macos.md)。Windows PowerShell COM 工作进程使用 STA，仅在该进程中允许执行项目脚本，不修改系统执行策略。
 
 标准 Node 环境使用：
 
@@ -275,10 +283,11 @@ python3 -m unittest discover -s macos -p 'test*.py'
 - `test/*.test.mjs`：参数边界、拒绝写操作、HTTP 鉴权、官方 SDK MCP 交互、并发串行化、超时恢复。
 - `macos/test*.py`：合成 HxStore 解析、中文主题与正文关联、目录范围和已删除排除、附件指纹、纯 Python MCP、共享协议兼容性；无需邮件账户。
 - `.github/workflows/ci.yml`：Windows、macOS、Linux 运行 Node 测试，macOS 和 Linux 另跑合成缓存测试。Linux 仅用于协议和解析测试，实际邮箱后端只支持 Windows/macOS。
-- `scripts/smoke.mjs`：Windows 真实邮箱检查；`scripts/smoke-mac.mjs`：Mac 真实缓存检查。只输出计数/布尔值。两者检查 CLI/MCP、正文和附件分页/哈希及拒绝覆盖；Mac 还检查接收日期口径和目录限制。下载测试使用服务状态目录内的临时文件，测试后删除。不显示主题、地址、正文或令牌。
+- Windows 索引的合成性能验证：`node scripts/benchmark-windows-fulltext.mjs`。检查 300 封邮件在冷查询、热查询、服务重启和单封变更后的结果与完整扫描一致，并验证正文读取次数为 300、0、0、1；耗时不包含真实 Outlook COM 或 OST/PST 解析延迟。
+- `scripts/smoke.mjs`：Windows 真实邮箱检查；`scripts/smoke-mac.mjs`：Mac 真实缓存检查。只输出计数/布尔值。两者检查 CLI/MCP、正文和附件分页/哈希及拒绝覆盖；Mac 还检查接收日期口径、目录限制和正文搜索 pending 重试。下载测试使用服务状态目录内的临时文件，测试后删除。不显示主题、地址、正文或令牌。
 - `Test-OutlookRead.ps1`：最初的独立可行性探测脚本，服务不依赖它。
 - `scripts/smoke-offline.mjs`：真实 OST 文件的正文/附件/筛选/MCP 验证，以及模拟 COM 不可用时自动调用真实文件后端的测试；不会关闭 Outlook。
-- 服务状态目录的 `service.log` 只记录启动/服务错误。Windows 正常使用不建立邮件副本或全文索引；Mac 在独立服务缓存中保存本地索引、可恢复正文和按需导出的附件，不写回原始缓存。
+- 服务状态目录的 `service.log` 只记录启动/服务错误。Windows 正常使用不建立邮件副本或全文索引；Mac 在独立服务缓存中保存本地索引、可恢复正文、可选全文索引和按需导出的附件，不写回原始缓存。
 
 服务端口可通过 `OUTLOOK_LOCAL_PORT` 设置；状态目录可通过 `OUTLOOK_LOCAL_STATE_DIR` 设置。变更后应在服务端和客户端使用一致的状态目录。MCP SDK 的确切依赖版本记录在 package.json 和锁文件中。
 

@@ -26,7 +26,7 @@ export const definitions = {
     folder, ...page, unread: z.boolean().optional(), scan_limit: integer(1, 2000, 500),
     date: todayDate.optional().describe('Continuation day from the previous result; omit on the first page to use today.')
   }),
-  search: define('Case-insensitive keyword and/or person search in ONE folder. Keyword matches subject/sender (also cached preview on Mac); optional body search is Windows-only. Person matches known sender/to/cc names or addresses; keyword AND person when both supplied. Bounded scan: follow next_offset and check person_search_incomplete. No claim of whole-mailbox coverage.', {
+  search: define('Case-insensitive keyword and/or person search in ONE folder. Keyword matches subject/sender (also cached preview on Mac); search_body opts into a private incremental SQLite body index on both platforms, including Chinese short keywords. Windows body indexing is limited to verified Inbox/Sent folders and their children, excluding Deleted. Person matches known sender/to/cc names or addresses; keyword AND person when both supplied. Follow next_offset; if retry_required repeat the same page first. Check fulltext, body_search_incomplete and person_search_incomplete; no claim of whole-mailbox coverage.', {
     ...filters, query: z.string().trim().max(500).default(''), search_body: z.boolean().default(false),
     person: z.string().trim().min(1).max(500).optional().describe('Literal case-insensitive name or email substring; never inferred from body text.'),
     person_role: z.enum(['any', 'sender', 'to', 'cc']).default('any')

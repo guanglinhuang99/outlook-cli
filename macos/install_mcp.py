@@ -23,6 +23,7 @@ REQUIRED_FILES = (
     "outlook_local.py",
     "osa_scope.py",
     "outlook_service.py",
+    "fulltext_index.py",
     "mcp_server.py",
 )
 OPTIONAL_FILES = ("hxfolders.py",)

@@ -172,12 +172,12 @@ class CommonReader:
             fail("INVALID_ARGUMENT", "Unknown operation or parameters")
         if "unread" in params:
             fail("UNSUPPORTED_FILTER", "Unread state is not verified by the macOS cache parser")
-        if params.get("search_body"):
-            fail("UNSUPPORTED_FILTER", "Common macOS search supports subject/sender; cached body text is available via read")
         if params.get("format", "text") != "text":
             fail("UNSUPPORTED_FORMAT", "Common macOS reads currently return text only")
         person, role = params.get("person"), params.get("person_role", "any")
         if method == "search":
+            if "search_body" in params and type(params["search_body"]) is not bool:
+                fail("INVALID_ARGUMENT", "search_body must be boolean")
             query = params.get("query", "")
             if not isinstance(query, str) or len(query) > 500 or (not query.strip() and not person):
                 fail("INVALID_ARGUMENT", "search requires query or person (1..500 characters)")
@@ -197,7 +197,7 @@ class CommonReader:
             return {**context, "connected": True, "offline": True, "outlook_required": False,
                     "store_count": len(groups), "readable_store_count": len(groups),
                     "outlook_version": None, "cache_summary": index["summary"],
-                    "capabilities": {"unread_filter": False, "body_search": False, "html_body": False,
+                    "capabilities": {"unread_filter": False, "body_search": True, "html_body": False,
                                      "received_time": True, "sent_time": True},
                     "limitations": ["Only recoverable cache in verified Inbox/Sent folders is exposed.",
                                     "Folder names may be redacted; membership is a local observation, not live server state."]}
@@ -230,29 +230,65 @@ class CommonReader:
             offset = number(params, "offset", 0, 0, 10000000)
             limit = number(params, "limit", 25, 1, 200)
             scan = number(params, "scan_limit", 500, 1, 2000)
-            query = params.get("query", "")
-            query = query.casefold()
+            query_text = params.get("query", "")
+            query = query_text.casefold()
             person_incomplete = False
             matched, position = [], min(offset, len(rows))
-            while position < len(rows) and position - offset < scan and len(matched) < limit:
-                row = rows[position]
-                position += 1
-                if method == "search" and query and not any(query in (row.get(field) or "").casefold()
-                                             for field in ("subject", "sender", "sender_name", "preview")):
-                    continue
+            window = rows[position:min(len(rows), position + scan)]
+            candidate_rows, person_roles, person_incomplete_by_id = [], {}, {}
+            for row in window:
                 roles, incomplete = core.person_matches(row, person, role)
-                person_incomplete |= incomplete
+                person_incomplete_by_id[row["id"]] = incomplete
                 if person and not roles:
                     continue
-                matched.append({**self.metadata(row, index),
-                                **({"matched_person_roles": roles} if person else {})})
-            return {**context, "messages": matched, "scanned": max(0, position - offset),
-                    "filtered_item_count": len(rows), "next_offset": position if position < len(rows) else None,
-                    "complete": position >= len(rows), "scope": "single_folder",
-                    "pagination": "live_offset_not_snapshot", "body_search_incomplete": False,
-                    "person_search_incomplete": person_incomplete,
-                    "received_time_unknown": unknown_times,
-                    "date_filter_incomplete": bool(dated and unknown_times)}
+                candidate_rows.append(row)
+                person_roles[row["id"]] = roles
+
+            body_hits, fulltext = {}, None
+            if method == "search" and params.get("search_body") and query_text:
+                body_hits, fulltext = self.service._fulltext_index.search(
+                    directory, index, candidate_rows, query_text)
+
+            examined = 0
+            for row in window:
+                examined += 1
+                person_incomplete |= person_incomplete_by_id[row["id"]]
+                roles = person_roles.get(row["id"])
+                if roles is None:
+                    continue
+                metadata_match = not query or any(
+                    query in (row.get(field) or "").casefold()
+                    for field in ("subject", "sender", "sender_name", "preview"))
+                body_match = row["id"] in body_hits
+                if method == "search" and query and not (metadata_match or body_match):
+                    continue
+                result = {**self.metadata(row, index),
+                          **({"matched_person_roles": roles} if person else {})}
+                if body_match:
+                    result["body_snippet"] = body_hits[row["id"]]
+                matched.append(result)
+                if len(matched) >= limit:
+                    break
+
+            position += examined
+            pending = bool(fulltext and (fulltext.get("pending") or fulltext.get("errors")))
+            next_offset = position if position < len(rows) else None
+            if pending:
+                # Keep the window anchored until every candidate has been searched.
+                next_offset = offset
+            result = {**context, "messages": matched, "scanned": max(0, examined),
+                      "filtered_item_count": len(rows), "next_offset": next_offset,
+                      "complete": not pending and position >= len(rows),
+                      "scope": "single_folder", "pagination": "live_offset_not_snapshot",
+                      "body_search_incomplete": bool(fulltext and not fulltext.get("complete", False)),
+                      "person_search_incomplete": person_incomplete,
+                      "received_time_unknown": unknown_times,
+                      "date_filter_incomplete": bool(dated and unknown_times)}
+            if fulltext is not None:
+                result["fulltext"] = fulltext
+                if pending:
+                    result["retry_required"] = True
+            return result
         if not identity or kind != "message":
             fail("INVALID_ID", "Expected a message ID")
         row = next((row for row in index["items"] if row["id"] == identity["key"]), None)

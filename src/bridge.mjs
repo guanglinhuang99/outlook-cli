@@ -2,11 +2,14 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { WindowsFulltextIndex } from './windows-fulltext-index.mjs';
+import { searchWindowsFulltext } from './windows-fulltext.mjs';
 
 const workerPath = fileURLToPath(new URL('../powershell/worker.ps1', import.meta.url));
 export class OutlookBridge {
-  constructor({ timeoutMs = 45000, spawnWorker } = {}) {
+  constructor({ timeoutMs = 45000, spawnWorker, fulltextIndex } = {}) {
     this.timeoutMs = timeoutMs;
+    this.fulltextIndex = fulltextIndex;
     this.spawnWorker = spawnWorker ?? (() => spawn(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', workerPath],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }));
@@ -14,11 +17,16 @@ export class OutlookBridge {
     this.sequence = 0;
     this.closed = false;
   }
-  call(method, params) {
+  call(method, params, { timeoutMs = this.timeoutMs } = {}) {
     if (this.closed) return Promise.reject(Object.assign(new Error('Service is stopping'), { code: 'STOPPING' }));
+    if (method === 'search' && params?.search_body) {
+      this.fulltextIndex ??= new WindowsFulltextIndex();
+      return searchWindowsFulltext(this, params, this.fulltextIndex);
+    }
     if (this.queue.length >= 32) return Promise.reject(Object.assign(new Error('Reader queue is full; retry later'), { code: 'BUSY' }));
+    const effectiveTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : this.timeoutMs;
     return new Promise((resolve, reject) => {
-      this.queue.push({ id: ++this.sequence, method, params, resolve, reject });
+      this.queue.push({ id: ++this.sequence, method, params, resolve, reject, deadline: Date.now() + effectiveTimeout });
       this.pump();
     });
   }
@@ -33,6 +41,10 @@ export class OutlookBridge {
         const message = JSON.parse(line);
         if (!this.active || message.id !== this.active.id) throw new Error('Mismatched worker response');
         const active = this.active;
+        if (Date.now() >= active.deadline) {
+          this.failWorker(worker, 'OUTLOOK_TIMEOUT', 'Reader timed out; retry the request.');
+          return;
+        }
         clearTimeout(active.timer);
         this.active = null;
         if (message.error) active.reject(Object.assign(new Error(message.error.message), { code: message.error.code }));
@@ -50,11 +62,18 @@ export class OutlookBridge {
   }
   pump() {
     if (this.active || !this.queue.length || this.closed) return;
-    this.active = this.queue.shift();
+    const next = this.queue.shift();
+    const remaining = next.deadline - Date.now();
+    if (remaining <= 0) {
+      next.reject(Object.assign(new Error('Reader timed out; retry the request.'), { code: 'OUTLOOK_TIMEOUT' }));
+      this.pump();
+      return;
+    }
+    this.active = next;
     try {
       this.ensureWorker();
       const worker = this.worker;
-      this.active.timer = setTimeout(() => this.failWorker(worker, 'OUTLOOK_TIMEOUT', 'Reader timed out; retry the request.'), this.timeoutMs);
+      this.active.timer = setTimeout(() => this.failWorker(worker, 'OUTLOOK_TIMEOUT', 'Reader timed out; retry the request.'), remaining);
       worker.stdin.write(JSON.stringify({ id: this.active.id, method: this.active.method, params: this.active.params }) + '\n');
     } catch {
       const active = this.active;
