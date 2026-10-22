@@ -1,16 +1,20 @@
 // Shared orchestration; each adapter supplies fresh, filtered metadata before
 // the private index is consulted. Mailbox offsets are live, not snapshots.
 export async function searchWindowsFulltext(bridge, params, index) {
+  if (!String(params.query ?? '').trim()) return bridge.call('search', { ...params, search_body: false });
   const deadline = Date.now() + 30000;
+  // Leave five seconds for the final source guard check even when building
+  // the index consumes its entire allowance.
+  const indexDeadline = deadline - 5000;
   const remaining = () => Math.max(1, deadline - Date.now());
   const page = await bridge.call('fulltext_candidates', {
     ...params, limit: 50, scan_limit: Math.min(params.scan_limit ?? 500, 50)
-  }, { timeoutMs: remaining() });
+  }, { timeoutMs: Math.max(1, indexDeadline - Date.now()) });
   const candidates = page.messages.map(item => ({
     id: item.id, signature: item._fulltext_signature ?? null, guard: item._fulltext_guard ?? null
   }));
   const evaluated = await index.evaluate(candidates, {
-    query: params.query ?? '', deadline,
+    query: params.query ?? '', deadline: indexDeadline,
     loadBody: (candidate, timeoutMs) => bridge.call('fulltext_read', {
       id: candidate.id, folder: page.folder_id ?? params.folder,
       signature: candidate.signature, guard: candidate.guard, validation: page.validation

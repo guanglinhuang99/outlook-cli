@@ -7,9 +7,10 @@ import { searchWindowsFulltext } from './windows-fulltext.mjs';
 
 const workerPath = fileURLToPath(new URL('../powershell/worker.ps1', import.meta.url));
 export class OutlookBridge {
-  constructor({ timeoutMs = 45000, spawnWorker, fulltextIndex } = {}) {
+  constructor({ timeoutMs = 45000, spawnWorker, fulltextIndex, enableWindowsFulltext = true } = {}) {
     this.timeoutMs = timeoutMs;
     this.fulltextIndex = fulltextIndex;
+    this.enableWindowsFulltext = enableWindowsFulltext;
     this.spawnWorker = spawnWorker ?? (() => spawn(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
       ['-NoLogo', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', workerPath],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }));
@@ -19,7 +20,7 @@ export class OutlookBridge {
   }
   call(method, params, { timeoutMs = this.timeoutMs } = {}) {
     if (this.closed) return Promise.reject(Object.assign(new Error('Service is stopping'), { code: 'STOPPING' }));
-    if (method === 'search' && params?.search_body) {
+    if (this.enableWindowsFulltext && method === 'search' && params?.search_body) {
       this.fulltextIndex ??= new WindowsFulltextIndex();
       return searchWindowsFulltext(this, params, this.fulltextIndex);
     }

@@ -77,3 +77,58 @@ test('COM protocol and real SQLite reuse unchanged bodies and independently upda
   await assert.rejects(bridge.call('search', args), { code: 'FULLTEXT_SOURCE_CHANGED' });
   assert.ok(methods.every(method => ['fulltext_candidates', 'fulltext_read', 'fulltext_validate'].includes(method)));
 });
+
+test('index budget exhaustion still validates the source and returns a retry page', async t => {
+  let clock = 1_800_000_000_000;
+  t.mock.method(Date, 'now', () => clock);
+  const methods = [];
+  const bridge = new OutlookBridge({
+    fulltextIndex: { evaluate: async (candidates, { deadline }) => {
+      clock = deadline;
+      return { hits: new Map(), retry_required: true, body_search_incomplete: true,
+        fulltext: { candidates: 1, pending: 1, indexed: 0, complete: false } };
+    } },
+    spawnWorker: () => {
+      const worker = new EventEmitter();
+      worker.stdout = new PassThrough(); worker.stderr = new PassThrough();
+      worker.stdin = new Writable({ write(chunk, encoding, callback) {
+        const request = JSON.parse(chunk.toString()); methods.push(request.method);
+        const result = request.method === 'fulltext_candidates'
+          ? { messages: [{ id: 'a', subject: 'other', _fulltext_signature: 'v1', _fulltext_offset: 1 }],
+            scanned: 1, next_offset: null, folder_id: 'folder', validation: { candidates: [{ id: 'a', signature: 'v1' }] } }
+          : { valid: true };
+        if (request.method === 'fulltext_validate') clock += 10;
+        worker.stdout.write(JSON.stringify({ id: request.id, result }) + '\n'); callback();
+      } });
+      worker.kill = () => { worker.stdout.end(); worker.stderr.end(); worker.emit('exit', 0); };
+      return worker;
+    }
+  });
+  t.after(() => bridge.close());
+  const result = await bridge.call('search', validateCall('search', { query: '预算', search_body: true }));
+  assert.deepEqual(methods, ['fulltext_candidates', 'fulltext_validate']);
+  assert.equal(result.retry_required, true);
+  assert.equal(result.next_offset, 0);
+  assert.equal(result.complete, false);
+  assert.equal(result.fulltext.pending, 1);
+});
+
+test('COM person-only search bypasses body indexing even when search_body is enabled', async t => {
+  const methods = [];
+  const bridge = new OutlookBridge({ fulltextIndex: { evaluate: () => { throw Error('body index must not run'); } },
+    spawnWorker: () => {
+      const worker = new EventEmitter(); worker.stdout = new PassThrough(); worker.stderr = new PassThrough();
+      worker.stdin = new Writable({ write(chunk, encoding, callback) {
+        const request = JSON.parse(chunk.toString()); methods.push(request.method);
+        assert.equal(request.params.search_body, false);
+        worker.stdout.write(JSON.stringify({ id: request.id, result: { messages: [{ id: 'a' }], next_offset: null, complete: true } }) + '\n'); callback();
+      } });
+      worker.kill = () => { worker.stdout.end(); worker.stderr.end(); worker.emit('exit', 0); }; return worker;
+    }
+  });
+  t.after(() => bridge.close());
+  const result = await bridge.call('search', validateCall('search', { person: '张三', search_body: true }));
+  assert.deepEqual(methods, ['search']);
+  assert.equal(result.complete, true);
+  assert.equal(result.next_offset, null);
+});

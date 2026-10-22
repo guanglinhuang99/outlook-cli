@@ -145,6 +145,17 @@ test('offline validates source after a warm index hit, not just on body reads', 
   await assert.rejects(f.search(), { code: 'OFFLINE_STORE_CHANGED' });
 });
 
+test('offline person-only search does not load full bodies or depend on their availability', async t => {
+  const f = await fixture(t);
+  f.add(10, null);
+  f.bridge.fulltextIndex.evaluate = () => { throw Error('body index must not run'); };
+  const result = await f.search({ query: '', person: '张三', person_role: 'to' });
+  assert.equal(result.messages.length, 1);
+  assert.equal(result.complete, true);
+  assert.equal(result.body_search_incomplete, false);
+  assert.equal(f.bodyReads(), 0);
+});
+
 test('shared orchestration keeps current page when body work is pending and combines metadata OR body', async () => {
   const page = { messages: [
     { id: 'a', subject: '预算', _fulltext_signature: '1', _fulltext_offset: 1 },

@@ -59,6 +59,63 @@ test('Mac worker uses the shared JSON-line lifecycle and serializes calls', asyn
   assert.equal(starts, 1);
 });
 
+test('Mac search with body indexing stays on the Python worker and preserves the request/result', async t => {
+  const requests = [];
+  const pythonResult = {
+    backend: 'mac-cache',
+    date_basis: 'received_at',
+    messages: [{ id: macId, subject: '项目', body_snippet: '正文命中' }],
+    fulltext: { engine: 'sqlite-fts5-trigram', candidates: 1, indexed: 1 },
+    body_search_incomplete: false
+  };
+  const bridge = new MacCacheBridge({
+    spawnWorker: () => fakeWorker((request, worker) => {
+      requests.push(request);
+      worker.stdout.write(JSON.stringify({ id: request.id, result: pythonResult }) + '\n');
+    })
+  });
+  const router = new BackendRouter({ platform: 'darwin', mac: bridge });
+  t.after(() => router.close());
+  const params = {
+    backend: 'mac-cache', folder: 'inbox', query: '正文', person: '张三', person_role: 'to',
+    search_body: true, after: null, before: null, unread: null, limit: 20, offset: 0, scan_limit: 50
+  };
+  const result = await router.call('search', params);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].method, 'search');
+  const { backend: _backend, ...workerParams } = params;
+  assert.deepEqual(requests[0].params, workerParams);
+  assert.equal(bridge.fulltextIndex, undefined);
+  assert.deepEqual(result, pythonResult);
+});
+
+test('Windows person-only search with the body flag uses the original metadata worker call', async t => {
+  const requests = [];
+  const fulltextIndex = { evaluate: async () => { throw new Error('person-only search must not invoke the full-text index'); } };
+  const workerResult = {
+    messages: [{ id: comId, subject: 'metadata result', sender: { name: '张三' }, matched_person_roles: ['to'] }],
+    scanned: 1, next_offset: null, complete: true, person_search_incomplete: false
+  };
+  const bridge = new OutlookBridge({
+    fulltextIndex,
+    spawnWorker: () => fakeWorker((request, worker) => {
+      requests.push(request);
+      worker.stdout.write(JSON.stringify({ id: request.id, result: workerResult }) + '\n');
+    })
+  });
+  t.after(() => bridge.close());
+  const params = {
+    folder: 'inbox', query: '', person: '张三', person_role: 'to', search_body: true,
+    after: null, before: null, unread: null, limit: 20, offset: 0, scan_limit: 50
+  };
+  const result = await bridge.call('search', params);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].method, 'search');
+  assert.deepEqual(requests[0].params, { ...params, search_body: false });
+  assert.equal(bridge.fulltextIndex, fulltextIndex);
+  assert.deepEqual(result, workerResult);
+});
+
 test('Mac worker close rejects the active request and missing worker text is generic', async t => {
   const bridge = new MacCacheBridge({ spawnWorker: () => fakeWorker(() => {}) });
   const pending = bridge.call('health', {});
@@ -73,11 +130,13 @@ test('Mac worker close rejects the active request and missing worker text is gen
 test('platform construction and foreign IDs never cross native backends', async () => {
   const defaultMac = new BackendRouter({ platform: 'darwin' });
   assert.ok(defaultMac.mac instanceof MacCacheBridge);
+  assert.equal(defaultMac.mac.enableWindowsFulltext, false);
   assert.equal(defaultMac.com, undefined);
   assert.equal(defaultMac.local, undefined);
   defaultMac.close();
   const defaultWin = new BackendRouter({ platform: 'win32' });
   assert.ok(defaultWin.com instanceof OutlookBridge);
+  assert.equal(defaultWin.com.enableWindowsFulltext, true);
   assert.equal(defaultWin.mac, undefined);
   defaultWin.close();
 
