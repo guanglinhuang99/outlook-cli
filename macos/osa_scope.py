@@ -275,7 +275,7 @@ class LogParseCache:
         entry = self._entries.pop(key, None)
         if entry is not None:
             self._serialized_bytes -= len(entry[1])
-        if remove_persistent and self.path is not None:
+        if remove_persistent and self.path is not None and not self._db_disabled:
             key_json = self._key_json(key)
             self._deleted_keys.add(self._cache_key(key_json))
 
@@ -603,7 +603,7 @@ class LogParseCache:
         ):
             key, entry = self._entries.popitem(last=False)
             self._serialized_bytes -= len(entry[1])
-            if self.path is not None:
+            if self.path is not None and not self._db_disabled:
                 cache_key = self._cache_key(self._key_json(key))
                 # A modified row which is evicted before ``flush`` must not
                 # leave its old persistent value behind.  An eviction of an
@@ -758,8 +758,10 @@ class LogParseCache:
             raise _UnstableLog("Osa log changed during read")
         self._entries[key] = (dict(source_stat), payload)
         self._serialized_bytes += len(payload)
-        self._dirty_keys.add(self._cache_key(self._key_json(key)))
-        self._deleted_keys.discard(self._cache_key(self._key_json(key)))
+        if self.path is not None and not self._db_disabled:
+            cache_key = self._cache_key(self._key_json(key))
+            self._dirty_keys.add(cache_key)
+            self._deleted_keys.discard(cache_key)
         self.stores += 1
         self._trim_memory()
         return key in self._entries

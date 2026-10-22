@@ -1751,6 +1751,41 @@ class OsaScopeTests(unittest.TestCase):
         self.assertNotIn(first_cache_key, cache._dirty_keys)
         self.assertIn(first_cache_key, cache._deleted_keys)
 
+    def test_memory_fallback_does_not_accumulate_persistent_bookkeeping(self):
+        path = self.write_log("x.GetFolder.seed.res.xmlgz", self.folder_log())
+        source_stat = osa_scope._file_stat(path)
+        parsed = osa_scope._parse_log(path, "folder", self.log_root)
+        for database_failure in (False, True):
+            with self.subTest(database_failure=database_failure):
+                cache = osa_scope.LogParseCache(
+                    self._persistent_cache_path() if database_failure else None,
+                    max_files=1, max_bytes=64 * 1024,
+                )
+                cache.put(self.profile, self.log_root, "folder", path, source_stat, parsed)
+                if database_failure:
+                    with patch.object(osa_scope.sqlite3, "connect",
+                                      side_effect=sqlite3.OperationalError("database unavailable")):
+                        cache.flush()
+                    self.assertTrue(cache._db_disabled)
+                    self.assertEqual(len(cache._dirty_keys), 0)
+                    self.assertEqual(len(cache._deleted_keys), 0)
+                # The file safety checks have separate coverage; use rotating
+                # identities here without creating 5,000 synthetic log files.
+                with patch.object(osa_scope, "_readable_file_stat", return_value=source_stat):
+                    for number in range(5000):
+                        rotated = self.log_dir / f"x.GetFolder.{number}.res.xmlgz"
+                        cache.put(self.profile, self.log_root, "folder", rotated, source_stat, parsed)
+                        cache.flush()
+                    self.assertEqual(cache.get(
+                        self.profile, self.log_root, "folder", rotated, source_stat), parsed)
+                    self.assertEqual(cache.entry_count, 1)
+                    self.assertLessEqual(cache.serialized_bytes, cache.max_bytes)
+                    self.assertEqual(len(cache._dirty_keys), 0)
+                    self.assertEqual(len(cache._deleted_keys), 0)
+                    cache.invalidate(self.profile, self.log_root, "folder", rotated)
+                    self.assertEqual(cache.entry_count, 0)
+                    self.assertEqual(len(cache._deleted_keys), 0)
+
     def test_sqlite_cache_busy_or_nonprivate_file_falls_back_to_source(self):
         items = self._write_cache_fixture("ENTRY-BUSY", "<busy@example.test>")
         cache_path = self._persistent_cache_path()
