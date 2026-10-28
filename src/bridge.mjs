@@ -22,7 +22,10 @@ export class OutlookBridge {
     if (this.closed) return Promise.reject(Object.assign(new Error('Service is stopping'), { code: 'STOPPING' }));
     if (this.enableWindowsFulltext && method === 'search' && params?.search_body) {
       this.fulltextIndex ??= new WindowsFulltextIndex();
-      return searchWindowsFulltext(this, params, this.fulltextIndex);
+      return searchWindowsFulltext(this, params, this.fulltextIndex, {
+        inlineColdRead: true, directScan: params.com_body_mode === 'direct',
+          deferredIndex: !params.com_body_mode || params.com_body_mode === 'auto'
+      });
     }
     if (this.queue.length >= 32) return Promise.reject(Object.assign(new Error('Reader queue is full; retry later'), { code: 'BUSY' }));
     const effectiveTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : this.timeoutMs;
@@ -97,6 +100,7 @@ export class OutlookBridge {
   }
   close() {
     this.closed = true;
+    this.fulltextIndex?.close?.();
     if (this.worker) this.failWorker(this.worker, 'STOPPING', 'Service stopped');
     for (const item of this.queue.splice(0)) item.reject(new Error('Service stopped'));
   }

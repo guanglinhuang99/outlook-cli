@@ -14,6 +14,22 @@ const runFile = (command, args) => new Promise((resolve, reject) => {
   });
 });
 
+test('worker no-match alphabet cannot hide JS lowercase matches for ASCII queries', async () => {
+  const source = await readFile(new URL('../powershell/worker.ps1', import.meta.url), 'utf8');
+  const pattern = source.match(/\$body\.text -cnotmatch '([^']+)'/)[1];
+  const excluded = new RegExp(pattern, 'u');
+  // Prove the actual worker allowlist, including every permitted code point.
+  // Any true lowercase ASCII match must therefore consist of ASCII source
+  // characters, which OrdinalIgnoreCase cannot miss. False positives stay on
+  // the canonical path because the worker only omits negative matches.
+  for (let cp = 128; cp <= 0x10ffff; cp++) {
+    const char = String.fromCodePoint(cp);
+    if (!excluded.test(char)) assert.ok(!/[\x00-\x7f]/.test(char.toLowerCase()), cp.toString(16));
+  }
+  for (const value of ['İ', 'K', 'Σ', '😀']) assert.equal(excluded.test(value), true);
+  for (const value of ['中文', 'é', '’', 'Ａ']) assert.equal(excluded.test(value), false);
+});
+
 function findPowerShell() {
   const configured = process.env.OUTLOOK_TEST_POWERSHELL;
   const commands = configured ? [configured] : (process.platform === 'win32' ? ['powershell.exe', 'pwsh.exe'] : ['pwsh']);
@@ -109,9 +125,23 @@ test('PowerShell COM full-text worker keeps the internal contract scoped and bod
 });
 
 const powershell = findPowerShell();
+test('identifier cache is bounded, case sensitive and never reuses a source object', { skip: powershell ? false : 'PowerShell unavailable' }, async () => {
+  const fixture = new URL('./fixtures/windows-id-cache.ps1', import.meta.url);
+  const result = await runFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(fixture)]);
+  assert.equal(JSON.parse(result.stdout.trim()).pass, true);
+});
+
 test('PowerShell fake-object harness exercises the internal full-text adapter without live COM', { skip: powershell ? false : 'PowerShell unavailable on this host; live Outlook COM is not required for this test' }, async () => {
   const fixture = new URL('./fixtures/windows-fulltext-worker.ps1', import.meta.url);
   const result = await runFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(fixture)]);
   const output = JSON.parse(result.stdout.trim());
   assert.equal(output.pass, true, output.message ?? 'fake-object harness failed');
+});
+
+test('PowerShell batch property path preserves guards, error fallbacks and whole-folder move checks', { skip: powershell ? false : 'PowerShell unavailable' }, async () => {
+  const fixture = new URL('./fixtures/windows-fulltext-worker.ps1', import.meta.url);
+  const result = await runFile(powershell, ['-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', fileURLToPath(fixture), '-BatchProperties']);
+  const output = JSON.parse(result.stdout.trim());
+  assert.equal(output.pass, true);
+  assert.equal(output.batch_properties, true);
 });

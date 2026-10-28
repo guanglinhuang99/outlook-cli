@@ -4,21 +4,49 @@ $ProgressPreference = 'SilentlyContinue'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 $OutputEncoding = [Console]::OutputEncoding
+$script:idPartsCache = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::Ordinal)
+$script:encodedIdCache = [Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+
+function Remember-Id($Id, $Kind, $Entry, $Store) {
+    # Only immutable identifier components are cached, never COM objects,
+    # versions or folder membership. Bound memory in the persistent worker.
+    if ($Id.Length -gt 16384 -or $Entry -notmatch '^[a-fA-F0-9]+$' -or $Store -notmatch '^[a-fA-F0-9]+$') { return }
+    if ($script:idPartsCache.Count -ge 256) { $script:idPartsCache.Clear() }
+    $script:idPartsCache[$Id] = @([string]$Kind, [string]$Entry, [string]$Store)
+}
 
 function Track($Value) {
     if ($null -ne $Value -and [Runtime.InteropServices.Marshal]::IsComObject($Value)) { $script:refs.Add($Value) }
     return ,$Value
 }
 function Make-Id($Kind, $Entry, $Store) {
+    $key = [string]$Kind + '|' + [string]$Entry + '|' + [string]$Store
+    $cached = $null
+    if ($script:encodedIdCache.TryGetValue($key, [ref]$cached)) {
+        Remember-Id $cached $Kind ([string]$Entry) ([string]$Store)
+        return $cached
+    }
     $json = @{ v = 1; kind = $Kind; entry = [string]$Entry; store = [string]$Store } | ConvertTo-Json -Compress
-    return [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
+    $id = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+','-').Replace('/','_')
+    Remember-Id $id $Kind ([string]$Entry) ([string]$Store)
+    if ($script:idPartsCache.ContainsKey($id)) {
+        if ($script:encodedIdCache.Count -ge 256) { $script:encodedIdCache.Clear() }
+        $script:encodedIdCache[$key] = $id
+    }
+    return $id
 }
 function Parse-Id($Id, $Kind) {
     try {
+        $cached = $null
+        if ($script:idPartsCache.TryGetValue($Id, [ref]$cached)) {
+            if ($cached[0] -ne $Kind) { throw 'bad id kind' }
+            return @{ v = 1; kind = $cached[0]; entry = $cached[1]; store = $cached[2] }
+        }
         $b64 = $Id.Replace('-','+').Replace('_','/')
         $b64 = $b64.PadRight($b64.Length + ((4 - $b64.Length % 4) % 4), '=')
         $obj = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) | ConvertFrom-Json
         if ($obj.v -ne 1 -or $obj.kind -ne $Kind -or $obj.entry -notmatch '^[a-fA-F0-9]+$' -or $obj.store -notmatch '^[a-fA-F0-9]+$') { throw 'bad id' }
+        Remember-Id $Id $Kind ([string]$obj.entry) ([string]$obj.store)
         return $obj
     } catch { throw 'INVALID_ID: Invalid or mismatched Outlook identifier' }
 }
@@ -42,29 +70,43 @@ function Folder-Key($Folder) {
         return $store + '|' + $entry
     } catch { return $null }
 }
-function Same-Folder($Left, $Right) {
-    $leftKey = Folder-Key $Left
-    $rightKey = Folder-Key $Right
-    if ($null -eq $leftKey -or $null -eq $rightKey) { return $false }
-    return [string]::Equals($leftKey, $rightKey, [StringComparison]::OrdinalIgnoreCase)
+function FullText-Folder-Ancestry($Folder, $InitialKey, $StoreRootKey, $StoreRoot = $null) {
+    # One fresh walk supplies both the allowed-root and Deleted checks. Never
+    # carry this proof across phases: the end-of-operation walk starts anew.
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $current = $Folder
+    for ($depth = 0; $depth -lt 128 -and $null -ne $current; $depth++) {
+        if ($null -ne $StoreRootKey -and $null -ne $StoreRoot -and [object]::ReferenceEquals($current, $StoreRoot)) {
+            [void]$seen.Add($StoreRootKey)
+            return ,$seen
+        }
+        $key = if ($depth -eq 0 -and $null -ne $InitialKey) { $InitialKey } else { Folder-Key $current }
+        # Providers without GetRootFolder may terminate at a non-folder Parent,
+        # just as the original ancestry walk did.
+        if ($null -eq $key) { return ,$seen }
+        if (-not $seen.Add($key)) { return $null }
+        if ($null -ne $StoreRootKey -and [string]::Equals($key, $StoreRootKey, [StringComparison]::OrdinalIgnoreCase)) { return ,$seen }
+        try { $current = Track ($current.Parent) } catch { return ,$seen }
+    }
+    if ($null -ne $current) { return $null }
+    return ,$seen
 }
-function Parent-Folder($Folder) {
-    try {
-        $parent = Track ($Folder.Parent)
-        if ($null -eq $parent -or $null -eq (Folder-Key $parent)) { return $null }
-        return ,$parent
-    } catch { return $null }
-}
-function Folder-Is-Within($Folder, $Root) {
+function Folder-Is-Within($Folder, $Root, $InitialKey = $null, $StoreRootKey = $null, $Ancestry = $null) {
+    $rootKey = if ($null -ne $InitialKey -and [object]::ReferenceEquals($Folder, $Root)) { $InitialKey } else { Folder-Key $Root }
+    if ($null -eq $rootKey) { return $false }
+    if ($null -ne $Ancestry) { return $Ancestry.Contains($rootKey) }
     $seen = @{}
     $current = $Folder
     for ($depth = 0; $depth -lt 128 -and $null -ne $current; $depth++) {
-        $key = Folder-Key $current
+        $key = if ($depth -eq 0 -and $null -ne $InitialKey) { $InitialKey } else { Folder-Key $current }
         if ($null -eq $key) { return $false }
-        if (Same-Folder $current $Root) { return $true }
+        if ([string]::Equals($key, $rootKey, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        # The store root has no folder ancestor. Avoid probing EntryID/StoreID
+        # on its non-folder Parent (expensive COM type discovery on first use).
+        if ($null -ne $StoreRootKey -and [string]::Equals($key, $StoreRootKey, [StringComparison]::OrdinalIgnoreCase)) { return $false }
         if ($seen.ContainsKey($key)) { return $false }
         $seen[$key] = $true
-        $current = Parent-Folder $current
+        try { $current = Track ($current.Parent) } catch { return $false }
     }
     return $false
 }
@@ -74,46 +116,122 @@ function Resolve-FullText-Scope($FolderId) {
     if ($null -eq $folder) { throw 'INVALID_ID: Folder not found' }
     try { $store = Track ($folder.Store) } catch { $store = $null }
     if ($null -eq $store) { throw 'FULLTEXT_FOLDER_SCOPE: Full-text operations require a known Outlook store' }
+    $storeRootKey = $null
+    $storeRoot = $null
+    try { $storeRoot = Track ($store.GetRootFolder()); $storeRootKey = Folder-Key $storeRoot } catch { }
     $inbox = $null
     $sent = $null
     $deleted = $null
     try { $inbox = Track ($store.GetDefaultFolder(6)) } catch { }
-    try { $sent = Track ($store.GetDefaultFolder(5)) } catch { }
     try { $deleted = Track ($store.GetDefaultFolder(3)) } catch { }
     # Deleted is a safety boundary. A missing Sent root is allowed when the
     # requested folder is in the same store's Inbox subtree.
     if ($null -eq $deleted) { throw 'FULLTEXT_FOLDER_SCOPE: Full-text operations require a known Deleted Items root' }
-    if (Folder-Is-Within $folder $deleted) { throw 'FULLTEXT_FOLDER_SCOPE: Full-text operations exclude Deleted Items and its descendants' }
+    $folderKey = Folder-Key $folder
+    if ($null -eq $folderKey) { throw 'FULLTEXT_FOLDER_SCOPE: Full-text operations require a known folder identity' }
+    $ancestry = FullText-Folder-Ancestry $folder $folderKey $storeRootKey $storeRoot
+    if ($null -eq $ancestry) { throw 'FULLTEXT_FOLDER_SCOPE: Full-text folder ancestry is cyclic or exceeds its bound' }
+    if (Folder-Is-Within $folder $deleted $folderKey $storeRootKey $ancestry) { throw 'FULLTEXT_FOLDER_SCOPE: Full-text operations exclude Deleted Items and its descendants' }
     $root = $null
-    if ($null -ne $inbox -and (Folder-Is-Within $folder $inbox)) { $root = $inbox }
-    elseif ($null -ne $sent -and (Folder-Is-Within $folder $sent)) { $root = $sent }
+    if ($null -ne $inbox -and (Folder-Is-Within $folder $inbox $folderKey $storeRootKey $ancestry)) { $root = $inbox }
+    else {
+        try { $sent = Track ($store.GetDefaultFolder(5)) } catch { }
+        if ($null -ne $sent -and (Folder-Is-Within $folder $sent $folderKey $storeRootKey $ancestry)) { $root = $sent }
+    }
     if ($null -eq $root) { throw 'FULLTEXT_FOLDER_SCOPE: Full-text operations are limited to the default Inbox and Sent subtrees' }
+    # The identity just captured is the scope's version, not a cache. Reuse it
+    # for serialization and compare with fresh identity at operation end.
+    $folderParts = $folderKey -split '\|', 2
     return ,@{
         folder = $folder
-        id = Make-Id 'folder' $folder.EntryID $folder.StoreID
+        folder_key = $folderKey
+        store_root_key = $storeRootKey
+        store_root = $storeRoot
+        store_id = $folderParts[0]
+        id = Make-Id 'folder' $folderParts[1] $folderParts[0]
         root = $root
-        root_id = Make-Id 'folder' $root.EntryID $root.StoreID
         deleted = $deleted
     }
 }
-function Mail-Current-Folder($Mail) {
-    try {
-        $folder = Track ($Mail.Parent)
-        if ($null -eq $folder -or $null -eq (Folder-Key $folder)) { return $null }
-        return ,$folder
-    } catch { return $null }
+function Mail-In-FullText-Scope($Mail, $Scope) {
+    # Resolve-FullText-Scope proves the requested folder's ancestry once per
+    # operation. Each mail still needs a fresh parent identity check, but not
+    # repeated walks through that identical ancestry. Recheck the folder proof
+    # at the operation's end to detect a folder/subtree move during the scan.
+    try { $current = Track ($Mail.Parent) } catch { return $false }
+    $key = Folder-Key $current
+    return $null -ne $key -and [string]::Equals($key, $Scope.folder_key, [StringComparison]::OrdinalIgnoreCase)
 }
-function Mail-In-FullText-Scope($Mail, $Scope, $RequestedFolder) {
-    $current = Mail-Current-Folder $Mail
-    if ($null -eq $current) { return $false }
-    if (-not (Same-Folder $current $RequestedFolder)) { return $false }
-    if (Folder-Is-Within $current $Scope.deleted) { return $false }
-    if (-not (Folder-Is-Within $current $Scope.root)) { return $false }
-    return $true
+function FullText-Scope-Unchanged($Scope) {
+    $key = Folder-Key $Scope.folder
+    if ($null -eq $key -or -not [string]::Equals($key, $Scope.folder_key, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    $ancestry = FullText-Folder-Ancestry $Scope.folder $key $Scope.store_root_key $Scope.store_root
+    return $null -ne $ancestry -and
+        -not (Folder-Is-Within $Scope.folder $Scope.deleted $key $Scope.store_root_key $ancestry) -and
+        (Folder-Is-Within $Scope.folder $Scope.root $key $Scope.store_root_key $ancestry)
 }
-function Change-Key-Hex($Mail) {
+function FullText-Mail-State($Mail, $Scope, $Accessor, $IncludeMetadata = $false) {
+    # GetProperties returns individual error values for unsupported properties.
+    # Only use the batch fast path for three nonempty binary values; otherwise
+    # fall back to the object model, including its complete ephemeral guard.
     try {
-        $accessor = Track ($Mail.PropertyAccessor)
+        $tags = [object[]]@(
+            'http://schemas.microsoft.com/mapi/proptag/0x65E20102',
+            'http://schemas.microsoft.com/mapi/proptag/0x0E090102',
+            'http://schemas.microsoft.com/mapi/proptag/0x0FFB0102'
+        )
+        if ($IncludeMetadata) {
+            $tags += [object[]]@(
+                'http://schemas.microsoft.com/mapi/proptag/0x0037001F', # Subject
+                'http://schemas.microsoft.com/mapi/proptag/0x0E060040', # Delivery time (UTC)
+                'http://schemas.microsoft.com/mapi/proptag/0x0E070003', # Message flags
+                'http://schemas.microsoft.com/mapi/proptag/0x0E080003', # Size
+                'http://schemas.microsoft.com/mapi/proptag/0x0C1A001F', # Sender name
+                'http://schemas.microsoft.com/mapi/proptag/0x0C1F001F', # Sender address
+                'http://schemas.microsoft.com/mapi/proptag/0x0C1E001F', # Sender address type
+                'http://schemas.microsoft.com/mapi/proptag/0x0FFF0102'  # Entry ID
+            )
+        }
+        $values = $Accessor.GetProperties($tags)
+        if ($values.Count -eq $tags.Count -and
+            $values[0] -is [byte[]] -and $values[0].Length -gt 0 -and
+            $values[1] -is [byte[]] -and $values[1].Length -gt 0 -and
+            $values[2] -is [byte[]] -and $values[2].Length -gt 0) {
+            $state = $Mail.DownloadState
+            if ($null -ne $state) {
+                $change = [BitConverter]::ToString($values[0]).Replace('-', '').ToLowerInvariant()
+                $parent = [BitConverter]::ToString($values[1]).Replace('-', '')
+                $store = [BitConverter]::ToString($values[2]).Replace('-', '')
+                $sameFolder = [string]::Equals($store + '|' + $parent, $Scope.folder_key, [StringComparison]::OrdinalIgnoreCase)
+                # Providers may represent equivalent EntryIDs differently.
+                # Preserve the object-model identity check on a non-match.
+                if (-not $sameFolder) { $sameFolder = Mail-In-FullText-Scope $Mail $Scope }
+                $metadata = @{ DownloadState = [int]$state }
+                if ($IncludeMetadata) {
+                    # Never convert an individual HRESULT into user data. Each
+                    # unsupported field is read through the object model later.
+                    foreach ($field in @(@(3, 'Subject'), @(7, 'SenderName'), @(8, 'SenderEmailAddress'), @(9, 'SenderEmailType'))) {
+                        if ($values[$field[0]] -is [string]) { $metadata[$field[1]] = $values[$field[0]] }
+                    }
+                    if ($values[4] -is [DateTime]) { $metadata.ReceivedTime = [DateTime]::SpecifyKind($values[4], [DateTimeKind]::Utc).ToLocalTime() }
+                    if ($values[5] -is [int] -and $values[5] -ge 0) { $metadata.UnRead = ($values[5] -band 1) -eq 0 }
+                    if ($values[6] -is [int] -and $values[6] -ge 0) { $metadata.Size = $values[6] }
+                    if ($values[10] -is [byte[]] -and $values[10].Length -gt 0) { $metadata.EntryID = [BitConverter]::ToString($values[10]).Replace('-', '') }
+                }
+                return @{ signature = $change + '|' + [string][int]$state; ephemeral_guard = $null; download_state = [int]$state; in_scope = $sameFolder; metadata_values = $metadata }
+            }
+        }
+    } catch { }
+    $guard = Mail-Guard $Mail $Accessor
+    $guard.in_scope = Mail-In-FullText-Scope $Mail $Scope
+    return $guard
+}
+function FullText-Accessor($Mail) {
+    try { return ,(Track ($Mail.PropertyAccessor)) } catch { return $null }
+}
+function Change-Key-Hex($Mail, $Accessor = $null) {
+    try {
+        if ($null -eq $Accessor) { $Accessor = Track ($Mail.PropertyAccessor) }
         $value = $accessor.GetProperty('http://schemas.microsoft.com/mapi/proptag/0x65E20102')
         if ($value -is [byte[]] -and $value.Length -gt 0) {
             return [BitConverter]::ToString($value).Replace('-', '').ToLowerInvariant()
@@ -126,8 +244,8 @@ function Change-Key-Hex($Mail) {
     } catch { }
     return $null
 }
-function Mail-Guard($Mail) {
-    $changeKey = Change-Key-Hex $Mail
+function Mail-Guard($Mail, $Accessor = $null) {
+    $changeKey = Change-Key-Hex $Mail $Accessor
     $downloadState = $null
     $lastModification = $null
     $size = $null
@@ -135,22 +253,25 @@ function Mail-Guard($Mail) {
     $lastModificationValue = $null
     $sizeValue = $null
     try { $downloadStateValue = $Mail.DownloadState } catch { }
+    if ($null -ne $downloadStateValue) { try { $downloadState = [int]$downloadStateValue } catch { } }
+    if (-not [string]::IsNullOrEmpty($changeKey) -and $null -ne $downloadState) {
+        # A versioned message never needs the weaker timestamp/size fallback.
+        # Avoid those COM reads and date conversion on every warm guard check.
+        return @{ signature = $changeKey + '|' + [string]$downloadState; ephemeral_guard = $null; download_state = $downloadState }
+    }
     try { $lastModificationValue = $Mail.LastModificationTime } catch { }
     try { $sizeValue = $Mail.Size } catch { }
-    if ($null -ne $downloadStateValue) { try { $downloadState = [int]$downloadStateValue } catch { } }
     if ($null -ne $lastModificationValue) { try { $lastModification = Iso-Date $lastModificationValue } catch { } }
     if ($null -ne $sizeValue) { try { $size = [string]$sizeValue } catch { } }
     $stateText = if ($null -eq $downloadState) { '<missing>' } else { [string]$downloadState }
     $lastText = if ($null -eq $lastModification) { '<missing>' } else { [string]$lastModification }
     $sizeText = if ($null -eq $size) { '<missing>' } else { [string]$size }
-    $signature = $null
-    if (-not [string]::IsNullOrEmpty($changeKey) -and $null -ne $downloadState) { $signature = $changeKey + '|' + $stateText }
     $ephemeralGuard = $null
     if ($null -ne $lastModification -and $null -ne $size -and $null -ne $downloadState) {
         $ephemeralGuard = $lastText + '|' + $sizeText + '|' + $stateText
     }
     return @{
-        signature = $signature
+        signature = $null
         ephemeral_guard = $ephemeralGuard
         download_state = $downloadState
     }
@@ -184,6 +305,8 @@ function FullText-Filtered-Items($Items, $Params) {
     return ,$Items
 }
 function FullText-Candidates($Scope, $Params) {
+    $inlineBudget = if ($null -ne $Params.inline_body_budget) { FullText-Body-Budget $Params.inline_body_budget } else { $null }
+    $inlineBodies = [Collections.Generic.List[object]]::new()
     $scanLimit = if ($null -eq $Params.scan_limit) { 50 } else { [int]$Params.scan_limit }
     $limit = if ($null -eq $Params.limit) { 50 } else { [int]$Params.limit }
     $offset = if ($null -eq $Params.offset) { 0 } else { [int]$Params.offset }
@@ -212,43 +335,64 @@ function FullText-Candidates($Scope, $Params) {
         if ($mail.Class -ne 43) { continue }
         # Capture the source guard before any date, person, or metadata reads.
         # A matching candidate must describe one stable item version.
-        $beforeGuard = Mail-Guard $mail
+        $accessor = FullText-Accessor $mail
+        $beforeGuard = FullText-Mail-State $mail $Scope $accessor $true
         if ($afterUtc -or $beforeUtc) {
-            $receivedUtc = ([DateTime]$mail.ReceivedTime).ToUniversalTime()
+            $receivedUtc = ([DateTime](Mail-Value $mail $beforeGuard.metadata_values 'ReceivedTime')).ToUniversalTime()
             if ($afterUtc -and $receivedUtc -lt $afterUtc) { continue }
             if ($beforeUtc -and $receivedUtc -ge $beforeUtc) { continue }
         }
-        if (-not (Mail-In-FullText-Scope $mail $Scope $Scope.folder)) { continue }
+        if (-not $beforeGuard.in_scope) { continue }
         $personMatch = $null
         $match = $true
         if ($personActive) {
-            $personMatch = Person-Match $mail $person $personRole
+            $personMatch = Person-Match $mail $person $personRole (Sender-Info $mail $beforeGuard.metadata_values)
             $personIncomplete = $personIncomplete -or $personMatch.incomplete
             $match = $personMatch.matched
         }
         if ($match) {
             $senderInfo = if ($personMatch) { $personMatch.sender } else { $null }
-            $metadata = Mail-Metadata $mail $Scope.folder.StoreID $senderInfo
+            $metadata = Mail-Metadata $mail $Scope.store_id $senderInfo $null $beforeGuard.metadata_values ([bool]$Params.defer_metadata)
             if ($personActive -and $personMatch) { $metadata.matched_person_roles = @($personMatch.matched_roles) }
-            $afterGuard = Mail-Guard $mail
-            $useSignature = $null -ne $beforeGuard.signature -and $null -ne $afterGuard.signature
-            if (-not (Mail-In-FullText-Scope $mail $Scope $Scope.folder) -or -not (FullText-Guard-Matches $beforeGuard $afterGuard $useSignature)) {
+            # The negotiated search path validates the original guard after
+            # matching. Keep that original version, never a later
+            # version that could bless metadata read during a mutation.
+            $afterGuard = $beforeGuard
+            $stable = $beforeGuard.in_scope -and ($null -ne $beforeGuard.signature -or $null -ne $beforeGuard.ephemeral_guard)
+            if (-not $Params.defer_metadata) {
+                $afterGuard = FullText-Mail-State $mail $Scope $accessor
+                $useSignature = $null -ne $beforeGuard.signature -and $null -ne $afterGuard.signature
+                $stable = $afterGuard.in_scope -and (FullText-Guard-Matches $beforeGuard $afterGuard $useSignature)
+            }
+            if (-not $stable) {
                 throw 'FULLTEXT_SOURCE_CHANGED: A message changed while its full-text candidate metadata was read; retry the search'
             }
             $metadata['_fulltext_signature'] = $afterGuard.signature
             $metadata['_fulltext_guard'] = if ($null -eq $afterGuard.signature) { $afterGuard.ephemeral_guard } else { $null }
             $metadata['_fulltext_offset'] = $position
-            $validationCandidates.Add(@{
+            $candidate = @{
                 id = $metadata.id
                 signature = $afterGuard.signature
                 guard = if ($null -eq $afterGuard.signature) { $afterGuard.ephemeral_guard } else { $null }
-            })
+            }
+            $validationCandidates.Add($candidate)
             $matches.Add($metadata)
+            if ($null -ne $inlineBudget) {
+                # The original guard spans metadata AND body. Reuse only this
+                # operation's live objects; no COM reference survives the RPC.
+                $prepared = @{ mail = $mail; accessor = $accessor; before = $beforeGuard;
+                    defer_validation = [bool]$Params.direct_scan -and [bool]$Params.defer_metadata;
+                    direct_query = if ($Params.direct_scan) { [string]$Params.direct_match_query } else { $null } }
+                $inlineBodies.Add((FullText-Bounded-Read $candidate $Scope $inlineBudget $prepared))
+            }
         }
     }
     $next = $null
     if ($position -lt $total) { $next = $position }
-    return @{
+    if (-not (FullText-Scope-Unchanged $Scope)) {
+        throw 'FULLTEXT_SOURCE_CHANGED: The requested folder moved out of its verified scope during the candidate scan; retry the search'
+    }
+    $result = @{
         messages = @($matches.ToArray())
         scanned = $scanned
         scan_limit_applied = $scanLimit
@@ -259,8 +403,11 @@ function FullText-Candidates($Scope, $Params) {
         pagination = 'live_offset_not_snapshot'
         person_search_incomplete = if ($personActive) { $personIncomplete } else { $false }
         folder_id = $Scope.id
+        fulltext_capabilities = @{ batch_read = $true; deferred_metadata = [bool]$Params.defer_metadata }
         validation = @{ candidates = @($validationCandidates.ToArray()) }
     }
+    if ($null -ne $inlineBudget) { $result.inline_bodies = @($inlineBodies.ToArray()) }
+    return $result
 }
 function FullText-Validate($Params) {
     $scope = Resolve-FullText-Scope $Params.folder
@@ -272,16 +419,25 @@ function FullText-Validate($Params) {
     if ($candidates.Count -gt 50) {
         throw 'INVALID_ARGUMENT: fulltext_validate accepts at most 50 candidates'
     }
+    $metadataIds = @{}
+    foreach ($id in @($Params.metadata_ids)) { if ($null -ne $id) { $metadataIds[[string]$id] = $true } }
+    $metadata = [Collections.Generic.List[object]]::new()
     foreach ($candidate in $candidates) {
         if ($null -eq $candidate -or [string]::IsNullOrWhiteSpace([string]$candidate.id)) {
             throw 'INVALID_ARGUMENT: fulltext_validate candidate id is required'
         }
         try { $mail = Get-Mail $candidate.id }
         catch { throw 'FULLTEXT_SOURCE_CHANGED: A message disappeared while its full-text index was being validated; retry the search' }
-        if (-not (Mail-In-FullText-Scope $mail $scope $scope.folder)) {
+        if ($metadataIds.ContainsKey([string]$candidate.id)) {
+            $attachments = Track ($mail.Attachments)
+            $metadata.Add(@{ id = $candidate.id; attachment_count = [int]$attachments.Count })
+        }
+        # Check after all deferred reads against the pre-metadata candidate
+        # version, so no intermediate guard can legitimize changed data.
+        $current = FullText-Mail-State $mail $scope (FullText-Accessor $mail)
+        if (-not $current.in_scope) {
             throw 'FULLTEXT_SOURCE_CHANGED: A message moved or was deleted while its full-text index was being validated; retry the search'
         }
-        $current = Mail-Guard $mail
         $expectedSignature = if ($null -ne $candidate.signature -and -not [string]::IsNullOrEmpty([string]$candidate.signature)) { [string]$candidate.signature } else { $null }
         $expectedGuard = if ($null -ne $candidate.guard -and -not [string]::IsNullOrEmpty([string]$candidate.guard)) { [string]$candidate.guard } else { $null }
         if ($null -eq $expectedSignature -and $null -eq $expectedGuard) {
@@ -292,16 +448,25 @@ function FullText-Validate($Params) {
             throw 'FULLTEXT_SOURCE_CHANGED: A message changed while its full-text index was being validated; retry the search'
         }
     }
-    return @{ valid = $true }
+    if (-not (FullText-Scope-Unchanged $scope)) {
+        throw 'FULLTEXT_SOURCE_CHANGED: The requested folder moved out of its verified scope during validation; retry the search'
+    }
+    if ($metadata.Count -ne $metadataIds.Count) { throw 'INVALID_ARGUMENT: Result metadata must belong to validated candidates' }
+    return @{ valid = $true; metadata = @($metadata.ToArray()) }
 }
-function FullText-Read($Params) {
+function FullText-Read($Params, $BatchScope = $null, $Prepared = $null) {
     if ([string]::IsNullOrWhiteSpace([string]$Params.id)) { throw 'INVALID_ARGUMENT: id is required for full-text reads' }
-    $scope = Resolve-FullText-Scope $Params.folder
-    $mail = Get-Mail $Params.id
-    $requestedFolder = $scope.folder
-    $current = Mail-Current-Folder $mail
-    if ($null -eq $current -or -not (Mail-In-FullText-Scope $mail $scope $requestedFolder)) { return (FullText-Result 'changed' $null $null) }
-    $before = Mail-Guard $mail
+    $scope = if ($null -ne $BatchScope) { $BatchScope } else { Resolve-FullText-Scope $Params.folder }
+    if ($null -ne $Prepared) {
+        $mail = $Prepared.mail
+        $accessor = $Prepared.accessor
+        $before = $Prepared.before
+    } else {
+        $mail = Get-Mail $Params.id
+        $accessor = FullText-Accessor $mail
+        $before = FullText-Mail-State $mail $scope $accessor
+    }
+    if (-not $before.in_scope) { return (FullText-Result 'changed' $null $null) }
     $expected = $null
     $useSignature = $false
     if ($null -ne $Params.signature -and -not [string]::IsNullOrEmpty([string]$Params.signature)) {
@@ -331,9 +496,16 @@ function FullText-Read($Params) {
     try { $rawBody = $mail.Body } catch { $read = $false }
     if ($read -and $null -eq $rawBody) { $read = $false }
     $body = if ($read) { [string]$rawBody } else { $null }
-    $afterFolder = Mail-Current-Folder $mail
-    $after = Mail-Guard $mail
-    if ($null -eq $afterFolder -or -not (Mail-In-FullText-Scope $mail $scope $requestedFolder) -or -not (FullText-Guard-Matches $before $after $useSignature)) {
+    if ($null -ne $Prepared -and $Prepared.defer_validation) {
+        # A direct scan cannot cache or publish this body yet. Its original
+        # guard is checked by fulltext_validate after ALL reads and matching.
+        # The distinct status keeps an ordinary index loader from accepting it.
+        if (-not $read) { return (FullText-Result 'missing' $null $before.signature) }
+        if ($body.Length -gt 16000000) { return (FullText-Result 'truncated' $null $before.signature) }
+        return (FullText-Result 'unverified' $body $before.signature)
+    }
+    $after = FullText-Mail-State $mail $scope $accessor
+    if (-not $after.in_scope -or -not (FullText-Guard-Matches $before $after $useSignature) -or ($null -eq $BatchScope -and -not (FullText-Scope-Unchanged $scope))) {
         return (FullText-Result 'changed' $null $(if ($useSignature) { $after.signature } else { $null }))
     }
     $signature = if ($useSignature) { $after.signature } else { $null }
@@ -344,22 +516,86 @@ function FullText-Read($Params) {
     }
     return (FullText-Result 'ready' $body $signature)
 }
+function FullText-Body-Budget($Params) {
+    $maxBytes = [long]$Params.max_bytes
+    $bodyBytes = [long]$Params.max_body_bytes
+    $budgetMs = [int]$Params.budget_ms
+    if ($maxBytes -lt 1 -or $maxBytes -gt 134217728 -or $bodyBytes -lt 1 -or $bodyBytes -gt 134217728 -or $budgetMs -lt 1 -or $budgetMs -gt 30000) {
+        throw 'INVALID_ARGUMENT: Invalid full-text batch budget'
+    }
+    return @{ clock = [Diagnostics.Stopwatch]::StartNew(); max_bytes = $maxBytes; max_body_bytes = $bodyBytes;
+        budget_ms = $budgetMs; used = 0L; exhausted = $false }
+}
+function FullText-Bounded-Read($Candidate, $Scope, $Budget, $Prepared = $null) {
+    $body = FullText-Result 'pending' $null $Candidate.signature
+    if (-not $Budget.exhausted -and $Budget.clock.ElapsedMilliseconds -lt $Budget.budget_ms) {
+        try { $body = FullText-Read $Candidate $Scope $Prepared }
+        catch { $body = FullText-Result 'changed' $null $Candidate.signature }
+        if ($body.status -eq 'ready' -or $body.status -eq 'unverified') {
+            $bytes = [Text.Encoding]::UTF8.GetByteCount($body.text)
+            if ($bytes -gt $Budget.max_body_bytes) { $body = FullText-Result 'truncated' $null $Candidate.signature }
+            elseif ($Budget.used + $bytes -gt $Budget.max_bytes) {
+                $body = FullText-Result 'pending' $null $Candidate.signature
+                $Budget.exhausted = $true
+            } else {
+                $Budget.used += $bytes
+                # An ASCII query can only match ASCII body characters after
+                # JS lowercase within this conservative alphabet. The allowed
+                # non-ASCII ranges never lowercase into ASCII (exhaustively
+                # checked against the JS runtime in tests). In particular,
+                # dotted I and Kelvin sign are excluded. A hit or any other
+                # alphabet still goes through the canonical JS path.
+                # Count the original body bytes before omitting any payload.
+                if ($body.status -eq 'unverified' -and $null -ne $Prepared -and
+                    -not [string]::IsNullOrEmpty($Prepared.direct_query) -and
+                    $Prepared.direct_query -cnotmatch '[^\x00-\x7f]' -and
+                    $body.text -cnotmatch '[^\x00-\x7f\u00a0-\u00ff\u2000-\u206f\u2e80-\u9fff\ufeff\uff00-\uffef]' -and
+                    $body.text.IndexOf($Prepared.direct_query, [StringComparison]::OrdinalIgnoreCase) -lt 0) {
+                    $body = @{ status = 'unverified_no_match'; text = $null; signature = $body.signature;
+                        query = $Prepared.direct_query; body_bytes = $bytes; body_code_units = $body.text.Length }
+                }
+            }
+        }
+    }
+    $body.id = $Candidate.id
+    return $body
+}
+function FullText-Read-Batch($Params) {
+    $candidates = @($Params.candidates)
+    if ($candidates.Count -lt 1 -or $candidates.Count -gt 50) { throw 'INVALID_ARGUMENT: fulltext_read_batch accepts 1 to 50 candidates' }
+    $budget = FullText-Body-Budget $Params
+    $scope = Resolve-FullText-Scope $Params.folder
+    $results = [Collections.Generic.List[object]]::new()
+    foreach ($candidate in $candidates) {
+        $results.Add((FullText-Bounded-Read $candidate $scope $budget))
+    }
+    # No body from this batch may escape if the shared folder proof expired.
+    if (-not (FullText-Scope-Unchanged $scope)) {
+        throw 'FULLTEXT_SOURCE_CHANGED: The requested folder moved during a body batch; retry the search'
+    }
+    return @{ bodies = @($results.ToArray()) }
+}
 function Iso-Date($Value) {
     if ($null -eq $Value) { return $null }
     return ([DateTime]$Value).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
 }
-function Sender-Info($Mail) {
-    $address = [string]$Mail.SenderEmailAddress
-    $addressType = [string]$Mail.SenderEmailType
+function Mail-Value($Mail, $Values, $Name) {
+    if ($null -ne $Values -and $Values.ContainsKey($Name)) { return ,$Values[$Name] }
+    return ,$Mail.$Name
+}
+function Sender-Info($Mail, $Values = $null) {
+    $address = [string](Mail-Value $Mail $Values 'SenderEmailAddress')
+    $addressType = [string](Mail-Value $Mail $Values 'SenderEmailType')
     $smtp = $null
     if ($addressType -eq 'SMTP') { $smtp = $address }
     if ($addressType -eq 'EX') {
         try {
             $sender = Track ($Mail.Sender)
-            if ($sender.AddressEntryUserType -eq 0 -or $sender.AddressEntryUserType -eq 5) {
+            $senderType = $sender.AddressEntryUserType
+            if ($senderType -eq 0 -or $senderType -eq 5) {
                 $exchangeUser = Track ($sender.GetExchangeUser())
                 if ($exchangeUser) { $smtp = $exchangeUser.PrimarySmtpAddress }
-            } elseif ($sender.AddressEntryUserType -eq 1) {
+            } elseif ($senderType -eq 1) {
                 $distribution = Track ($sender.GetExchangeDistributionList())
                 if ($distribution) { $smtp = $distribution.PrimarySmtpAddress }
             }
@@ -369,20 +605,20 @@ function Sender-Info($Mail) {
             }
         } catch { }
     }
-    return @{ name = [string]$Mail.SenderName; address = $address; address_type = $addressType; smtp_address = $smtp }
+    return @{ name = [string](Mail-Value $Mail $Values 'SenderName'); address = $address; address_type = $addressType; smtp_address = $smtp }
 }
-function Mail-Metadata($Mail, $StoreId, $SenderInfo = $null, $Attachments = $null) {
-    if ($null -eq $Attachments) { $Attachments = Track ($Mail.Attachments) }
-    if ($null -eq $SenderInfo) { $SenderInfo = Sender-Info $Mail }
+function Mail-Metadata($Mail, $StoreId, $SenderInfo = $null, $Attachments = $null, $Values = $null, $DeferAttachments = $false) {
+    if (-not $DeferAttachments -and $null -eq $Attachments) { $Attachments = Track ($Mail.Attachments) }
+    if ($null -eq $SenderInfo) { $SenderInfo = Sender-Info $Mail $Values }
     return @{
-        id = Make-Id 'message' $Mail.EntryID $StoreId
-        subject = [string]$Mail.Subject
+        id = Make-Id 'message' (Mail-Value $Mail $Values 'EntryID') $StoreId
+        subject = [string](Mail-Value $Mail $Values 'Subject')
         sender = $SenderInfo
-        received_at = Iso-Date $Mail.ReceivedTime
-        unread = [bool]$Mail.UnRead
-        size_bytes = [int]$Mail.Size
-        attachment_count = [int]$attachments.Count
-        download_state = [int]$Mail.DownloadState
+        received_at = Iso-Date (Mail-Value $Mail $Values 'ReceivedTime')
+        unread = [bool](Mail-Value $Mail $Values 'UnRead')
+        size_bytes = [int](Mail-Value $Mail $Values 'Size')
+        attachment_count = if ($DeferAttachments) { $null } else { [int]$attachments.Count }
+        download_state = [int](Mail-Value $Mail $Values 'DownloadState')
     }
 }
 function Attachment-List($Mail, $Attachments = $null) {
@@ -533,6 +769,9 @@ function Run-Operation($Method, $Params) {
         }
         'fulltext_read' {
             return (FullText-Read $Params)
+        }
+        'fulltext_read_batch' {
+            return (FullText-Read-Batch $Params)
         }
         { $_ -eq 'messages' -or $_ -eq 'search' } {
             $folder = Get-Folder $Params.folder

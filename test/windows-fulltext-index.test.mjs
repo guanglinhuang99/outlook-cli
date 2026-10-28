@@ -14,6 +14,177 @@ async function fixture(t, options = {}) {
   return { root, directory, index: new WindowsFulltextIndex({ directory, ...options }) };
 }
 
+test('direct scan matches SQLite literal hits and snippets without creating a cache', async t => {
+  const { index, directory } = await fixture(t);
+  t.after(() => index.close());
+  const texts = ['会议预算复核 Straße a*b "OR" 中文关键字 İ 😀', '', `${'x'.repeat(400)}尾部独有预算复核`];
+  const candidates = texts.map((text, i) => ({ id: String(i), signature: 'v1' }));
+  const bodies = new Map(candidates.map((c, i) => [c.id, { ...c, status: 'unverified', text: texts[i] }]));
+  assert.deepEqual(index.directReadBudget(), { max_bytes: 134217728, max_body_bytes: 134217728 });
+  const scans = new Map();
+  for (const query of ['算', '预算', '预算复核', 'a*b', '"OR"', 'Straße', "' OR 1=1", '独有', 'i\u0307', '😀']) {
+    const result = index.evaluateDirect(candidates, bodies, { query });
+    assert.equal(result.fulltext.complete, true);
+    assert.equal(result.fulltext.evaluated, 3);
+    assert.equal(result.fulltext.indexed, 0);
+    scans.set(query, result.hits);
+  }
+  await assert.rejects(stat(directory), { code: 'ENOENT' });
+  for (const [query, hits] of scans) {
+    const result = await index.evaluate(candidates, { query, loadBody: async c => ({ ...bodies.get(c.id), status: 'ready' }) });
+    assert.deepEqual(result.hits, hits, query);
+  }
+  const rejected = await index.evaluate([{ id: 'unverified', signature: 'v1' }], {
+    query: 'hit', loadBody: async c => ({ ...c, status: 'unverified', text: 'hit' })
+  });
+  assert.equal(rejected.fulltext.errors, 1);
+  assert.equal(rejected.hits.size, 0);
+});
+
+test('direct scan retains incomplete, retry, byte and time limits', async t => {
+  let clock = 1_800_000_000_000;
+  const { index } = await fixture(t, { singleBatchBytes: 8, bodyCapCodeUnits: 6, now: () => clock });
+  const run = statuses => {
+    const candidates = statuses.map((b, i) => ({ id: String(i), signature: 'v1' }));
+    return index.evaluateDirect(candidates, new Map(candidates.map((c, i) => [c.id, { ...c, ...statuses[i] }])), { query: 'test' });
+  };
+  const mixed = run([{ status: 'unverified', text: 'test' }, { status: 'missing' }, { status: 'truncated' },
+    { status: 'error' }, { status: 'pending' }, { status: 'ready', text: 'test', signature: 'v2' }]);
+  assert.equal(mixed.hits.size, 1);
+  assert.equal(mixed.fulltext.missing, 2); assert.equal(mixed.fulltext.errors, 2); assert.equal(mixed.fulltext.pending, 1);
+  assert.equal(mixed.body_search_incomplete, true); assert.equal(mixed.retry_required, true);
+  assert.equal(run([{ status: 'ready', text: '1234567' }]).fulltext.missing, 1);
+  const capped = run(Array.from({ length: 3 }, () => ({ status: 'ready', text: 'test' })));
+  assert.equal(capped.fulltext.evaluated, 2); assert.equal(capped.fulltext.pending, 1);
+  const c = { id: 'a', signature: 'v1' };
+  const expired = index.evaluateDirect([c], new Map([['a', { ...c, status: 'ready', text: 'test' }]]), { query: 'test', deadline: clock });
+  assert.equal(expired.fulltext.pending, 1); assert.equal(expired.fulltext.evaluated, 0);
+});
+
+test('compact direct no-matches preserve query/version identity, byte caps and cannot enter SQLite', async t => {
+  const { index } = await fixture(t, { singleBatchBytes: 8 });
+  const candidates = ['a', 'b', 'c'].map(id => ({ id, signature: 'v1' }));
+  const body = { status: 'unverified_no_match', signature: 'v1', query: 'test', body_bytes: 4, body_code_units: 4 };
+  const result = index.evaluateDirect(candidates, new Map(candidates.map(c => [c.id, body])), { query: 'TEST' });
+  assert.equal(result.fulltext.evaluated, 2); assert.equal(result.fulltext.omitted_bodies, 2);
+  assert.equal(result.fulltext.pending, 1); assert.equal(result.retry_required, true);
+  assert.equal(result.hits.size, 0);
+  for (const extra of [{ query: 'other' }, { signature: 'v2' }, { body_bytes: -1 }, { body_code_units: 5 }]) {
+    const invalid = index.evaluateDirect(candidates.slice(0, 1), new Map([['a', { ...body, ...extra }]]), { query: 'test' });
+    assert.equal(invalid.fulltext.errors, 1); assert.equal(invalid.fulltext.evaluated, 0);
+  }
+  const rejected = await index.evaluate(candidates.slice(0, 1), { query: 'test', loadBody: async () => body });
+  assert.equal(rejected.fulltext.errors, 1); assert.equal(rejected.fulltext.updated, 0);
+});
+
+test('inline cold reads require a prepared empty private cache and preserve configured bounds', async t => {
+  const { index, directory } = await fixture(t, { singleBatchBytes: 8 });
+  assert.deepEqual(await index.prepareColdRead(), { max_bytes: 8, max_body_bytes: 8 });
+  assert.equal(await index.prepareColdRead(), null);
+  assert.equal(await new WindowsFulltextIndex({ directory }).prepareColdRead(), null);
+  assert.ok((await stat(index.databasePath)).size > 0);
+  const { index: raced } = await fixture(t);
+  const open = raced._openDatabase.bind(raced);
+  raced._openDatabase = async () => {
+    const db = await open();
+    raced._storeReady(db, { id: 'concurrent', signature: 'v1' }, 'text');
+    return db;
+  };
+  assert.equal(await raced.prepareColdRead(), null);
+});
+
+test('unsafe cold cache preparation fails before body prefetch can be requested', async t => {
+  const { index, directory } = await fixture(t);
+  await writeFile(directory, 'not a directory');
+  await assert.rejects(index.prepareColdRead());
+});
+
+test('bulk FTS failure cannot commit documents without their matching searchable entries', async t => {
+  const { index } = await fixture(t);
+  const candidates = ['a', 'b'].map(id => ({ id, signature: 'v1' }));
+  const loadBody = async () => { throw Error('batch expected'); };
+  const options = { query: 'original', loadBody,
+    loadBodies: async missing => missing.map(c => ({ ...c, status: 'ready', text: 'original searchable text' })) };
+  const first = await index.evaluate(candidates, options);
+  assert.equal(first.hits.size, 2);
+  const insert = index._storeFtsBatch.bind(index);
+  index._storeFtsBatch = () => { throw Error('injected FTS batch failure'); };
+  await assert.rejects(index.evaluate(candidates.map(c => ({ ...c, signature: 'v2' })), options));
+  index._storeFtsBatch = insert;
+  // _prepareCache removes obsolete versions before loading; after failed
+  // replacement no new document may exist without its matching FTS entry.
+  const db = await index._openDatabase();
+  try {
+    assert.equal(db.prepare("SELECT count(*) AS n FROM documents WHERE signature='v2'").get().n, 0);
+    index._checkIntegrity(db);
+  } finally { db.close(); }
+  const rebuilt = await index.evaluate(candidates, options);
+  assert.equal(rebuilt.hits.size, 2);
+  const reused = await index.evaluate(candidates, { ...options, loadBodies: async () => { throw Error('warm bodies should be reused'); } });
+  assert.equal(reused.fulltext.reused, 2);
+  assert.equal(reused.hits.size, 2);
+});
+
+test('bounded batch loading reads only misses, persists versions and rejects malformed batches', async t => {
+  const { index } = await fixture(t, { singleBatchBytes: 8 });
+  const candidates = ['a', 'b', 'c'].map(id => ({ id, signature: 'v1' }));
+  const calls = [];
+  const loadBody = () => { throw Error('single reader must not run'); };
+  const loadBodies = async (missing, timeout, maxBytes, bodyBytes) => {
+    calls.push(missing.map(item => item.id));
+    assert.ok(timeout > 0); assert.equal(maxBytes, 8); assert.equal(bodyBytes, 8);
+    return missing.map((item, i) => ({ ...item, status: i === 2 ? 'pending' : 'ready', text: 'test' }));
+  };
+  const first = await index.evaluate(candidates, { query: 'test', loadBody, loadBodies });
+  assert.deepEqual([...first.hits.keys()].sort(), ['a', 'b']);
+  assert.equal(first.fulltext.pending, 1); assert.equal(first.retry_required, true);
+  const second = await index.evaluate(candidates, { query: 'test', loadBody, loadBodies });
+  assert.equal(second.fulltext.reused, 2); assert.equal(second.fulltext.updated, 1);
+  assert.deepEqual(calls, [['a', 'b', 'c'], ['c']]);
+  await index.evaluate(candidates, { query: 'test', loadBody, loadBodies });
+  assert.equal(calls.length, 2);
+  const changed = candidates.map(item => ({ ...item, signature: 'v2' }));
+  const malformed = await index.evaluate(changed, { query: 'test', loadBody,
+    loadBodies: async () => changed.map(() => ({ id: 'a', signature: 'v2', status: 'ready', text: 'x' })) });
+  assert.equal(malformed.fulltext.errors, 3);
+  assert.equal(malformed.hits.size, 0);
+});
+
+test('batch mode preserves source signatures, ephemeral bodies, byte caps and late-result deadlines', async t => {
+  let clock = 1_800_000_000_000;
+  const { index } = await fixture(t, { now: () => clock, singleBatchBytes: 8 });
+  const loadBody = () => { throw Error('single reader must not run'); };
+  const candidates = [{ id: 'a', signature: null }, { id: 'b', signature: 'v1' }, { id: 'c', signature: 'v1' }];
+  const result = await index.evaluate(candidates, { query: 'test', loadBody, loadBodies: async () => [
+    { ...candidates[0], status: 'ready', text: 'test' },
+    { ...candidates[1], status: 'ready', text: 'test', signature: 'v2' },
+    { ...candidates[2], status: 'ready', text: 'testtest' }
+  ] });
+  assert.deepEqual([...result.hits.keys()], ['a']);
+  assert.equal(result.fulltext.errors, 1); assert.equal(result.fulltext.pending, 1);
+  const deadline = clock + 100;
+  const late = await index.evaluate(candidates, { query: 'test', loadBody, deadline,
+    loadBodies: async () => { clock = deadline; return candidates.map(item => ({ ...item, status: 'ready', text: 'test' })); } });
+  assert.equal(late.fulltext.pending, 3); assert.equal(late.fulltext.updated, 0);
+  assert.equal(late.fulltext.reused, 0); assert.equal(late.hits.size, 0);
+});
+
+test('a failed batch write rolls back every document and releases the database lock', async t => {
+  const { index } = await fixture(t);
+  const candidates = ['a', 'b'].map(id => ({ id, signature: 'v1' }));
+  const options = { query: 'test', loadBody: () => { throw Error('single reader must not run'); },
+    loadBodies: async items => items.map(item => ({ ...item, status: 'ready', text: 'test' })) };
+  const store = index._storeReady.bind(index);
+  index._storeReady = (db, candidate, ...args) => {
+    store(db, candidate, ...args);
+    if (candidate.id === 'b') throw Error('injected write failure');
+  };
+  await assert.rejects(index.evaluate(candidates, options), { code: 'FULLTEXT_ERROR' });
+  index._storeReady = store;
+  const result = await index.evaluate(candidates, options);
+  assert.equal(result.fulltext.reused, 0); assert.equal(result.fulltext.updated, 2);
+});
+
 function loader(texts, calls = []) {
   return async candidate => {
     calls.push(candidate.id);

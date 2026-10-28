@@ -1,6 +1,5 @@
 // Read-only real-mailbox integration test. Emits only counters/booleans, no mail content.
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdtemp, readFile, unlink, rmdir } from 'node:fs/promises';
@@ -8,6 +7,7 @@ import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/cli
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { call, readState, root, runtimeDir } from '../src/runtime.mjs';
 import path from 'node:path';
+import { readVerifiedAttachment } from './smoke-attachment.mjs';
 
 const report = {};
 report.health = await call('health');
@@ -52,10 +52,7 @@ if (attached) {
   const metadata = await call('attachments', { id: attached.id });
   const candidate = metadata.attachments.find(a => a.type === 1 && a.size_bytes <= 10485760);
   if (candidate) {
-    const data = await call('read_attachment', { id: attached.id, index: candidate.index });
-    const bytes = Buffer.from(data.data, 'base64');
-    assert.equal(bytes.length, data.size_bytes);
-    assert.equal(createHash('sha256').update(bytes).digest('hex'), data.sha256);
+    const { bytes } = await readVerifiedAttachment(call, { id: attached.id, index: candidate.index });
     report.attachment_bytes_verified = bytes.length;
     const firstChunk = await call('read_attachment', { id: attached.id, index: candidate.index, chunk_bytes: 100 });
     assert.equal(firstChunk.chunk_size, Math.min(100, bytes.length));

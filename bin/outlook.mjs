@@ -36,7 +36,7 @@ const help = `Outlook Local Service — read-only, no AI
   outlook-local messages [--folder inbox] [--limit 25] [--unread true]
   outlook-local today [--folder inbox|sent] [--limit 25] [--date YYYY-MM-DD]
   outlook-local search [--query text] [--person name-or-email] [--person-role any|sender|to|cc]
-                       [--search-body true] [--scan-limit 500]
+                       [--search-body true] [--com-body-mode auto|direct|indexed] [--scan-limit 500]
   outlook-local read --id <message-id> [--max-chars 20000] [--body-offset 0]
   outlook-local attachments --id <message-id>
   outlook-local download --id <message-id> --index 1 --out <file>
@@ -114,7 +114,7 @@ async function main() {
   const operation = command === 'download' ? 'read_attachment' : command === 'rpc' ? args.shift() : command;
   if (!Object.hasOwn(definitions, operation)) throw new Error(`Unknown command: ${command}`);
   const parsed = parseArgs({ args, options: Object.fromEntries([
-    'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'date', 'scan-limit', 'query', 'person', 'person-role', 'search-body', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json'
+    'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'date', 'scan-limit', 'query', 'person', 'person-role', 'search-body', 'com-body-mode', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json'
   ].map(key => [key, { type: 'string' }])), strict: true, allowPositionals: false });
   const values = { ...parsed.values };
   const outputPath = values.out;

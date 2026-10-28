@@ -1,6 +1,6 @@
 // Read-only real-cache verification. No Outlook close/launch and no mail content output.
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { readVerifiedAttachment } from './smoke-attachment.mjs';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { call, readState } from '../src/runtime.mjs';
 import { BackendRouter } from '../src/backend.mjs';
@@ -39,10 +39,8 @@ if (attached) {
   const attachments = await call('attachments', { id: attached.id });
   const candidate = attachments.attachments.find(a => a.type === 1 && a.size_bytes < 10485760);
   if (candidate) {
-    const result = await call('read_attachment', { id: attached.id, index: candidate.index, chunk_bytes: 1048576 });
-    assert.equal(result.next_offset, null);
-    const bytes = Buffer.from(result.data, 'base64');
-    assert.equal(createHash('sha256').update(bytes).digest('hex'), result.sha256);
+    const result = await readVerifiedAttachment(call, { id: attached.id, index: candidate.index });
+    const bytes = result.bytes;
     report.attachment_bytes_verified = bytes.length;
     const com = await call('messages', { backend: 'com', limit: 5 }).catch(() => null);
     const same = com?.messages.find(m => m.subject === attached.subject);
@@ -50,7 +48,7 @@ if (attached) {
       const comAttachments = await call('attachments', { id: same.id, backend: 'com' });
       const matching = comAttachments.attachments.find(a => a.filename === candidate.filename);
       if (matching) {
-        const comData = await call('read_attachment', { id: same.id, backend: 'com', index: matching.index, chunk_bytes: 1048576 });
+        const comData = await readVerifiedAttachment(call, { id: same.id, backend: 'com', index: matching.index });
         assert.equal(comData.sha256, result.sha256);
         report.attachment_matches_com = true;
       }

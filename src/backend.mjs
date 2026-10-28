@@ -101,7 +101,7 @@ export class BackendRouter {
   get active() { return this.bridges.find(bridge => bridge.active) ?? false; }
   async call(method, params = {}) {
     if (method === 'today') return this.today(params);
-    const { backend, ...args } = params;
+    const { backend, com_body_mode, ...args } = params;
     const mode = backend ?? this.mode;
     const id = decodeId(args.id ?? args.folder);
     if (!modes.includes(mode)) throw localError('INVALID_ARGUMENT', 'backend must be auto, com, local or mac-cache');
@@ -126,7 +126,8 @@ export class BackendRouter {
     }
     if (!this.com) throw localError('UNSUPPORTED_BACKEND', 'The COM backend is unavailable');
     try {
-      return withWindowsDateBasis({ ...(await this.com.call(method, args)), backend: 'com', data_scope: 'outlook_session' });
+      const comArgs = com_body_mode === undefined ? args : { ...args, com_body_mode };
+      return withWindowsDateBasis({ ...(await this.com.call(method, comArgs)), backend: 'com', data_scope: 'outlook_session' });
     }
     catch (error) {
       // A busy Outlook or an unreadable item must not silently change backends.

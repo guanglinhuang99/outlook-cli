@@ -42,6 +42,8 @@ Codex / 其他 Agent / 命令行
 
 ## 安装
 
+给另一名 Agent 安装或接入，请直接转发 [Agent 安装与使用指南](docs/agent-install-guide.md)，包含同机服务复用、Windows/macOS 源码安装、MCP 验收和可复制的任务说明。
+
 **按默认用户目录安装和使用，无需管理员权限。** Windows 安装包使用当前用户目录和专用 Node.js；macOS 源码应放在自己的用户目录，无需 `sudo`。Mac 首次安装 Node.js、Python 是否需要管理员密码取决于所选安装方式。Windows COM 服务应与 Outlook 使用同一用户和权限级别，建议均以普通用户运行；企业电脑的访问、下载和脚本策略仍需遵循。
 
 ### macOS：从源码安装
@@ -148,13 +150,19 @@ Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa
 
 搜索性能：Mac 在常驻进程中复用已验证索引，仅复制返回页；用 Python 标准库 SQLite 持久保存 Osa 日志的解析元数据，重启后也可复用未变化的日志，仍检查完整日志清单和接收时间，正文按需读取。无需额外安装数据库服务，SQLite 文件位于程序自己的私有状态目录。Windows COM 搜索复用已经读取的发件人信息，单封读取复用附件集合；离线 OST/PST 搜索复用同一次读取的结果。两端均保留接收时间筛选及原始邮件只读行为。实际耗时取决于邮箱规模和后端，Mac 的测量不能代表 Windows 性能。
 
-关键词默认查主题、发件人和 Mac 已有摘要，不展开正文。Mac 和 Windows 都可显式启用 `--search-body true`，在独立的私有 SQLite 索引中搜索纯文本正文，命中时返回 `body_snippet`。支持中文单字、双字及更长的字面关键词；三字符及以上使用 FTS5 trigram，一、二字符在筛选后的正文中匹配。先按文件夹、接收时间及人员条件筛选，再按需建立索引，不修改原始邮件或已读状态，附件内容不纳入索引。
+关键词默认查主题、发件人和 Mac 已有摘要，不展开正文。Mac 和 Windows 都可显式启用 `--search-body true`，搜索纯文本正文，命中时返回 `body_snippet`。支持中文单字、双字及更长的字面关键词。索引查询对三字符及以上使用 FTS5 trigram，一、二字符在筛选后的正文中匹配。先按文件夹、接收时间及人员条件筛选，不修改原始邮件或已读状态，附件内容不纳入索引。
 
-Windows COM 按邮件变更标识增量更新；未变化的正文跨查询、跨服务重启复用。离线 OST/PST 文件未变化时同样复用；目前解析器没有可靠的逐邮件变更标识，文件变化后会保守重校验本次候选正文，避免漏掉刚补下载的内容。Windows 使用 Node 内置 SQLite，无需另装数据库或 Python；源码运行全文搜索需 Node 22.13+，Windows 安装器附带的 Node 24 已满足要求。
+Windows COM 正文搜索默认使用自动策略（`--com-body-mode auto`，也可省略）：没有数据库时，首次直接扫描，`fulltext.engine=direct-scan`、`index_state=deferred`、`indexed=0`，已检查正文数看 `evaluated`。首次返回前校验全部候选，随后仅在内存中暂存一页已校验、具有可靠版本标识的完整正文，最多 30 秒；不启动后台建库。下一次正文查询才按需建立私有 SQLite 索引，新扫描确认版本相同的正文可直接写入，变化、过期或缺失的正文重新读取。已有数据库则直接走增量索引，未变化正文可跨查询、跨服务重启复用。
+
+显式 `--com-body-mode direct` 每次直接扫描，不访问数据库；`--com-body-mode indexed` 首次立即建索引。CLI/MCP JSON 对应 `com_body_mode: "auto" | "direct" | "indexed"`。三种策略均保留摘要、人员筛选、分页、不完整状态及返回前的版本、位置、下载状态校验；`indexed=0` 不表示搜索未完成。
+
+`com_body_mode` 只作用于 Windows COM，其他后端忽略它。离线 OST/PST 保持原有索引方式，文件未变化时复用；目前解析器没有可靠的逐邮件变更标识，文件变化后会保守重校验本次候选正文，避免漏掉刚补下载的内容。Windows 索引模式使用 Node 内置 SQLite，无需另装数据库或 Python；源码运行全文搜索需 Node 22.13+，Windows 安装器附带的 Node 24 已满足要求。
 
 索引数据库上限 512 MiB。Windows 每次扫描最多 50 个候选项目，只允许收件箱、已发送及其子目录，排除已删除；共享接口每次查询一个文件夹，子目录需逐级遍历。首次正文读取受时间及大小预算限制：`retry_required=true` 时保持**本页原参数**重试；完成后才按 `next_offset` 翻页。检查 `fulltext` 与 `body_search_incomplete`，正文缺失、截断、格式不支持或索引错误均不能视作完整的无匹配结果。Mac 的 pending 重试与原生接口说明见下文。两平台均按接收时间筛选，不用发送时间作为增量水位；结果不代表服务器上的完整邮箱。
 ```sh
 node bin/outlook.mjs search --folder inbox --query '预算' --search-body true
+# 对同一范围反复查询时，可显式启用索引
+node bin/outlook.mjs search --folder inbox --query '预算' --search-body true --com-body-mode indexed
 ```
 
 Mac 原生 `outlook_local_search` 的 JSON 参数：
@@ -283,4 +291,5 @@ python3 -m unittest discover -s macos -p 'test*.py'
 
 - [macOS 配置、目录范围与原生 Python MCP](docs/macos.md)
 - [Windows 安装参数、后端、分页协议与 HTTP API](docs/usage-reference.md)
+- [Windows 正文搜索 COM 优化、正确性验证与三版本性能对比](docs/windows-fulltext-performance.md)
 - [ost-mcp](https://github.com/3rg0n/ost-mcp)：Windows OST/PST 后端使用的解析器，固定版本和限制见详细参考。

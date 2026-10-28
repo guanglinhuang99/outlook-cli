@@ -208,6 +208,123 @@ export class WindowsFulltextIndex {
     this._integrityChecked = false;
   }
 
+  async prepareColdRead() {
+    const cold = await this.beginColdRead();
+    return cold && await cold.ready ? cold.budget : null;
+  }
+
+  async beginDirectRead() {
+    if (this._directReadChecked) return null;
+    this._directReadChecked = true;
+    try { await lstat(this.databasePath); return null; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    // No database or private directory is created for a one-off search.
+    this._coldReadChecked = true;
+    return { max_bytes: Math.min(this.singleBatchBytes, DEFAULT_BATCH_BYTES),
+      max_body_bytes: Math.min(this.singleBatchBytes, DEFAULT_BATCH_BYTES) };
+  }
+
+  prepareDeferredCache() {
+    if (!this._deferredBodies || this.now() >= this._deferredUntil) return null;
+    // Only a subsequent query pays for persistence; ACL setup can overlap
+    // that query's fresh candidate scan. SQLite still checks its own files.
+    return this._ensureDirectory();
+  }
+
+  takeDeferredBodies(candidates) {
+    const staged = this._deferredBodies;
+    const fresh = this.now() < this._deferredUntil;
+    this._clearDeferredBodies();
+    return new Map(candidates.flatMap(candidate => {
+      const body = fresh && staged?.get(candidate.id);
+      return body && candidate.signature !== null && body.signature === candidate.signature
+        ? [[candidate.id, body]] : [];
+    }));
+  }
+
+  stageValidatedBodies(accepted) {
+    this._clearDeferredBodies();
+    // Called only after the final COM proof. Weak versions never survive a
+    // request. This is one bounded page, not an unbounded in-memory index.
+    this._deferredBodies = new Map([...accepted].filter(([, body]) => body.signature !== null));
+    if (!this._deferredBodies.size) { this._clearDeferredBodies(); return; }
+    this._deferredUntil = this.now() + 30_000;
+    this._deferredTimer = setTimeout(() => this._clearDeferredBodies(), 30_000);
+    this._deferredTimer.unref?.();
+  }
+
+  _clearDeferredBodies() {
+    clearTimeout(this._deferredTimer);
+    this._deferredTimer = null;
+    this._deferredBodies = null;
+    this._deferredUntil = 0;
+  }
+
+  directReadBudget() {
+    return { max_bytes: Math.min(this.singleBatchBytes, DEFAULT_BATCH_BYTES),
+      max_body_bytes: Math.min(this.singleBatchBytes, DEFAULT_BATCH_BYTES) };
+  }
+
+  evaluateDirect(candidates, bodies, { query, deadline, retainBodies = false } = {}) {
+    const active = this._validateCandidates(candidates);
+    if (active.length > DEFAULT_CANDIDATE_WINDOW || typeof query !== 'string') throw invalid('Invalid direct scan');
+    const end = deadlineFrom(deadline, this.now(), this.budgetMs);
+    const hits = new Map();
+    const accepted = new Map();
+    let evaluated = 0, omitted = 0, missing = 0, errors = 0, pending = 0, bytesUsed = 0;
+    for (const candidate of active) {
+      const body = bodies.get(candidate.id);
+      if (this.now() >= end || bytesUsed >= this.singleBatchBytes || body?.status === 'pending') { pending++; continue; }
+      if (MISSING_STATUSES.has(body?.status)) { missing++; continue; }
+      if (body?.status === 'unverified_no_match') {
+        // The worker can prove a no-match for an ASCII query without sending
+        // the body when its alphabet cannot fold non-ASCII text into ASCII.
+        // It is tied to this exact query/version and still needs the final COM
+        // proof. Account for original bytes, not the smaller wire response.
+        if (body.signature !== candidate.signature || body.query !== lower(query)
+            || !Number.isSafeInteger(body.body_bytes) || body.body_bytes < 0
+            || !Number.isSafeInteger(body.body_code_units) || body.body_code_units < 0
+            || body.body_code_units > body.body_bytes) { errors++; continue; }
+        if (body.body_code_units > this.bodyCapCodeUnits || body.body_bytes > this.singleBatchBytes) { missing++; continue; }
+        if (bytesUsed + body.body_bytes > this.singleBatchBytes) { pending++; bytesUsed = this.singleBatchBytes; continue; }
+        bytesUsed += body.body_bytes; evaluated++; omitted++;
+        continue;
+      }
+      if (!['ready', 'unverified'].includes(body?.status) || typeof body.text !== 'string' || body.signature !== candidate.signature) { errors++; continue; }
+      const bytes = Buffer.byteLength(body.text, 'utf8');
+      if (body.text.length > this.bodyCapCodeUnits || bytes > this.singleBatchBytes) { missing++; continue; }
+      if (bytesUsed + bytes > this.singleBatchBytes) { pending++; bytesUsed = this.singleBatchBytes; continue; }
+      bytesUsed += bytes;
+      const snippet = bodySnippet(body.text, query);
+      if (this.now() >= end) { pending++; continue; }
+      if (snippet) hits.set(candidate.id, snippet);
+      if (retainBodies) accepted.set(candidate.id, { id: candidate.id, signature: candidate.signature, status: 'ready', text: body.text });
+      evaluated++;
+    }
+    return { hits, accepted, retry_required: Boolean(errors || pending), body_search_incomplete: Boolean(missing || errors || pending),
+      fulltext: { candidates: active.length, indexed: 0, evaluated, omitted_bodies: omitted, missing, errors, pending, updated: 0, reused: 0,
+        complete: evaluated === active.length, engine: 'direct-scan', index_state: retainBodies ? 'deferred' : 'disabled' } };
+  }
+
+  async beginColdRead() {
+    // A performance hint, never evidence of source freshness. Only a new
+    // database can benefit; restarts and warm searches keep the miss-only path.
+    if (this._coldReadChecked) return null;
+    this._coldReadChecked = true;
+    try { await lstat(this.databasePath); return null; }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    // Body prefetch is memory-only. Its COM work can overlap ACL/schema setup,
+    // but the caller must await ready before evaluating or persisting bodies.
+    const ready = (async () => {
+      await this._ensureDirectory();
+      const db = await this._openDatabase();
+      try { return !db.prepare('SELECT 1 FROM documents LIMIT 1').get(); }
+      finally { db.close(); }
+    })();
+    return { budget: { max_bytes: Math.min(this.singleBatchBytes, DEFAULT_BATCH_BYTES),
+      max_body_bytes: Math.min(this.singleBatchBytes, DEFAULT_BATCH_BYTES) }, ready };
+  }
+
   async _ensureDirectory() {
     if (!this._preparePromise) {
       this._preparePromise = (async () => {
@@ -441,23 +558,28 @@ export class WindowsFulltextIndex {
     }
   }
 
-  _storeReady(db, candidate, text) {
+  _storeReady(db, candidate, text, inTransaction = false, pendingFts = null) {
     const normalized = lower(text);
     const bytes = Buffer.byteLength(text, 'utf8');
-    db.exec('BEGIN IMMEDIATE');
+    if (!inTransaction) db.exec('BEGIN IMMEDIATE');
     try {
       this._removeDocument(db, candidate.id);
       const inserted = db.prepare(
         'INSERT INTO documents(id,signature,text,normalized,bytes,updated_at) VALUES(?,?,?,?,?,?)'
       ).run(candidate.id, candidate.signature, text, normalized, bytes, this.now());
-      db.prepare(
-        'INSERT INTO body_fts(rowid,id,signature,normalized) SELECT doc_key,id,signature,normalized FROM documents WHERE doc_key=?'
-      ).run(inserted.lastInsertRowid);
-      db.exec('COMMIT');
+      if (pendingFts) pendingFts.push(inserted.lastInsertRowid);
+      else this._storeFtsBatch(db, [inserted.lastInsertRowid]);
+      if (!inTransaction) db.exec('COMMIT');
     } catch (error) {
-      try { db.exec('ROLLBACK'); } catch {}
+      if (!inTransaction) { try { db.exec('ROLLBACK'); } catch {} }
       throw error;
     }
+  }
+
+  _storeFtsBatch(db, keys) {
+    if (!keys.length) return;
+    db.prepare(`INSERT INTO body_fts(rowid,id,signature,normalized)
+      SELECT doc_key,id,signature,normalized FROM documents WHERE doc_key IN (${sqlPlaceholders(keys.length)})`).run(...keys);
   }
 
   _queryRows(db, pairs, query) {
@@ -501,10 +623,11 @@ export class WindowsFulltextIndex {
     }
   }
 
-  async evaluate(candidates, { query = '', loadBody, deadline } = {}) {
+  async evaluate(candidates, { query = '', loadBody, loadBodies, deadline } = {}) {
     const allCandidates = this._validateCandidates(candidates);
     if (typeof query !== 'string') throw invalid('full-text query must be text');
     if (typeof loadBody !== 'function') throw invalid('loadBody must be a function');
+    if (loadBodies !== undefined && typeof loadBodies !== 'function') throw invalid('loadBodies must be a function');
     const activeCandidates = allCandidates.slice(0, DEFAULT_CANDIDATE_WINDOW);
     const statuses = new Map();
     const indexedIds = new Set();
@@ -517,6 +640,8 @@ export class WindowsFulltextIndex {
 
     await this._ensureDirectory();
     const db = await this._openDatabase();
+    let batchTransaction = false;
+    const pendingFts = [];
     try {
       const existing = this._prepareCache(db, activeCandidates);
       for (const candidate of activeCandidates) {
@@ -528,6 +653,7 @@ export class WindowsFulltextIndex {
         }
       }
 
+      let batch;
       for (let index = 0; index < activeCandidates.length; index += 1) {
         const candidate = activeCandidates[index];
         if (statuses.has(candidate.id)) continue;
@@ -541,7 +667,22 @@ export class WindowsFulltextIndex {
         }
         let body;
         try {
-          body = await loadBody(candidate, remainingMs);
+          if (loadBodies) {
+            if (!batch) {
+              const missing = activeCandidates.filter(item => !statuses.has(item.id));
+              // Only misses cross the COM boundary. The adapter must obey both
+              // the aggregate byte budget and the deadline; verify again below.
+              batch = new Map();
+              const loaded = await loadBodies(missing, remainingMs, this.singleBatchBytes - batchBytesUsed, this.singleBatchBytes);
+              const ids = new Set(missing.map(item => item.id));
+              if (!Array.isArray(loaded) || loaded.length !== missing.length
+                  || loaded.some(item => !item || !ids.delete(item.id))) throw invalid('Invalid body batch');
+              batch = new Map(loaded.map(item => [item.id, item]));
+            }
+            body = batch.get(candidate.id);
+          } else {
+            body = await loadBody(candidate, remainingMs);
+          }
         } catch {
           statuses.set(candidate.id, 'error');
           continue;
@@ -556,6 +697,10 @@ export class WindowsFulltextIndex {
           break;
         }
         const status = body?.status;
+        if (status === 'pending') {
+          statuses.set(candidate.id, 'pending');
+          continue;
+        }
         if (MISSING_STATUSES.has(status)) {
           statuses.set(candidate.id, 'missing');
           continue;
@@ -596,7 +741,13 @@ export class WindowsFulltextIndex {
           const snippet = bodySnippet(body.text, query);
           if (snippet) ephemeralHits.set(candidate.id, snippet);
         } else {
-          this._storeReady(db, candidate, body.text);
+          // Batch loading has already completed; never hold a SQLite write
+          // lock across a COM await. Commit this bounded batch just once.
+          if (loadBodies && !batchTransaction) {
+            db.exec('BEGIN IMMEDIATE');
+            batchTransaction = true;
+          }
+          this._storeReady(db, candidate, body.text, batchTransaction, batchTransaction ? pendingFts : null);
         }
         if (this.now() >= end) {
           for (const rest of activeCandidates.slice(index + 1)) {
@@ -604,6 +755,13 @@ export class WindowsFulltextIndex {
           }
           break;
         }
+      }
+      if (batchTransaction) {
+        // Populate FTS once for this bounded batch, in the same transaction
+        // as document replacement. A failure rolls back both representations.
+        this._storeFtsBatch(db, pendingFts);
+        db.exec('COMMIT');
+        batchTransaction = false;
       }
       for (const candidate of allCandidates.slice(activeCandidates.length)) statuses.set(candidate.id, 'pending');
       for (const candidate of allCandidates) statuses.set(candidate.id, statuses.get(candidate.id) ?? 'pending');
@@ -650,6 +808,7 @@ export class WindowsFulltextIndex {
         body_search_incomplete: Boolean(missing || errors || pending)
       };
     } catch (error) {
+      if (batchTransaction) { try { db.exec('ROLLBACK'); } catch {} }
       if (error?.code?.startsWith?.('FULLTEXT_')) throw error;
       throw mapSqliteError(error);
     } finally {
@@ -658,6 +817,6 @@ export class WindowsFulltextIndex {
   }
 
   close() {
-    // Connections are intentionally per-call, so there is no persistent handle to close.
+    this._clearDeferredBodies();
   }
 }
