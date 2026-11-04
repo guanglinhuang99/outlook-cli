@@ -122,7 +122,10 @@ export class BackendRouter {
     if (id?.backend === 'local') {
       if (mode === 'com') throw localError('BACKEND_ID_MISMATCH', 'Local IDs cannot be passed to COM. List messages with backend=com again.');
       if (!this.local) throw localError('UNSUPPORTED_BACKEND', 'The local-file backend is unavailable');
-      return withWindowsDateBasis(await this.local.call(method, args));
+      const result = await this.local.call(method, args);
+      return withWindowsDateBasis({ ...result, warnings: [...(result.warnings ?? []), {
+        code: 'LOCAL_ID_ROUTING', message: 'This ID belongs to the local-file backend; reading cached data only. List messages/folders with backend=com to use Outlook.'
+      }] });
     }
     if (!this.com) throw localError('UNSUPPORTED_BACKEND', 'The COM backend is unavailable');
     try {
@@ -131,10 +134,19 @@ export class BackendRouter {
     }
     catch (error) {
       // A busy Outlook or an unreadable item must not silently change backends.
-      if (mode !== 'auto' || error.code !== 'OUTLOOK_UNAVAILABLE') throw error;
-      if (id) throw localError('BACKEND_ID_MISMATCH', 'Outlook is closed and this is a COM ID. Relist messages/folders to obtain local-file IDs.');
+      if (mode !== 'auto' || !['OUTLOOK_UNAVAILABLE', 'OUTLOOK_START_FAILED'].includes(error.code)) throw error;
+      if (id) throw localError('BACKEND_ID_MISMATCH', `${error.code}: ${error.message} This is a COM ID and cannot be read by the local-file backend. Retry with Outlook available, or relist messages/folders with backend=local to obtain local-file IDs.`);
       if (!this.local) throw localError('UNSUPPORTED_BACKEND', 'The local-file backend is unavailable');
-      return withWindowsDateBasis({ ...(await this.local.call(method, args)), fallback_reason: 'OUTLOOK_UNAVAILABLE' });
+      let result;
+      try { result = await this.local.call(method, args); }
+      catch (localFailure) {
+        throw localError('OUTLOOK_FALLBACK_FAILED', `COM unavailable (${error.code}: ${error.message}); local-file fallback also failed (${localFailure.code ?? 'OFFLINE_ERROR'}: ${localFailure.message}).`);
+      }
+      return withWindowsDateBasis({ ...result, backend: 'local', data_scope: 'cached_only',
+        fallback_reason: error.code, fallback_message: error.message,
+        warnings: [...(result.warnings ?? []), { code: 'LOCAL_FALLBACK',
+          message: `Fell back to local OST/PST because ${error.code}: ${error.message} Only locally cached mail is available; no server synchronization is performed by this backend.`
+        }] });
     }
   }
   async today(params = {}) {

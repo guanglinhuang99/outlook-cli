@@ -7,12 +7,13 @@ import { searchWindowsFulltext } from './windows-fulltext.mjs';
 
 const workerPath = fileURLToPath(new URL('../powershell/worker.ps1', import.meta.url));
 export class OutlookBridge {
-  constructor({ timeoutMs = 45000, spawnWorker, fulltextIndex, enableWindowsFulltext = true } = {}) {
+  constructor({ timeoutMs = 45000, spawnWorker, fulltextIndex, enableWindowsFulltext = true, autoStart = process.env.OUTLOOK_AUTO_START ?? '1' } = {}) {
+    if (!['0', '1'].includes(autoStart)) throw new Error('OUTLOOK_AUTO_START must be 0 or 1');
     this.timeoutMs = timeoutMs;
     this.fulltextIndex = fulltextIndex;
     this.enableWindowsFulltext = enableWindowsFulltext;
     this.spawnWorker = spawnWorker ?? (() => spawn(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe'),
-      ['-NoLogo', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', workerPath],
+      ['-NoLogo', '-NoProfile', '-NonInteractive', '-STA', '-ExecutionPolicy', 'Bypass', '-File', workerPath, '-AutoStart', autoStart],
       { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true }));
     this.queue = [];
     this.sequence = 0;
@@ -46,7 +47,12 @@ export class OutlookBridge {
         if (!this.active || message.id !== this.active.id) throw new Error('Mismatched worker response');
         const active = this.active;
         if (Date.now() >= active.deadline) {
-          this.failWorker(worker, 'OUTLOOK_TIMEOUT', 'Reader timed out; retry the request.');
+          this.timeoutWorker(worker);
+          return;
+        }
+        if (message.event === 'connection') {
+          if (!['starting', 'ready'].includes(message.phase)) throw new Error('Invalid connection phase');
+          active.startingOutlook = message.phase === 'starting';
           return;
         }
         clearTimeout(active.timer);
@@ -77,7 +83,7 @@ export class OutlookBridge {
     try {
       this.ensureWorker();
       const worker = this.worker;
-      this.active.timer = setTimeout(() => this.failWorker(worker, 'OUTLOOK_TIMEOUT', 'Reader timed out; retry the request.'), remaining);
+      this.active.timer = setTimeout(() => this.timeoutWorker(worker), remaining);
       worker.stdin.write(JSON.stringify({ id: this.active.id, method: this.active.method, params: this.active.params }) + '\n');
     } catch {
       const active = this.active;
@@ -85,6 +91,12 @@ export class OutlookBridge {
       active.reject(Object.assign(new Error('Could not start reader worker'), { code: 'WORKER_START' }));
       this.pump();
     }
+  }
+  timeoutWorker(worker) {
+    const starting = this.active?.startingOutlook;
+    this.failWorker(worker, starting ? 'OUTLOOK_START_TIMEOUT' : 'OUTLOOK_TIMEOUT', starting
+      ? 'Classic Outlook startup or profile initialization timed out. Outlook may still be running or waiting for a sign-in/profile prompt. Check Outlook and retry, or explicitly use backend=local for cached mail. No automatic fallback was performed.'
+      : 'Outlook read timed out. Check whether Outlook is busy or waiting for a prompt, then retry. No automatic fallback was performed.');
   }
   failWorker(worker, code, message) {
     if (worker !== this.worker) return;

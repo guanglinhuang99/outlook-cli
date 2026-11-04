@@ -16,7 +16,7 @@ const filters = {
   before: z.iso.datetime({ offset: true }).optional().describe('Exclusive ISO timestamp, using the same backend date_basis as after.'),
   scan_limit: integer(1, 2000, 500)
 };
-const define = (description, shape) => ({ description, schema: z.strictObject({ ...shape, backend: z.enum(['auto', 'com', 'local', 'mac-cache']).optional().describe('auto selects Windows COM/local OST/PST or macOS HxStore cache by platform. IDs are backend-specific; cache reads can be incomplete.') }) });
+const define = (description, shape) => ({ description, schema: z.strictObject({ ...shape, backend: z.enum(['auto', 'com', 'local', 'mac-cache']).optional().describe('Windows auto/com may start classic Outlook on demand; local never starts Outlook. auto falls back to cached OST/PST only on unavailable/failed startup, with explicit warnings and fallback_reason; com never falls back. macOS uses HxStore cache. IDs are backend-specific; check data_scope and warnings for incomplete/stale cache reads.') }) });
 export const definitions = {
   health: define('Check Outlook or local-file backend readiness, active backend and cache limitations.', {}),
   stores: define('List Outlook stores with opaque root folder IDs.', {}),

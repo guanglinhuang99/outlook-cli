@@ -38,3 +38,31 @@ test('timeout kills worker, rejects queued calls, next call starts a fresh worke
   assert.equal((await bridge.call('health', {})).recovered, true);
   assert.equal(starts, 2);
 });
+
+test('startup progress does not complete a request and startup timeout stays distinct', async t => {
+  const bridge = new OutlookBridge({ timeoutMs: 40, spawnWorker: () => fakeWorker((request, worker) => {
+    worker.stdout.write(JSON.stringify({ id: request.id, event: 'connection', phase: 'starting' }) + '\n');
+  }) });
+  t.after(() => bridge.close());
+  await assert.rejects(bridge.call('health', {}), error => {
+    assert.equal(error.code, 'OUTLOOK_START_TIMEOUT');
+    assert.match(error.message, /No automatic fallback/);
+    return true;
+  });
+});
+
+test('ready progress restores read timeout semantics and allows a normal response', async t => {
+  const bridge = new OutlookBridge({ timeoutMs: 40, spawnWorker: () => fakeWorker((request, worker) => {
+    for (const phase of ['starting', 'ready']) worker.stdout.write(JSON.stringify({ id: request.id, event: 'connection', phase }) + '\n');
+    if (request.method === 'health') worker.stdout.write(JSON.stringify({ id: request.id, result: { outlook_connection: 'started' } }) + '\n');
+  }) });
+  t.after(() => bridge.close());
+  assert.equal((await bridge.call('health', {})).outlook_connection, 'started');
+  await assert.rejects(bridge.call('messages', {}), { code: 'OUTLOOK_TIMEOUT' });
+});
+
+test('automatic Outlook startup setting rejects ambiguous values', () => {
+  assert.throws(() => new OutlookBridge({ autoStart: 'false' }), /OUTLOOK_AUTO_START must be 0 or 1/);
+  const bridge = new OutlookBridge({ autoStart: '0' });
+  bridge.close();
+});

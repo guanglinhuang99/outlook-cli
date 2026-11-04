@@ -34,6 +34,9 @@ test('auto falls back only for unavailable Outlook, explicit COM never falls bac
   const router = new BackendRouter({ platform: 'win32', com: stub(async () => { throw localError('OUTLOOK_UNAVAILABLE', 'closed'); }), local });
   const fallback = await router.call('health');
   assert.equal(fallback.fallback_reason, 'OUTLOOK_UNAVAILABLE');
+  assert.equal(fallback.data_scope, 'cached_only');
+  assert.equal(fallback.fallback_message, 'closed');
+  assert.equal(fallback.warnings[0].code, 'LOCAL_FALLBACK');
   assert.equal(fallback.date_basis, 'received_at');
   await assert.rejects(router.call('health', { backend: 'com' }), { code: 'OUTLOOK_UNAVAILABLE' });
   router.com = stub(async () => { throw localError('OUTLOOK_TIMEOUT', 'busy'); });
@@ -45,10 +48,49 @@ test('local IDs retain local routing; COM IDs fail clearly after Outlook closes'
   const id = encodeLocalId('message', 'test', 42);
   const localResult = await router.call('read', { id });
   assert.equal(localResult.backend, 'local');
+  assert.equal(localResult.warnings[0].code, 'LOCAL_ID_ROUTING');
   assert.equal(localResult.date_basis, 'received_at');
   await assert.rejects(router.call('read', { id, backend: 'com' }), { code: 'BACKEND_ID_MISMATCH' });
   const oldId = Buffer.from(JSON.stringify({ v: 1, kind: 'message', entry: 'AA', store: 'BB' })).toString('base64url');
   await assert.rejects(router.call('read', { id: oldId }), { code: 'BACKEND_ID_MISMATCH' });
+});
+
+test('startup failure falls back visibly; explicit COM and uncertain startup timeout do not', async () => {
+  let localCalls = 0;
+  const router = new BackendRouter({ platform: 'win32', com: stub(async () => {
+    throw localError('OUTLOOK_START_FAILED', 'Cannot initialize default profile');
+  }), local: stub(async () => { localCalls++; return { warnings: [{ code: 'EXISTING_WARNING' }] }; }) });
+  const result = await router.call('health');
+  assert.equal(result.backend, 'local');
+  assert.equal(result.data_scope, 'cached_only');
+  assert.equal(result.fallback_reason, 'OUTLOOK_START_FAILED');
+  assert.match(result.fallback_message, /default profile/);
+  assert.deepEqual(result.warnings.map(w => w.code), ['EXISTING_WARNING', 'LOCAL_FALLBACK']);
+  assert.match(result.warnings[1].message, /cached mail/);
+  await assert.rejects(router.call('health', { backend: 'com' }), { code: 'OUTLOOK_START_FAILED' });
+  const id = Buffer.from(JSON.stringify({ v: 1, kind: 'message', entry: 'AA', store: 'BB' })).toString('base64url');
+  await assert.rejects(router.call('read', { id }), error => error.code === 'BACKEND_ID_MISMATCH' && /OUTLOOK_START_FAILED/.test(error.message));
+  for (const code of ['OUTLOOK_START_TIMEOUT', 'OUTLOOK_TIMEOUT', 'OUTLOOK_ERROR']) {
+    router.com = stub(async () => { throw localError(code, 'cannot read'); });
+    await assert.rejects(router.call('health'), { code });
+  }
+  assert.equal(localCalls, 1);
+});
+
+test('explicit local never contacts or starts Outlook; fallback failure preserves both causes', async () => {
+  let comCalls = 0;
+  const router = new BackendRouter({ platform: 'win32', com: stub(async () => {
+    comCalls++; throw localError('OUTLOOK_START_FAILED', 'Cannot start Outlook');
+  }), local: stub(async () => ({ backend: 'local', data_scope: 'cached_only' })) });
+  assert.equal((await router.call('health', { backend: 'local' })).backend, 'local');
+  assert.equal(comCalls, 0);
+  router.local = stub(async () => { throw localError('OFFLINE_NO_STORES', 'No local files'); });
+  await assert.rejects(router.call('health'), error => {
+    assert.equal(error.code, 'OUTLOOK_FALLBACK_FAILED');
+    assert.match(error.message, /OUTLOOK_START_FAILED/);
+    assert.match(error.message, /OFFLINE_NO_STORES/);
+    return true;
+  });
 });
 test('HTML-only cached body converts without scripts, remote image loading or entity loss', () => {
   const text = asText({ body_format: 'html', body: '<style>.x{color:red}</style><script>alert(1)</script><p>中文 &amp; test</p><img src="https://example.com/tracker"><p>第二行</p>' });

@@ -1,4 +1,5 @@
 # Persistent JSON-lines worker. Runs only fixed read operations on a single STA thread.
+param([ValidateSet('0', '1')][string]$AutoStart = '1')
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
@@ -734,10 +735,62 @@ function Person-Match($Mail, $Person, $Role, $SenderInfo = $null) {
     $orderedRoles = @('sender', 'to', 'cc') | Where-Object { $matchedRoles.Contains($_) }
     return @{ matched = ($matchedRoles.Count -gt 0); matched_roles = @($orderedRoles); incomplete = $incomplete; sender = $sender }
 }
+function Get-RunningOutlook { return [Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application') }
+function Start-Outlook { return New-Object -ComObject Outlook.Application }
+function Release-OutlookApplication {
+    if ($null -ne $script:application) {
+        try { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($script:application) } catch { }
+        $script:application = $null
+    }
+}
+function Write-ConnectionPhase($Phase) {
+    [Console]::WriteLine((@{ id = $request.id; event = 'connection'; phase = $Phase } | ConvertTo-Json -Compress))
+}
+function Connect-Outlook {
+    $script:connection = 'reused'
+    if ($null -ne $script:application) {
+        try {
+            # Keep only the application alive, never cache folders or mail items.
+            # A user may have exited Outlook since the preceding request.
+            $null = $script:application.Version
+            $script:session = Track ($script:application.GetNamespace('MAPI'))
+            return
+        } catch { Release-OutlookApplication }
+    }
+    try {
+        $script:application = Get-RunningOutlook
+        $script:connection = 'existing'
+    } catch {
+        if ($AutoStart -eq '0') {
+            throw 'OUTLOOK_UNAVAILABLE: Automatic startup is disabled (OUTLOOK_AUTO_START=0). Open classic Outlook in the same Windows user session, enable automatic startup, or use backend=local for cached mail.'
+        }
+        Write-ConnectionPhase 'starting'
+        $stage = 'COM activation'
+        try {
+            $script:application = Start-Outlook
+            $script:connection = 'started'
+            $stage = 'default profile initialization'
+            $script:session = Track ($script:application.GetNamespace('MAPI'))
+            # Initialize the default profile without explicitly calling Logon.
+            $null = Track ($script:session.GetDefaultFolder(6))
+        } catch {
+            $failure = $_.Exception
+            while ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
+            $hresult = '0x{0:X8}' -f $failure.HResult
+            Release-OutlookApplication
+            throw "OUTLOOK_START_FAILED: Classic Outlook $stage failed ($hresult). Check installation, the default profile, sign-in prompts, and the Windows user/session/permissions. Open classic Outlook manually and retry, or use backend=local for cached mail."
+        }
+        Write-ConnectionPhase 'ready'
+        return
+    }
+    # Errors from an existing Outlook session are not startup failures and must
+    # not trigger an automatic change of data source.
+    try { $script:session = Track ($script:application.GetNamespace('MAPI')) }
+    catch { Release-OutlookApplication; throw }
+}
 function Run-Operation($Method, $Params) {
-    try { $app = Track ([Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')) }
-    catch { throw 'OUTLOOK_UNAVAILABLE: Open and sign in to classic Outlook in the same Windows user session as the service' }
-    $script:session = Track ($app.GetNamespace('MAPI'))
+    Connect-Outlook
+    $app = $script:application
     switch ($Method) {
         'health' {
             $stores = Track ($script:session.Stores)
@@ -888,6 +941,11 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     try {
         $request = $line | ConvertFrom-Json
         $result = Run-Operation $request.method $request.params
+        $result.outlook_connection = $script:connection
+        $result.outlook_auto_start = ($AutoStart -eq '1')
+        if ($script:connection -eq 'started') {
+            $result.warnings = @(@{ code = 'OUTLOOK_STARTED'; message = 'Classic Outlook was activated on demand. Mail synchronization may still be in progress; this result does not guarantee the latest server state.' })
+        }
         $response = @{ id = $request.id; result = $result }
     } catch {
         $code = 'OUTLOOK_ERROR'
@@ -905,3 +963,4 @@ while ($null -ne ($line = [Console]::ReadLine())) {
     $response = $null
     $result = $null
 }
+Release-OutlookApplication
