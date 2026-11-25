@@ -38,14 +38,19 @@ test('rejects injected protected roots and descendants without changing HOME', a
 
 test('resolves symlinked ancestors before checking protected roots', async t => {
   const fixture = await tempFixture();
-  t.after(() => rm(fixture.base, { recursive: true, force: true }));
   const mailRoot = path.join(fixture.homeDir, 'Library', 'Mail');
   const realMail = path.join(fixture.base, 'mail-real');
+  const alias = path.join(fixture.base, 'mail-alias');
+  t.after(async () => {
+    // Remove directory links before recursively deleting their targets on Windows.
+    await rm(alias, { force: true });
+    await rm(mailRoot, { force: true });
+    await rm(fixture.base, { recursive: true, force: true });
+  });
   await mkdir(path.dirname(mailRoot), { recursive: true });
   await mkdir(realMail, { recursive: true });
   await symlink(realMail, mailRoot, process.platform === 'win32' ? 'junction' : 'dir');
 
-  const alias = path.join(fixture.base, 'mail-alias');
   await symlink(mailRoot, alias, process.platform === 'win32' ? 'junction' : 'dir');
   await assert.rejects(
     assertSafeMacPath(path.join(alias, 'future', 'message.bin'), {
@@ -58,9 +63,12 @@ test('resolves symlinked ancestors before checking protected roots', async t => 
 
 test('returns the canonical destination for a safe symlinked write path', async t => {
   const fixture = await tempFixture();
-  t.after(() => rm(fixture.base, { recursive: true, force: true }));
   const safeRoot = path.join(fixture.base, 'safe');
   const safeAlias = path.join(fixture.base, 'safe-alias');
+  t.after(async () => {
+    await rm(safeAlias, { force: true });
+    await rm(fixture.base, { recursive: true, force: true });
+  });
   await mkdir(safeRoot, { recursive: true });
   await symlink(safeRoot, safeAlias, process.platform === 'win32' ? 'junction' : 'dir');
   const result = await assertSafeMacPath(path.join(safeAlias, 'new.bin'), {
@@ -110,10 +118,13 @@ test('canonical protected roots keep a custom profile blocked without current en
 
 test('canonical protected roots include an auto-discovered profile symlinked outside Outlook', async t => {
   const fixture = await tempFixture();
-  t.after(() => rm(fixture.base, { recursive: true, force: true }));
   const outlookRoot = path.join(fixture.homeDir, 'Library', 'Group Containers', 'UBF8T346G9.Office', 'Outlook');
   const profileTarget = path.join(fixture.base, 'external-profile');
   const profileLink = path.join(outlookRoot, 'Outlook 15 Profiles', 'Default Profile');
+  t.after(async () => {
+    await rm(profileLink, { force: true });
+    await rm(fixture.base, { recursive: true, force: true });
+  });
   await mkdir(profileTarget);
   await mkdir(path.dirname(profileLink), { recursive: true });
   await mkdir(path.join(profileTarget, 'Files'));

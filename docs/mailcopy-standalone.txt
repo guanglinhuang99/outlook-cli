@@ -1,0 +1,51 @@
+Outlook 邮件复制工具（独立版）
+
+要求：Windows 10/11、Windows 自带的 PowerShell 5.1 和 .NET Framework、经典 Outlook。
+无需安装 Node.js、Python 或 Codex，无需模型或 API Key，无需管理员权限。
+
+首次使用
+1. 将 ZIP 完整解压到你有写权限的固定目录，例如 D:\Tools\Outlook-MailCopy。
+   不要在压缩包内直接双击运行。保留 powershell 文件夹和其中的全部文件。
+2. 打开已登录的经典 Outlook，双击 Start-MailCopy.cmd。
+   启动成功后窗口自动关闭，监听程序继续在后台运行。
+3. 在 Outlook 邮件列表中选中邮件，按 Ctrl+C。
+4. 稍等导出完成，切到 WorkBuddy，按 Ctrl+V，即可粘贴 MSG 文件附件。
+   本机已验证这条粘贴流程；其他 WorkBuddy 版本的支持情况需实测。
+   大附件导出需要更多时间，可通过 Status-MailCopy.cmd 查看完成状态。
+
+日常使用
+- Start-MailCopy.cmd：启动。重复双击不会启动多个监听器。
+- Status-MailCopy.cmd：查看状态。running=true 表示运行中；last_files 是最近导出路径；last_error 是错误信息。
+- Stop-MailCopy.cmd：停止。不会关闭 Outlook，也不会删除导出的邮件文件。
+- 关闭 Codex、命令行窗口或本文件，不会停止后台监听。
+- 电脑重启或 Windows 注销后，需要重新双击 Start-MailCopy.cmd。
+
+可选：登录 Windows 后自动启动
+1. 先把工具放在固定目录。
+2. 为 Start-MailCopy.cmd 创建快捷方式。
+3. 按 Win+R，输入 shell:startup，按回车。
+4. 把“快捷方式”放进打开的启动文件夹。不要只复制 CMD 文件。
+5. 下次登录 Windows 后会自动启动。无需事先打开 Outlook，之后打开 Outlook 即可复制。
+取消自启：删除这个快捷方式。如需同时停止当前监听，再运行 Stop-MailCopy.cmd。
+工具本身不会自动注册开机启动，也不会修改系统执行策略。
+
+文件与限制
+- 默认 MSG 文件位于工具目录下 .runtime\service\clipboard\exports。
+- 若设置了 OUTLOOK_LOCAL_STATE_DIR，路径改为该目录下 clipboard\exports；以状态中 export_dir 为准。
+- 导出文件保留邮件正文、格式和内嵌附件；不会自动删除。用完后可手动清理 exports 中的旧文件。
+- 清理或移动文件后，旧剪贴板中的路径将失效；请重新复制邮件。
+- 只处理经典 Outlook 复制的整封 MSG 邮件；复制正文文字时保持普通文字行为。
+- 一次最多 20 封，整批最大 256 MiB。失败时查看 last_error。
+- 仅支持经典 Outlook（OUTLOOK.EXE），不支持新版 Outlook、网页版或 Mac。
+- 成功导出后剪贴板变成普通文件列表，原 Outlook 专用复制格式被替换；若需原生 Outlook 内部粘贴，先停止监听。
+- 所有处理均在本机完成，不发送邮件，不修改邮箱，也不自动上传文件。
+- 同一 Windows 会话只允许一份监听器。换目录或使用另一个副本前，先在原目录运行 Stop-MailCopy.cmd。
+- 程序与 Outlook 应使用相同用户和权限级别，通常都以普通权限运行。
+
+排查
+1. 确认在邮件列表中复制了整封邮件，并在启动监听后重新按 Ctrl+C。
+2. 双击 Status-MailCopy.cmd，查看 running、exported_count、last_files、last_error。
+3. WorkBuddy 粘贴无反应时，可在资源管理器空文件夹中粘贴，或用上传按钮选择导出的 MSG。
+4. 启动失败时查看 .runtime\service\clipboard\clipboard.log；企业电脑如禁止脚本运行，需由 IT 允许该工具。
+
+此 ZIP 仅包含程序源码、启动入口和说明，不包含任何邮件、日志或账号数据。

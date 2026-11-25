@@ -102,11 +102,11 @@ try {
     }
     Write-Utf8 $markerPath ($marker | ConvertTo-Json)
     Write-Host '[1/5] Installing application files...'
-    foreach ($file in @('package.json', 'package-lock.json', 'pnpm-lock.yaml', 'README.md', 'install.ps1', 'install.cmd')) {
+    foreach ($file in @('package.json', 'package-lock.json', 'pnpm-lock.yaml', 'README.md', 'INSTALL-WINDOWS.md', 'install.ps1', 'install.cmd')) {
         if (-not (Test-Path -LiteralPath (Join-Path $source $file))) { continue }
         Copy-Item -LiteralPath (Join-Path $source $file) -Destination (Join-Path $target $file) -Force
     }
-    foreach ($directory in @('bin','src','powershell','scripts','test','third-party')) {
+    foreach ($directory in @('bin','src','powershell','scripts','test','third-party','docs')) {
         if (-not (Test-Path -LiteralPath (Join-Path $source $directory))) { continue }
         foreach ($file in Get-ChildItem -LiteralPath (Join-Path $source $directory) -File -Recurse) {
             if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Source package contains a symbolic link.' }
@@ -127,7 +127,9 @@ try {
     $npm = Join-Path $nodeHome 'node_modules\npm\bin\npm-cli.js'
     New-Item -ItemType Directory -Path $runtime -Force | Out-Null
     if (-not ((Test-Path -LiteralPath $script:node) -and (Test-Path -LiteralPath $npm))) {
+        $bundledNode = Join-Path $source "payload\$nodeFolder.zip"
         if ($NodeArchive) { $archive = (Resolve-Path -LiteralPath $NodeArchive).Path }
+        elseif (Test-Path -LiteralPath $bundledNode) { $archive = $bundledNode }
         else {
             $archive = Join-Path $runtime "$nodeFolder.zip"
             if (-not (Test-Path -LiteralPath $archive)) {
@@ -151,7 +153,12 @@ try {
     # npm ci verifies package-lock integrity. No third-party lifecycle scripts run.
     Run-Node @($npm, 'ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund', '--cache', (Join-Path $target '.runtime\npm-cache'))
     if (-not $SkipLocalReader) {
-        & (Join-Path $target 'scripts\setup-reader.ps1') -InstallDir $target
+        $bundledReader = Join-Path $source 'payload\ost-mcp.zip'
+        if (Test-Path -LiteralPath $bundledReader) {
+            & (Join-Path $target 'scripts\setup-reader.ps1') -InstallDir $target -Archive $bundledReader
+        } else {
+            & (Join-Path $target 'scripts\setup-reader.ps1') -InstallDir $target
+        }
     } else { Write-Warning 'Local-file fallback installation skipped; only COM is guaranteed to be available.' }
     Write-Host '[4/5] Creating launchers and MCP configuration...'
     $launcher = @"
@@ -216,14 +223,21 @@ $env:OUTLOOK_LOCAL_PORT = '__PORT__'
     Write-Host '[5/5] Checking the service...'
     if (-not $NoStart) {
         Run-Node @($cli, 'start')
-        # Health returns no mail bodies. Installation is still valid if Outlook is closed.
+        # Health returns no mail bodies and may activate classic Outlook on demand.
+        Write-Host 'Checking the mailbox may start classic Outlook; sign-in/profile prompts may appear.'
         $savedPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         $health = & $script:node $cli health 2>&1
         $healthExit = $LASTEXITCODE
         $ErrorActionPreference = $savedPreference
-        if ($healthExit -eq 0) { Write-Host 'Mailbox backend ready (COM or local file). Run outlook.cmd health to see which backend is active.' }
-        else { Write-Warning 'Service started, but no mailbox backend is ready. Open classic Outlook or configure local-stores.json, then run outlook.cmd health.' }
+        if ($healthExit -eq 0) {
+            Write-Host 'Mailbox health result (includes active backend and any startup/fallback warnings):'
+            Write-Host ($health -join [Environment]::NewLine)
+        }
+        else {
+            Write-Warning ($health -join [Environment]::NewLine)
+            Write-Warning 'Service started, but no mailbox backend is ready. Check classic Outlook sign-in/profile prompts or configure local-stores.json, then run outlook.cmd health.'
+        }
     } else { Write-Host 'Startup skipped (-NoStart).' }
     Write-Host ''
     Write-Host 'Installation completed.' -ForegroundColor Green

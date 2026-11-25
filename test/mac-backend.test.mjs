@@ -40,15 +40,14 @@ test('Mac worker uses the shared JSON-line lifecycle and serializes calls', asyn
   let maxInflight = 0;
   let starts = 0;
   const bridge = new MacCacheBridge({
-    timeoutMs: 100,
     spawnWorker: () => {
       starts++;
       return fakeWorker((request, worker) => {
         maxInflight = Math.max(maxInflight, ++inflight);
-        setTimeout(() => {
+        queueMicrotask(() => {
           inflight--;
           worker.stdout.write(JSON.stringify({ id: request.id, result: { backend: 'mac-cache', value: request.params.value } }) + '\n');
-        }, 5);
+        });
       });
     }
   });

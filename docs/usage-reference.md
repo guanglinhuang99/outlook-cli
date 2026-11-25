@@ -8,7 +8,7 @@ Windows 和 macOS Outlook 的本机只读服务，共用 **CLI、MCP stdio、MCP
 
 | 平台 | 默认后端 | 日期筛选依据 | 目录范围 |
 |---|---|---|---|
-| Windows | 已运行的经典 Outlook COM；不可用时读本地 OST/PST | `received_at` | 原有 Outlook / 文件后端范围 |
+| Windows | 经典 Outlook COM，默认按需启动；启动失败时提示并尝试本地 OST/PST | `received_at` | 原有 Outlook / 文件后端范围 |
 | macOS | `mac-cache`，只读本地 HxStore 和 Osa 目录证据 | `received_at`（已验证的 `LastDeliveryTime`） | 已确认的收件箱、已发送及其全部已知子目录；排除已删除及归属不明邮件 |
 
 ### Mac 从源码使用
@@ -31,7 +31,13 @@ Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 
 
 ## Windows：Outlook 未打开时读取本地数据
 
-默认 `auto` 模式：先尝试连接已运行的经典 Outlook；仅当 COM 返回 `OUTLOOK_UNAVAILABLE` 时转到本地文件解析。不会为了读取而启动 Outlook，也不会在 Outlook 忙、权限错误或某封邮件读取失败时悄悄换数据源。每次响应包含 `backend`（`com` / `local`）及 `data_scope`。
+默认 `auto` 模式：先复用经典 Outlook 会话；没有可连接的实例时，通过 COM 按需启动 Outlook，并以默认收件箱初始化默认 MAPI 配置。首次邮箱调用（包括 `health`）可能启动 Outlook，安装器的健康检查也会使用此行为。只启动服务或查询 `status` 不会启动 Outlook。可能出现登录或配置提示；启动成功不代表服务器邮件已全部同步。
+
+默认 `OUTLOOK_AUTO_START=1`，可在启动服务前设为 `0` 禁止启动；服务已运行时需 `restart` 应用变更。此设置作用于 Windows 的 `auto` 和 `com`，`local` 始终不连接或启动 Outlook。工作进程保留应用引用以复用会话，但逐次读取邮件对象；不会调用 Outlook 的 `Quit`。
+
+仅当 COM 返回 `OUTLOOK_START_FAILED`（激活或默认配置初始化失败），或禁用启动后返回 `OUTLOOK_UNAVAILABLE` 时，`auto` 才尝试本地文件解析。降级结果包含 `backend: local`、`data_scope: cached_only`、`fallback_reason`、`fallback_message` 及 `warnings` 中的 `LOCAL_FALLBACK`，明确说明只读本地缓存、不会同步服务器。若本地读取也失败，返回 `OUTLOOK_FALLBACK_FAILED`，消息保留两条失败原因。`com` 不降级。
+
+启动超时返回 `OUTLOOK_START_TIMEOUT`：Outlook 可能仍在启动或等待提示，请检查 Outlook 后重试，也可以显式选择 `local`。超时、Outlook 忙或普通邮件读取错误不自动降级。普通请求默认总期限 45 秒（含排队和启动），正文搜索保留原有更短的内部预算；超时会结束读取工作进程，但不会主动关闭 Outlook。成功的 COM 结果包含 `outlook_connection`（`existing` / `started` / `reused`）和 `outlook_auto_start`；发生按需启动时另有 `OUTLOOK_STARTED` 提示，提醒同步可能尚未完成。
 
 ```powershell
 .\outlook.cmd health
@@ -43,7 +49,7 @@ Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 
 .\outlook.cmd messages --backend com --limit 10
 ```
 
-所有 MCP 邮箱工具也接受 `backend: "auto" | "com" | "local" | "mac-cache"`。可用服务环境变量 `OUTLOOK_LOCAL_BACKEND` 设置默认值。Windows 的 `local` 读取 OST/PST，Mac 的 `local` 是 `mac-cache` 别名。使用本地文件 ID 的请求在 Windows auto 模式下仍路由到本地后端，因此 Outlook 重新打开后可以继续处理同一 ID。**各后端的 ID 不互通**；Outlook 关闭后若继续传 COM ID，会返回 `BACKEND_ID_MISMATCH`，应重新列出邮件获取本地 ID。
+所有 MCP 邮箱工具也接受 `backend: "auto" | "com" | "local" | "mac-cache"`。可用服务环境变量 `OUTLOOK_LOCAL_BACKEND` 设置默认值。Windows 的 `local` 读取 OST/PST，Mac 的 `local` 是 `mac-cache` 别名。使用本地文件 ID 的请求在 Windows auto 模式下仍路由到本地后端，返回 `LOCAL_ID_ROUTING` 提示，因此 Outlook 重新打开后可以继续处理同一 ID。**各后端的 ID 不互通**；携带 COM ID 时若 Outlook 无法连接或启动，不会将该 ID 交给离线解析器，而是返回 `BACKEND_ID_MISMATCH` 并说明 COM 失败原因；可恢复 Outlook 后重试，或显式从 `local` 重新列出邮件获取本地 ID。
 
 文件由 `ost-mcp` 从 Outlook 配置注册表和默认缓存目录发现，第一个文件作为内置文件夹别名的默认存储。需要手动指定文件或默认顺序时，在安装目录创建 **`local-stores.json`**：
 
@@ -70,19 +76,19 @@ Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 
 
 ## Windows：在另一台电脑上一键安装
 
-1. 从 [GitHub Releases](https://github.com/guanglinhuang99/outlook-cli/releases/latest) 下载 `outlook-local-0.2.1-setup.zip`，复制到目标 Windows 电脑，**先解压全部文件**。
+1. 从 [GitHub Releases](https://github.com/guanglinhuang99/outlook-cli/releases/latest) 下载 `outlook-local-0.3.0-setup.zip`，复制到目标 Windows 电脑，**先解压全部文件**。
 2. 确认已配置经典 Outlook 邮箱，或有可读取的本地 OST/PST。双击解压目录中的 **`install.cmd`**，无需管理员身份。
 3. 完成后，双击安装目录中的 **`Setup-MCP.cmd`**，查看中文接入说明和这台电脑的 `mcp-config.json`。
 4. 在 Agent 的 MCP 设置中导入配置，或只合并 `mcpServers.outlook-local` 条目，保留已有设置。使用配置表单的客户端，按说明填写 stdio 的 command、args、env。
 5. 保存并重新连接 Agent，然后双击 **`Test-MCP.cmd`** 验证 MCP 连接和邮箱后端。
 
-**MCP 服务端随一键安装器一起安装，不需要额外执行 npm install。** 已发布的 v0.2.1 安装包提供 8 个工具；本分支源码增加 `outlook_today`，重新打包后检查 9 个工具。中文 `MCP-SETUP.txt` 包含实际安装路径、手动填写字段、验证方法和常见错误处理。`Setup-MCP.cmd` 打开说明与配置供你接入客户端，不会自动修改客户端配置。`Test-MCP.cmd` 检查实际配置、协议和邮箱健康状态，不读取邮件正文；使用 `-NoStart` 安装时，请先运行 `Start-Outlook.cmd` 再测试。
+**MCP 服务端随安装器一起安装，无需额外执行 npm install。** v0.3.0 提供 9 个工具，包含 `outlook_today`。中文 `MCP-SETUP.txt` 包含实际安装路径、手动填写字段、验证方法和常见错误处理。`Setup-MCP.cmd` 打开说明与配置供你接入客户端。`Test-MCP.cmd` 检查实际配置、协议和邮箱健康状态；使用 `-NoStart` 安装时，请先运行 `Start-Outlook.cmd` 再测试。
 
 默认安装到当前用户的 `%LOCALAPPDATA%\OutlookLocal`，自动安装专用便携 Node.js 24.22.0、按 `package-lock.json` 安装生产依赖和固定版本 OST/PST 解析器、生成启动/停止入口及本机 MCP 配置，并启动服务验证后端。Node/COM 支持 Windows x64/ARM64；文件解析器提供 x64 程序，ARM64 需 Windows x64 仿真支持。可用 `-SkipLocalReader` 只安装 COM 功能。不会修改全局 Node.js、系统 PATH 或系统 PowerShell 执行策略。
 
-首次安装需要连接 `nodejs.org`、`registry.npmjs.org` 和 GitHub 发布文件下载域名。Node ZIP 使用脚本内固定的官方 SHA-256 校验，npm 依赖使用锁文件完整性校验；不会关闭 HTTPS 证书验证。安装包不包含邮件数据、服务令牌、原电脑的本地配置或 node_modules。
+发布安装包随附 Windows x64 的 Node ZIP 和 OST/PST 解析器，安装 npm 依赖仍需连接 npm registry。其他架构或自行打包时，缺少的组件会从官方源下载。Node ZIP 和解析器使用固定 SHA-256 校验，npm 依赖使用锁文件完整性校验。
 
-安装后可双击 `Start-Outlook.cmd`、`Stop-Outlook.cmd`，也可在命令行调用安装目录中的 `outlook.cmd`。默认不修改登录自启。Outlook 未运行时服务可以完成安装，打开经典 Outlook 后再运行 `outlook.cmd health` 检查。
+安装后可双击 `Start-Outlook.cmd`、`Stop-Outlook.cmd`，也可在命令行调用安装目录中的 `outlook.cmd`。登录自启由安装参数 `-AutoStart` 控制。安装时的邮箱检查默认可按需启动经典 Outlook；完成登录和同步后，可运行 `outlook.cmd health` 复查。
 
 可选参数（在解压后的安装包目录运行）：
 
@@ -141,9 +147,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-reader.p
 .\outlook.cmd stop
 ```
 
-`start` 启动隐藏的后台进程，重复执行会复用已经运行的服务。`status` 检查服务，`health` 检查 Outlook 或本地文件后端。需要已配置并运行经典 Outlook，或有支持的本地 OST/PST 文件。CLI 成功输出 JSON；失败在 stderr 输出 JSON，退出码非零。`serve` 可在前台运行，便于排查问题。
+`start` 启动隐藏的后台进程，重复执行会复用已经运行的服务。`status` 检查服务，`health` 检查已配置的经典 Outlook 或受支持的本地 OST/PST 文件，默认可按需启动 Outlook。CLI 成功输出 JSON，失败时将 JSON 写入 stderr 并返回非零退出码。`serve` 可在前台运行，便于排查问题。
 
-COM 模式下，服务应在与 Outlook **相同的 Windows 用户、交互式登录会话及权限级别**下启动；本地模式无需 Outlook 运行，只需读取文件的权限。通常不需要管理员身份。本项目采用用户会话后台进程，因为 Outlook COM 不适合 Session 0 的 Windows 系统服务。服务不会主动启动或关闭 Outlook。注销、重启后需要重新执行 `start`；可在安装时选择 `-AutoStart`。
+COM 模式下，服务应在与 Outlook **相同的 Windows 用户、交互式登录会话及权限级别**下启动；本地模式无需 Outlook 运行，只需读取文件的权限。通常不需要管理员身份。本项目采用用户会话后台进程，因为 Outlook COM 不适合 Session 0 的 Windows 系统服务。服务默认允许按需启动经典 Outlook，但不会主动关闭它。注销、重启后需要重新执行 `start`；可在安装时选择 `-AutoStart`（这是服务登录自启，与 `OUTLOOK_AUTO_START` 的按需启动 Outlook 设置不同）。
 
 若在隔离的 Agent 环境中启动出现 `OUTLOOK_UNAVAILABLE`，请在普通桌面终端启动服务；Agent 随后可连接该本机服务。
 
@@ -263,7 +269,7 @@ Invoke-RestMethod "http://127.0.0.1:$($state.port)/rpc" -Method Post -Headers $h
 
 也可以用 CLI 传完整 JSON 参数：`outlook.cmd rpc messages --json '{"limit":5}'`，注意所用 shell 的引号规则。请求体上限 64 KiB。最多排队 32 个调用，Windows 工作进程执行超时 45 秒，Mac 因首次索引需要更久，超时为 180 秒。超时会重建工作进程，等待中的请求返回错误，由调用方决定重试。
 
-常见错误：`OUTLOOK_UNAVAILABLE`（经典 Outlook 未运行或会话不匹配）、`OUTLOOK_TIMEOUT`（Outlook 忙或弹窗）、`INVALID_ARGUMENT`、`INVALID_ID`、`ATTACHMENT_TOO_LARGE`、`UNSUPPORTED_ATTACHMENT`、`BUSY`。
+常见错误：`OUTLOOK_UNAVAILABLE`（禁用按需启动且无法连接 Outlook）、`OUTLOOK_START_FAILED`（启动或默认配置初始化失败）、`OUTLOOK_START_TIMEOUT`（启动或配置初始化超时）、`OUTLOOK_FALLBACK_FAILED`（COM 与离线读取均失败）、`OUTLOOK_TIMEOUT`（读取超时，可能忙或有弹窗）、`INVALID_ARGUMENT`、`INVALID_ID`、`ATTACHMENT_TOO_LARGE`、`UNSUPPORTED_ATTACHMENT`、`BUSY`。
 
 ## 安装、开发和验证
 

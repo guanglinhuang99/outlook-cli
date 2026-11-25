@@ -31,6 +31,7 @@ function downloadStateChanged() {
 const help = `Outlook Local Service — read-only, no AI
 
   outlook-local start | stop | restart | status | health
+  outlook-local clipboard start|stop|status  Windows Outlook copy-to-MSG bridge
   outlook-local stores
   outlook-local folders [--folder inbox|<folder-id>] [--limit 25] [--offset 0]
   outlook-local messages [--folder inbox] [--limit 25] [--unread true]
@@ -49,8 +50,11 @@ Messages/search: --after/--before ISO time with timezone, --offset,
 --limit, --scan-limit. Search covers one folder per call; follow next_offset.
 All mailbox commands accept --backend auto|com|local|mac-cache (default auto).
 auto uses Windows COM/local OST/PST or the macOS HxStore cache by platform.
+Windows auto/com may start classic Outlook on demand (OUTLOOK_AUTO_START=0 disables it).
+local never starts Outlook. auto reports explicit warnings when falling back to cached mail.
+Startup timeouts do not auto-fallback; check Outlook prompts or explicitly select local.
 Both platforms filter by received_at; macOS uses verified LastDeliveryTime.
-On macOS, Python 3.11+ is required; unread/body-search/HTML are unsupported.
+On macOS, Python 3.11+ is required; unread filters and HTML are unsupported.
 Local reads contain cached data only; COM and local IDs are different.
 Use stores -> root_id -> folders to discover other folders.
 All output is JSON, except help. Errors go to stderr with nonzero exit status.
@@ -89,6 +93,11 @@ async function stop() {
 async function main() {
   const [command = 'help', ...args] = process.argv.slice(2);
   if (['help', '--help', '-h'].includes(command)) { process.stdout.write(help); return; }
+  if (command === 'clipboard') {
+    if (args.length !== 1) throw new Error('Usage: outlook-local clipboard start|stop|status');
+    const { clipboardCommand } = await import('../src/clipboard.mjs');
+    return print(await clipboardCommand(args[0]));
+  }
   if (command === 'start') return print(await start());
   if (command === 'stop') return print(await stop());
   if (command === 'restart') { await stop(); return print(await start()); }
@@ -167,7 +176,11 @@ async function main() {
       if (currentDestination !== writeDestination) throw downloadStateChanged();
     }
     await writeFile(writeDestination, bytes, { flag: 'wx', mode: 0o600 });
-    return print({ path: writeDestination, size_bytes: bytes.length, sha256 });
+    return print({ path: writeDestination, size_bytes: bytes.length, sha256,
+      backend: result.backend, data_scope: result.data_scope,
+      outlook_connection: result.outlook_connection, outlook_auto_start: result.outlook_auto_start,
+      fallback_reason: result.fallback_reason, fallback_message: result.fallback_message,
+      warnings: result.warnings });
   }
   print(await call(operation, params));
 }

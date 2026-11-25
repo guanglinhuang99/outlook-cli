@@ -4,7 +4,7 @@
 
 **原始邮件只读**：不发送、删除、移动邮件，也不修改已读状态。邮箱登录和同步由 Outlook 完成；本项目不内置 AI 模型，不需要模型 API Key 或 Microsoft Graph OAuth。
 
-> 跨平台源码版本为 **v0.3.0**，源码安装使用 `main` 分支。Windows 已发布的 v0.2.1 安装包不包含 Mac 读取器和 `outlook_today` 工具。
+> **v0.3.0** 支持 Windows 和 macOS。Windows 可下载安装包，macOS 从源码安装。
 
 ## 项目背景
 
@@ -30,7 +30,7 @@ Codex / 其他 Agent / 命令行
 
 | 项目 | Windows | macOS |
 |---|---|---|
-| 读取来源 | 已运行的经典 Outlook COM；不可用时读取支持的本地 OST/PST | Outlook 已同步到本机的 HxStore 缓存 |
+| 读取来源 | 经典 Outlook COM，默认按需启动；启动失败时明确提示并尝试本地 OST/PST | Outlook 已同步到本机的 HxStore 缓存 |
 | 文件夹 | 原有 COM / OST/PST 后端可见目录 | 已确认的收件箱、已发送及其全部已知子目录 |
 | 已删除邮件 | 原有后端支持；需要时显式选择目录 | 排除已删除及其子目录、归属不明邮件 |
 | 日期筛选 | 接收时间 `received_at` | 接收时间 `received_at`（验证后的 `LastDeliveryTime`） |
@@ -73,12 +73,12 @@ node bin/outlook.mjs start
 
 ### Windows：安装包
 
-1. 在 [Releases](https://github.com/guanglinhuang99/outlook-cli/releases) 下载 `outlook-local-0.2.1-setup.zip`，解压全部文件。
+1. 在 [Releases](https://github.com/guanglinhuang99/outlook-cli/releases) 下载 `outlook-local-0.3.0-setup.zip`，解压全部文件。
 2. 双击 `install.cmd`，默认安装到 `%LOCALAPPDATA%\OutlookLocal`，无需管理员身份。
 3. 安装器会准备专用 Node.js、依赖和 OST/PST 解析器，并生成启动入口和 MCP 配置。
 4. 在安装目录运行 `outlook.cmd health` 检查后端，双击 `Setup-MCP.cmd` 查看接入说明，`Test-MCP.cmd` 验证连接。
 
-已发布安装包提供 8 个 MCP 工具。需要本 README 中新增的 `today` 命令和 9 个工具时，请使用下面的 v0.3.0 源码安装方式。
+v0.3.0 安装包提供 `today` 命令和 9 个 MCP 工具。安装需要联网获取锁定的 npm 依赖，详见 [Windows 安装说明](INSTALL-WINDOWS.md)。
 
 ### Windows：从源码安装
 
@@ -95,7 +95,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup-reader.p
 .\outlook.cmd today --folder inbox --limit 25
 ```
 
-默认优先连接已运行的经典 Outlook，仅在 COM 不可用时转到本地文件读取。服务不会主动启动 Outlook。新版 Windows Outlook 不支持 COM，其自身缓存也不属于本项目 OST/PST 后端的支持范围。
+默认优先连接已运行的经典 Outlook；未运行时按需启动 Outlook 并初始化默认配置，再通过 COM 读取。首次查询（包括 `health`）可能启动 Outlook、出现登录或配置提示，返回结果不保证同步已经完成。服务不会主动关闭 Outlook。
+
+`--backend local` 始终直接读取本地 OST/PST，不连接或启动 Outlook。默认 `auto` 模式在明确启动失败时尝试离线读取，结果会包含 `fallback_reason`、`fallback_message`、`warnings` 和 `data_scope: cached_only`；启动超时、Outlook 忙或普通读取错误会明确报错，不自动降级。`--backend com` 始终使用 COM，失败即报错。若要禁用按需启动，在启动服务前设置 `OUTLOOK_AUTO_START=0`；已运行的服务需重启。新版 Windows Outlook 不支持此 COM 后端，其自身缓存也不属于本项目 OST/PST 后端的支持范围。
 
 COM 服务应与 Outlook 使用相同的 Windows 用户、交互式会话和权限级别。手动指定 OST/PST、安装参数和本地模式限制见 [详细参考](docs/usage-reference.md)。
 
@@ -176,6 +178,14 @@ Mac 原生 `outlook_local_search` 的 JSON 参数：
 Mac 原生 MCP 使用 `outlook_local_search`，例如 `{"query":"预算","field":"all","search_body":true,"person":"张三","person_role":"any","from_date":"2026-10-01","limit":20}`。不指定 `folder_id` 时覆盖已验证的收件箱、已发送及子目录；指定后默认含子目录。原生分页使用 `next_cursor`，共享 CLI/MCP 使用 `next_offset`。原生 `complete` 仍表示分页是否结束；正文索引状态单独看 `body_search_incomplete` 和 `fulltext`，pending 大于 0 时先重复第一页。
 
 Mac 只公开已确认的收件箱和已发送目录树。目录名可能被 Outlook 脱敏，服务不会猜测原名称。邮件 ID 属于具体后端和缓存快照，失效时重新检索获取。
+
+### 复制邮件为 MSG 文件（Windows）
+
+无需 Codex 或 Node.js：双击 `Start-MailCopy.cmd` 启动后台监听，`Status-MailCopy.cmd` 查看状态，`Stop-MailCopy.cmd` 停止。也可打包为独立 ZIP，见 [独立版说明](docs/mailcopy-standalone.txt)。
+
+运行 `.\outlook.cmd clipboard start` 后，在经典 Outlook 邮件列表中选中邮件并按 **Ctrl+C**，程序会自动保存 MSG（保留邮件及其内嵌附件），并将文件放入剪贴板，供 WorkBuddy 等应用测试 **Ctrl+V**。目标应用是否支持文件粘贴和 MSG 解析需要实际验证。
+
+使用 `.\outlook.cmd clipboard status` 查看导出路径与错误，`.\outlook.cmd clipboard stop` 停止监听。无需启动邮件查询服务。导出文件保存在独立目录，不会自动删除。操作步骤与限制见 [剪贴板桥接说明](docs/clipboard-bridge.md)。
 
 ### 查看与下载附件
 
@@ -264,7 +274,7 @@ codex mcp list
 - Mac 列表先按接收时间和文件夹筛选，不按发送时间提前裁剪，因此早先发送、后来投递的邮件仍能进入对应接收日期。列表中的正文待读取状态不代表正文缺失；首次读取才确认可用性。首次读取前源正文变化时会要求刷新，避免将变化后的内容错误关联到旧快照。
 - Mac 缓存格式并非微软公开稳定 API，其他 Outlook 版本可能不兼容。服务保留一份当前压缩邮箱容器，刷新构建期间还需一份新容器的可用空间（容器部分通常为一份、峰值两份），另需索引、按需正文和附件空间。当前没有正文缓存总字节配额。源容器更新后旧快照 ID / 游标失效，应重新检索。
 - 服务仅监听 `127.0.0.1` 并使用令牌认证，适用于本机 Agent，不直接提供局域网远程访问。
-- Windows、macOS、Linux 自动化检查覆盖协议和合成测试；Mac 已完成真实缓存验证，统一版本的 Windows 真实邮箱验证仍待完成。
+- Windows、macOS、Linux 自动化检查覆盖协议和合成测试。项目文档还记录了 Windows COM 真实邮箱测试和 Mac 真实缓存测试。
 
 升级到接收时间筛选版本后，请运行 `node bin/outlook.mjs restart` 重新加载读取器并刷新索引。原生 Python MCP 用户需更新源码并重启对应客户端。
 

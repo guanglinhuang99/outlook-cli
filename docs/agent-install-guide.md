@@ -1,6 +1,6 @@
 # 给其他 Agent 的 Outlook CLI 安装与使用指南
 
-仓库：<https://github.com/guanglinhuang99/outlook-cli>。本文对应 `main` 分支源码，包含 Windows 正文搜索的自动策略：首次直接扫描、后续按需建索引。旧的 v0.2.1 安装包不包含这些改动；要使用本次优化，请按本文安装源码。
+本文对应 Outlook CLI v0.3.0。Windows 可以使用 [发布安装包](https://github.com/guanglinhuang99/outlook-cli/releases/tag/v0.3.0)，安装及验收步骤见 [Windows 安装说明](../INSTALL-WINDOWS.md)。下面的步骤适用于从源码安装。
 
 该项目让**运行在邮箱所在电脑上的 Agent** 通过 CLI 或 MCP 读取 Outlook。它不需要模型 API Key，也不通过 Microsoft Graph 登录；邮箱登录和同步由本机 Outlook 完成。原始邮件只读，不发送、删除、移动邮件或修改已读状态。程序会创建自己的索引及附件导出文件。
 
@@ -39,7 +39,7 @@ node bin/outlook.mjs health --backend com
 node bin/outlook.mjs messages --folder inbox --limit 1
 ```
 
-`health --backend com` 用于明确检查经典 Outlook 连接，避免把自动回退误认为 COM 安装成功。应返回 `connected: true` 和 `backend: "com"`。不需要管理员权限；不要为此把 Outlook 或服务改为管理员运行。
+`health --backend com` 应返回 `connected: true` 和 `backend: "com"`。如果经典 Outlook 未运行，该命令默认会尝试启动它，首次使用可能出现登录或配置提示。Outlook 和服务都可使用普通用户权限运行。
 
 **可选：支持 Outlook 关闭后的本地 OST/PST 读取。** 仅使用 COM 时可跳过以下步骤；需要文件后端时，在项目目录运行：
 
