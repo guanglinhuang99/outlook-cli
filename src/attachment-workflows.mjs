@@ -58,7 +58,7 @@ async function pinnedBackend(options, output = false) {
   };
 }
 
-const stateErrors = new Set(['SERVICE_RESTART_REQUIRED', 'SERVICE_UNAVAILABLE', 'OUTPUT_DIR_CHANGED']);
+const stateErrors = new Set(['SERVICE_RESTART_REQUIRED', 'SERVICE_UNAVAILABLE', 'SERVICE_NOT_RUNNING', 'SERVICE_TIMEOUT', 'OUTPUT_DIR_CHANGED']);
 
 async function listedAttachments(pinned, params) {
   const listing = await pinned.call('attachments', validateCall('attachments', params));

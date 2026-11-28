@@ -5,7 +5,8 @@ import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { BackendRouter } from './backend.mjs';
 import { validateCall } from './tools.mjs';
 import { createMcp } from './mcp.mjs';
-import { prepareRuntime, publishState, statePath, port } from './runtime.mjs';
+import path from 'node:path';
+import { prepareRuntime, publishState, runtimeDir, statePath, port } from './runtime.mjs';
 import { MacCacheBridge } from './mac.mjs';
 import { canonicalMacProtectedRoots, resolveMacProfile } from './mac-paths.mjs';
 
@@ -50,6 +51,11 @@ export async function startService({ bridge, listenPort = port, token = randomBy
   let closing = false;
   const sockets = new Set();
   const invoke = (method, params) => serviceBridge.call(method, validateCall(method, params));
+  // Workflow tools run inside this process; their state pin is this service instance.
+  const serviceState = { port: listenPort, token, pid: process.pid, startedAt,
+    ...(protectedMailRoots ? { protected_mail_roots: protectedMailRoots } : {}) };
+  const workflows = { call: (method, params) => invoke(method, params), readState: async () => serviceState,
+    stateDir: path.join(runtimeDir, 'read-parity') };
   const server = http.createServer(async (req, res) => {
     try {
       if (!authenticate(req, token, listenPort)) return json(res, 403, { error: { code: 'FORBIDDEN', message: 'Local bearer authentication required' } });
@@ -72,7 +78,7 @@ export async function startService({ bridge, listenPort = port, token = randomBy
       }
       if (url === '/mcp' && req.method === 'POST') {
         const body = await parseBody(req);
-        const mcp = createMcp(invoke);
+        const mcp = createMcp(invoke, { workflows });
         const transport = new NodeStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
         res.once('close', () => { void mcp.close(); });
         await mcp.connect(transport);
@@ -108,9 +114,7 @@ export async function startService({ bridge, listenPort = port, token = randomBy
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(listenPort, '127.0.0.1', resolve); });
   if (persist) {
     try {
-      const state = { port: listenPort, token, pid: process.pid, startedAt };
-      if (protectedMailRoots) state.protected_mail_roots = protectedMailRoots;
-      await publishState(state);
+      await publishState(serviceState);
     }
     catch (error) { await close(); throw error; }
   }

@@ -8,6 +8,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { call, readState, root, runtimeDir } from '../src/runtime.mjs';
 import path from 'node:path';
 import { readVerifiedAttachment } from './smoke-attachment.mjs';
+import { toolNamesForPlatform } from '../src/mcp.mjs';
 
 const report = {};
 report.health = await call('health');
@@ -85,7 +86,7 @@ for (const type of ['http', 'stdio']) {
   try {
     await client.connect(transport);
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 9);
+    assert.deepEqual(tools.tools.map(tool => tool.name).sort(), toolNamesForPlatform().sort());
     const result = await client.callTool({ name: 'outlook_health', arguments: {} });
     assert.equal(result.structuredContent.connected, true);
     const mail = await client.callTool({ name: 'outlook_messages', arguments: { limit: 1 } });

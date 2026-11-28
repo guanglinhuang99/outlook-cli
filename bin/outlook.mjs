@@ -65,13 +65,14 @@ async function attachmentCommand(command, args) {
   const { values } = parseArgs({ args, options, strict: true, allowPositionals: false });
   const { id, backend } = validateCall('attachments', { id: values.id, backend: values.backend });
   const workflows = await import('../src/attachment-workflows.mjs');
+  const service = { call: callStarting, readState: readStateStarting };
   if (command === 'download-all') {
     if (!values['out-dir']) throw new Error('download-all requires --out-dir');
-    return workflows.downloadAllAttachments({ id, backend, out_dir: values['out-dir'] });
+    return workflows.downloadAllAttachments({ id, backend, out_dir: values['out-dir'] }, service);
   }
   const { index } = validateCall('read_attachment', { id, backend, index: Number(values.index) });
   const maximum = values['max-chars'] === undefined ? {} : { max_chars: Number(values['max-chars']) };
-  return workflows.readAttachmentText({ id, backend, index, ...maximum });
+  return workflows.readAttachmentText({ id, backend, index, ...maximum }, service);
 }
 
 function sameDownloadState(left, right) {
@@ -114,7 +115,7 @@ const help = `Outlook CLI — read-only local Outlook mail for agents
   outlook-local knowledge status|sync|search|read|source|export|bundle [--json '<JSON object>' | --json-file <file|->]
   outlook-local calendar status|calendars|agenda|authorize [--json '<JSON object>' | --json-file <file|->]
   outlook-local semantic sync|search|status [--json '<JSON object>' | --json-file <file|->]
-  outlook-local mcp              MCP stdio adapter; requires running service
+  outlook-local mcp              MCP stdio adapter; starts the service on demand
   outlook-local mcp-config       Print MCP stdio configuration (no secrets)
   outlook-local rpc <operation> --json '<JSON object>'
   outlook-local serve            Run service in foreground
@@ -161,6 +162,32 @@ async function start() {
   throw new Error(`Service did not start. Check ${path.join(runtimeDir, 'service.log')}`);
 }
 
+// After a reboot or logout the service is gone; mail commands and the MCP adapter start
+// it on demand. One start runs at a time, and pinned-state calls never restart silently.
+let starting;
+function ensureStarted() {
+  starting ??= start().finally(() => { starting = undefined; });
+  return starting;
+}
+
+async function callStarting(method, params, options) {
+  try { return await call(method, params, options); }
+  catch (error) {
+    if (error.code !== 'SERVICE_NOT_RUNNING' || options?.state) throw error;
+    await ensureStarted();
+    return call(method, params, options);
+  }
+}
+
+async function readStateStarting(options) {
+  try { return await readState(options); }
+  catch (error) {
+    if (error.code !== 'SERVICE_NOT_RUNNING') throw error;
+    await ensureStarted();
+    return readState(options);
+  }
+}
+
 async function stop() {
   const result = await request('/shutdown', {});
   for (let i = 0; i < 40; i++) {
@@ -185,14 +212,14 @@ async function main() {
   if (command === 'stop') return print(await stop());
   if (command === 'restart') {
     // A service that is not running (or left a stale state file) only needs a start.
-    try { await stop(); } catch (error) { if (error.code !== 'SERVICE_UNAVAILABLE') throw error; }
+    try { await stop(); } catch (error) { if (!['SERVICE_NOT_RUNNING', 'SERVICE_UNAVAILABLE'].includes(error.code)) throw error; }
     return print(await start());
   }
   if (command === 'status') return print(await request('/status'));
   if (command === 'download-all' || command === 'attachment-text') return print(await attachmentCommand(command, args));
   if (['conversation', 'delta-bundle', 'task-bundle'].includes(command)) {
     const { runReadParity } = await import('../src/read-parity.mjs');
-    return print(await runReadParity(command, await workflowArguments(args), { call, stateDir: path.join(runtimeDir, 'read-parity') }));
+    return print(await runReadParity(command, await workflowArguments(args), { call: callStarting, stateDir: path.join(runtimeDir, 'read-parity') }));
   }
   if (command === 'knowledge' || command === 'calendar') {
     const [action, ...options] = args;
@@ -208,14 +235,14 @@ async function main() {
     }
     const { readAttachmentText } = await import('../src/attachment-workflows.mjs');
     const { runKnowledgeWorkflow } = await import('../src/knowledge-workflow.mjs');
-    return print(await runKnowledgeWorkflow(action, params, { call, stateDir, readAttachmentText }));
+    return print(await runKnowledgeWorkflow(action, params, { call: callStarting, stateDir, readAttachmentText }));
   }
   if (command === 'semantic') {
     const [action, ...options] = args;
     const { runSemanticWorkflow } = await import('../src/semantic-workflow.mjs');
     if (!action || action === 'help' || action === '--help') return print({ actions: ['status', 'sync', 'search'] });
     return print(await runSemanticWorkflow(action, await workflowArguments(options), {
-      call, stateDir: path.join(runtimeDir, 'semantic')
+      call: callStarting, stateDir: path.join(runtimeDir, 'semantic')
     }));
   }
   if (command === 'mcp-config') return print({ mcpServers: { 'outlook-local': { command: process.execPath, args: [fileURLToPath(import.meta.url), 'mcp'], env: { OUTLOOK_LOCAL_STATE_DIR: runtimeDir } } } });
@@ -231,7 +258,9 @@ async function main() {
   if (command === 'mcp') {
     const { createMcp } = await import('../src/mcp.mjs');
     const { StdioServerTransport } = await import('@modelcontextprotocol/server/stdio');
-    const server = createMcp(call);
+    const server = createMcp(callStarting, { workflows: {
+      call: callStarting, readState: readStateStarting, stateDir: path.join(runtimeDir, 'read-parity')
+    } });
     await server.connect(new StdioServerTransport());
     process.stdin.once('end', () => { void server.close(); });
     return;
@@ -276,7 +305,7 @@ async function main() {
   if (command === 'download') {
     if (params.byte_offset) throw new Error('download saves a complete attachment; byte-offset must be zero');
     const destination = path.resolve(outputPath);
-    const initialState = await readState({ requireMacProtectedRoots: process.platform === 'darwin' });
+    const initialState = await readStateStarting({ requireMacProtectedRoots: process.platform === 'darwin' });
     let writeDestination = destination;
     if (process.platform === 'darwin') {
       writeDestination = await assertSafeMacPath(destination, { protectedRoots: initialState.protected_mail_roots });
@@ -309,7 +338,7 @@ async function main() {
       fallback_reason: result.fallback_reason, fallback_message: result.fallback_message,
       warnings: result.warnings });
   }
-  print(await call(operation, params));
+  print(await callStarting(operation, params));
 }
 
 main().catch(error => { process.stderr.write(JSON.stringify({ error: { code: error.code ?? 'CLI_ERROR', message: error.message } }) + '\n'); process.exitCode = 1; });

@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { openRuntimeLog, prepareRuntime, publishState, readState, runtimeMarkerName } from '../src/runtime.mjs';
+import { openRuntimeLog, prepareRuntime, publishState, readState, request, runtimeMarkerName } from '../src/runtime.mjs';
 
 async function fixture() {
   const base = await mkdtemp(path.join(os.tmpdir(), 'outlook-runtime-'));
@@ -260,7 +260,7 @@ test('readState validates protected roots and requires them for Mac downloads', 
   await publishState(state, statePath);
   assert.deepEqual(await readState({ target: statePath, requireMacProtectedRoots: true }), state);
   await publishState({ ...state, protected_mail_roots: 'not-an-array' }, statePath);
-  await assert.rejects(readState({ target: statePath }), /Service state unavailable/);
+  await assert.rejects(readState({ target: statePath }), /Service state is invalid or untrusted/);
   await publishState({ port: state.port, token: state.token, pid: state.pid, startedAt: state.startedAt }, statePath);
   if (process.platform === 'darwin') {
     await assert.rejects(readState({ target: statePath, requireMacProtectedRoots: true }), error => (
@@ -419,4 +419,37 @@ test('CLI reports malformed --json as an invalid argument', () => {
   assert.deepEqual(JSON.parse(result.stderr), {
     error: { code: 'INVALID_ARGUMENT', message: '--json must be a valid JSON object' }
   });
+});
+
+test('service errors separate a stopped service from a busy one', async t => {
+  const silent = createServer(() => {});
+  await new Promise(resolve => silent.listen(0, '127.0.0.1', resolve));
+  t.after(() => { silent.closeAllConnections(); silent.close(); });
+  const state = { port: silent.address().port, token: 'a'.repeat(64) };
+  await assert.rejects(request('/status', undefined, { state, timeoutMs: 200 }), { code: 'SERVICE_TIMEOUT' });
+  const closed = createServer();
+  await new Promise(resolve => closed.listen(0, '127.0.0.1', resolve));
+  const port = closed.address().port;
+  await new Promise(resolve => closed.close(resolve));
+  await assert.rejects(request('/status', undefined, { state: { ...state, port }, timeoutMs: 2000 }), { code: 'SERVICE_NOT_RUNNING' });
+  const item = await fixture();
+  t.after(() => rm(item.base, { recursive: true, force: true }));
+  await assert.rejects(readState({ target: path.join(item.runtime, 'service.json') }), { code: 'SERVICE_NOT_RUNNING' });
+});
+
+test('mail commands start a stopped service on demand', async t => {
+  if (process.platform === 'darwin') return t.skip('macOS service start requires an Outlook profile');
+  const base = await mkdtemp(path.join(os.tmpdir(), 'outlook-autostart-'));
+  const env = { ...process.env, OUTLOOK_LOCAL_STATE_DIR: path.join(base, 'service'),
+    OUTLOOK_LOCAL_PORT: String(20000 + Math.floor(Math.random() * 20000)), OUTLOOK_AUTO_START: '0' };
+  const cli = (...args) => spawnSync(process.execPath, [
+    fileURLToPath(new URL('../bin/outlook.mjs', import.meta.url)), ...args
+  ], { env, encoding: 'utf8', timeout: 60000 });
+  t.after(async () => { cli('stop'); await rm(base, { recursive: true, force: true }); });
+  assert.equal(JSON.parse(cli('status').stderr).error.code, 'SERVICE_NOT_RUNNING', 'status never starts the service');
+  const stores = cli('stores');
+  assert.doesNotMatch(stores.stderr, /SERVICE_NOT_RUNNING/, 'the mail command started the service instead of failing');
+  const status = cli('status');
+  assert.equal(status.status, 0, status.stderr);
+  assert.equal(JSON.parse(status.stdout).service, 'outlook-local');
 });

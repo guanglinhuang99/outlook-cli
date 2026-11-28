@@ -4,7 +4,7 @@
 
 Windows 和 macOS Outlook 的本机只读服务共用 **CLI、MCP stdio、MCP Streamable HTTP**。邮箱登录及同步由本机 Outlook 完成，不连接任何云端邮件接口。
 
-源码 v0.3.0 按平台自动选择读取器，共享 9 个 `outlook_*` 工具。已有 Windows COM / OST/PST 用法保持兼容；Mac 的 HxStore 格式由独立 Python 读取器处理，邮件 ID 不跨后端通用。
+源码 v0.3.0 按平台自动选择读取器，共享 10 个 `outlook_*` 工具。已有 Windows COM / OST/PST 用法保持兼容；Mac 的 HxStore 格式由独立 Python 读取器处理，邮件 ID 不跨后端通用。
 
 | 平台 | 默认后端 | 日期筛选依据 | 目录范围 |
 |---|---|---|---|
@@ -82,7 +82,7 @@ node bin/outlook.mjs mcp-config
 4. 在 Agent 的 MCP 设置中导入配置，或只合并 `mcpServers.outlook-local` 条目，保留已有设置。使用配置表单的客户端，按说明填写 stdio 的 command、args、env。
 5. 保存并重新连接 Agent，然后双击 **`Test-MCP.cmd`** 验证 MCP 连接和邮箱后端。
 
-**MCP 服务端随安装器一起安装，无需额外执行 npm install。** v0.3.0 提供 9 个工具，包含 `outlook_today`。中文 `MCP-SETUP.txt` 包含实际安装路径、手动填写字段、验证方法和常见错误处理。`Setup-MCP.cmd` 打开说明与配置供你接入客户端。`Test-MCP.cmd` 检查实际配置、协议和邮箱健康状态；使用 `-NoStart` 安装时，请先运行 `Start-Outlook.cmd` 再测试。
+**MCP 服务端随安装器一起安装，无需额外执行 npm install。** 提供 10 个工具，包含 `outlook_today` 和 `outlook_attachment_text`。中文 `MCP-SETUP.txt` 包含实际安装路径、手动填写字段、验证方法和常见错误处理。`Setup-MCP.cmd` 打开说明与配置供你接入客户端。`Test-MCP.cmd` 检查实际配置、协议和邮箱健康状态；使用 `-NoStart` 安装时，请先运行 `Start-Outlook.cmd` 再测试。
 
 默认安装到当前用户的 `%LOCALAPPDATA%\OutlookLocal`，自动安装专用便携 Node.js 24.22.0、按 `package-lock.json` 安装生产依赖和固定版本 OST/PST 解析器、生成启动/停止入口及本机 MCP 配置，并启动服务验证后端。Node/COM 支持 Windows x64/ARM64；文件解析器提供 x64 程序，ARM64 需 Windows x64 仿真支持。可用 `-SkipLocalReader` 只安装 COM 功能。不会修改全局 Node.js、系统 PATH 或系统 PowerShell 执行策略。
 
@@ -190,7 +190,7 @@ COM 模式下，服务应在与 Outlook **相同的 Windows 用户、交互式�
 
 ## 工具和参数
 
-下表列出通用的本地查询命令及其 MCP 工具。macOS 另提供跨目录和批量读取工具。[macOS 批量工具](macos.md#跨目录查询与批量读取)
+下表列出通用的本地查询命令及其 MCP 工具。macOS 另提供跨目录、批量读取、邮件往来 `outlook_conversation` 和增量 `outlook_delta_bundle` 工具。[macOS 批量工具](macos.md#跨目录查询与批量读取)
 
 | CLI / 操作 | MCP 工具 | 功能 |
 |---|---|---|
@@ -203,6 +203,7 @@ COM 模式下，服务应在与 Outlook **相同的 Windows 用户、交互式�
 | `read` | `outlook_read` | 单封邮件及分页正文 |
 | `attachments` | `outlook_attachments` | 附件名称、类型、大小、序号 |
 | `read_attachment` / `download` | `outlook_read_attachment` | 分块读取附件；CLI download 合并并保存文件 |
+| `attachment-text` | `outlook_attachment_text` | 提取附件文字（文本、PDF、DOCX、XLSX），不返回原始字节 |
 
 本地服务和这些 MCP 工具以只读方式访问邮箱。CLI `download` 将附件保存到用户指定的本机路径，拒绝覆盖已有文件。本工具不提供标记已读、移动、草稿或发送。
 

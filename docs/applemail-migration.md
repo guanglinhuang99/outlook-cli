@@ -12,7 +12,7 @@
 | 一次读取 50 封邮件与指定附件，查询和导出证据 | `knowledge bundle`、`knowledge sync/search/read/source/export` | 本地缓存派生文本、私有索引与 SHA-256 |
 | 查看日历和日程 | `calendar status/calendars/agenda` | 已授权的 macOS EventKit |
 
-跨目录查询按 `received_at` 和新加坡时区筛选。邮件缓存范围与分页规则见 [macOS 批量工具](macos.md#跨目录查询与批量读取)。现有 12 个 macOS MCP 工具可继续用于本地只读查询和正文。下面的新增命令通过 CLI 调用。
+跨目录查询按 `received_at` 和新加坡时区筛选。邮件缓存范围与分页规则见 [macOS 批量工具](macos.md#跨目录查询与批量读取)。附件文字、邮件往来和增量读取也可通过 MCP 工具 `outlook_attachment_text`、`outlook_conversation`、`outlook_delta_bundle` 调用，其余命令通过 CLI 调用。
 
 ## 账户目录和未读
 

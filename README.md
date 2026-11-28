@@ -78,7 +78,7 @@ node bin/outlook.mjs start
 3. 安装器会准备专用 Node.js、依赖和 OST/PST 解析器，并生成启动入口和 MCP 配置。
 4. 在安装目录运行 `outlook.cmd health` 检查后端，双击 `Setup-MCP.cmd` 查看接入说明，`Test-MCP.cmd` 验证连接。
 
-v0.3.0 安装包提供 `today` 命令和 9 个 MCP 工具。安装需要联网获取锁定的 npm 依赖，详见 [Windows 安装说明](INSTALL-WINDOWS.md)。
+安装包提供 `today` 命令和 10 个 MCP 工具。安装需要联网获取锁定的 npm 依赖，详见 [Windows 安装说明](INSTALL-WINDOWS.md)。
 
 ### Windows：从源码安装
 
@@ -217,7 +217,7 @@ node bin/outlook.mjs restart
 node bin/outlook.mjs stop
 ```
 
-`status` 检查服务是否在线，`health` 检查邮箱后端是否可用。机器重启或注销后需重新启动；Windows 安装器可选登录自启。
+`status` 检查服务是否在线，`health` 检查邮箱后端是否可用。机器重启或注销后无需手动启动：MCP 和查询命令发现服务未运行时会自动启动它；Windows 安装器也可选登录自启。
 
 ## 接入 Codex 和其他 Agent
 

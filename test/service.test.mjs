@@ -10,7 +10,7 @@ import { promisify } from 'node:util';
 import { Client, InMemoryTransport, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { startService, authenticate } from '../src/service.mjs';
 import { validateCall } from '../src/tools.mjs';
-import { createMcp } from '../src/mcp.mjs';
+import { createMcp, toolNamesForPlatform } from '../src/mcp.mjs';
 
 const bundleTools = ['outlook_context_bundle', 'outlook_messages_bundle', 'outlook_today_bundle'];
 
@@ -26,14 +26,15 @@ test('installed MCP checker accepts the real platform-aware annotations', async 
   ], { timeout: 20000 });
   const report = JSON.parse(result.stdout);
   assert.equal(report.mcp, 'ready');
-  assert.equal(report.tools.length, process.platform === 'darwin' ? 12 : 9);
+  assert.deepEqual(report.tools.sort(), toolNamesForPlatform().sort());
+  assert.equal(report.tools.length, process.platform === 'darwin' ? 15 : process.platform === 'win32' ? 10 : 9);
   assert.ok(report.tools.includes('outlook_today'));
   assert.deepEqual(report.tools.filter(name => name.endsWith('_bundle')).sort(), process.platform === 'darwin' ? bundleTools : []);
 });
 
 test('shared MCP annotations reflect the backend platform', async t => {
   async function listAnnotations(platform) {
-    const server = createMcp(async () => ({}), { platform });
+    const server = createMcp(async () => ({}), { platform, workflows: {} });
     const client = new Client({ name: `annotation-test-${platform}`, version: '1.0.0' });
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
@@ -46,12 +47,18 @@ test('shared MCP annotations reflect the backend platform', async t => {
   }
 
   const windows = await listAnnotations('win32');
-  assert.equal(windows.length, 9);
-  assert.ok(windows.every(tool => tool.annotations.readOnlyHint === true && tool.annotations.destructiveHint === false));
+  assert.equal(windows.length, 10);
+  assert.ok(windows.some(tool => tool.name === 'outlook_attachment_text'));
   const mac = await listAnnotations('darwin');
-  assert.equal(mac.length, 12);
-  assert.deepEqual(mac.map(tool => tool.name).filter(name => name.endsWith('_bundle')).sort(), bundleTools);
-  assert.ok(mac.every(tool => tool.annotations.readOnlyHint === false && tool.annotations.destructiveHint === true));
+  assert.equal(mac.length, 15);
+  assert.deepEqual(mac.map(tool => tool.name).filter(name => name.endsWith('_bundle')).sort(),
+    [...bundleTools, 'outlook_delta_bundle'].sort());
+  assert.ok(mac.some(tool => tool.name === 'outlook_conversation'));
+  // Clients auto-approve read-only tools; private cache upkeep must not make mail reads prompt.
+  for (const tool of [...windows, ...mac]) {
+    assert.equal(tool.annotations.readOnlyHint, true, `${tool.name} must be annotated read-only`);
+    assert.equal(tool.annotations.destructiveHint, false, `${tool.name} must not be annotated destructive`);
+  }
   const linux = await listAnnotations('linux');
   assert.equal(linux.length, 9);
 });
@@ -138,9 +145,8 @@ test('RPC and official MCP HTTP client share validated read-only backend', async
   t.after(() => client.close());
   await client.connect(new StreamableHTTPClientTransport(new URL(base + '/mcp'), { requestInit: { headers } }));
   const list = await client.listTools();
-  assert.equal(list.tools.length, process.platform === 'darwin' ? 12 : 9);
-  const cacheWrites = process.platform !== 'win32';
-  assert.ok(list.tools.every(tool => tool.annotations.readOnlyHint === !cacheWrites && tool.annotations.destructiveHint === cacheWrites));
+  assert.deepEqual(list.tools.map(tool => tool.name).sort(), toolNamesForPlatform().sort());
+  assert.ok(list.tools.every(tool => tool.annotations.readOnlyHint === true && tool.annotations.destructiveHint === false));
   const result = await client.callTool({ name: 'outlook_health', arguments: {} });
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.connected, true);
@@ -173,4 +179,30 @@ test('RPC and official MCP HTTP client share validated read-only backend', async
     assert.equal(calls.at(-1).method, 'read');
     assert.equal(calls.at(-1).params.id, 'first_id');
   }
+});
+
+test('MCP workflow tools return attachment text and reach the local workflows', async t => {
+  const text = Buffer.from('预算已批准');
+  const sha256 = (await import('node:crypto')).createHash('sha256').update(text).digest('hex');
+  const call = async (method, input) => {
+    const context = { backend: 'mac-cache', snapshot: 's', data_scope: 'cached_only' };
+    if (method === 'attachments') return { ...context, attachments: [{ index: 1, filename: 'note.txt', size_bytes: text.length, type: 1 }] };
+    if (method === 'read_attachment') return { ...context, filename: 'note.txt', offset: 0, chunk_size: text.length,
+      encoding: 'base64', size_bytes: text.length, next_offset: null, sha256, data: text.toString('base64') };
+    throw new Error(`unexpected ${method} ${JSON.stringify(input)}`);
+  };
+  const state = { port: 1, token: 't', pid: 1, startedAt: 'now' };
+  const server = createMcp(call, { platform: 'darwin', workflows: { call, readState: async () => state, stateDir: os.tmpdir() } });
+  const client = new Client({ name: 'workflow-test', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  t.after(async () => { await client.close(); await server.close(); });
+  const id = 'abcdefgh12345678';
+  const extracted = await client.callTool({ name: 'outlook_attachment_text', arguments: { id, index: 1 } });
+  assert.equal(extracted.isError, undefined, JSON.stringify(extracted.content));
+  assert.equal(extracted.structuredContent.text, '预算已批准');
+  const delta = await client.callTool({ name: 'outlook_delta_bundle', arguments: { folder: 'not-a-folder-id' } });
+  assert.equal(delta.isError, true);
+  assert.equal(JSON.parse(delta.content[0].text).error.code, 'INVALID_ARGUMENT');
 });
