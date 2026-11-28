@@ -107,8 +107,10 @@ test('sync indexes only verified body text, pages within the requested scope, an
     assert.equal(entry.args.mode, 'metadata');
   }
   const index = path.join(f.stateDir, 'index.json');
-  assert.equal((await stat(index)).mode & 0o777, 0o600);
-  assert.equal((await stat(f.stateDir)).mode & 0o777, 0o700);
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(index)).mode & 0o777, 0o600);
+    assert.equal((await stat(f.stateDir)).mode & 0o777, 0o700);
+  }
   const raw = await readFile(index, 'utf8');
   assert.ok(!raw.includes('境外差旅'));
   assert.ok(!raw.includes('应急预案'));

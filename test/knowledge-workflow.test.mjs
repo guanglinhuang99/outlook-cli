@@ -246,7 +246,9 @@ test('index keeps cache provenance, literal lookups, explicit unknowns and check
   assert.equal(payload.records[0].content.text_sha256, sha(ATTACHMENT));
   assert.equal(payload.manifest.length, 2);
   assert.equal(exported.format, 'outlook-cache-derived-evidence-v1');
-  assert.equal((await stat(exported.path)).mode & 0o777, 0o600);
+  if (process.platform !== 'win32') {
+    assert.equal((await stat(exported.path)).mode & 0o777, 0o600);
+  }
   await assert.rejects(runKnowledgeWorkflow('export', args, options), { code: 'KNOWLEDGE_EXPORT_EXISTS' });
   assert.equal(sha(await readFile(exported.path)), exported.sha256);
 });
