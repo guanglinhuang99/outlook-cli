@@ -20,7 +20,7 @@ node bin/outlook.mjs mcp-config
 
 ## 2. Windows 新安装
 
-准备 Git、Node.js 22.16 或更高版本（可使用 Node.js 24）、随 Node 安装的 npm，以及 Windows PowerShell 5.1。先打开**经典 Outlook**，完成登录和邮件同步；服务与 Outlook 应使用相同用户、会话和权限级别。新版 Windows Outlook 不支持此 COM 接口。
+准备 Git、Node.js 24 或更高版本、随 Node 安装的 npm，以及 Windows PowerShell 5.1。先打开**经典 Outlook**，完成登录和邮件同步；服务与 Outlook 应使用相同用户、会话和权限级别。新版 Windows Outlook 不支持此 COM 接口。
 
 在 PowerShell 中逐步执行；任何一步失败，先处理错误再继续。下面的目标目录应尚不存在，已有项目使用第 6 节的更新方法。
 

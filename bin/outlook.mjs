@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { openRuntimeLog, prepareRuntime, runtimeDir, root, statePath, readState, request, call } from '../src/runtime.mjs';
 import { assertSafeMacPath } from '../src/mac-paths.mjs';
 import { validateCall, definitions, isMacWorkflow } from '../src/tools.mjs';
+import { nodeVersionError } from '../src/node-version.mjs';
 
 const print = value => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
 const inputLimit = 4 * 1024 * 1024 + 32768;
@@ -175,6 +176,8 @@ async function stop() {
 async function main() {
   const [command = 'help', ...args] = process.argv.slice(2);
   if (['help', '--help', '-h'].includes(command)) { process.stdout.write(help); return; }
+  const unsupportedNode = nodeVersionError();
+  if (unsupportedNode) throw unsupportedNode;
   if (command === 'clipboard') {
     if (args.length !== 1) throw new Error('Usage: outlook-local clipboard start|stop|status');
     const { clipboardCommand } = await import('../src/clipboard.mjs');
