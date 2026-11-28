@@ -65,6 +65,23 @@ test('downloads verified chunks with safe names and per-item failure details', a
   assert.deepEqual(backend.calls.filter(call => call.input.index === 1).map(call => call.input.byte_offset), [0, 1024 * 1024]);
 });
 
+test('falls back to exclusive copies where the output volume refuses hard links', async t => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'outlook-attachments-nolink-'));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(path.join(directory, 'report.txt'), 'leave intact');
+  let linkAttempts = 0;
+  const backend = fakeBackend([fixture('report.txt', 'first'), fixture('notes.txt', 'second')], {
+    linkFile: async () => { linkAttempts += 1; throw Object.assign(new Error('not permitted'), { code: 'EPERM' }); }
+  });
+  const result = await downloadAllAttachments({ id, out_dir: directory }, backend);
+  assert.equal(result.complete, true);
+  assert.equal(linkAttempts, 1, 'hard links are tried once per batch, then copies are used');
+  assert.deepEqual(result.downloaded.map(item => path.basename(item.path)), ['report-2.txt', 'notes.txt']);
+  assert.equal(await readFile(path.join(directory, 'report.txt'), 'utf8'), 'leave intact');
+  assert.equal(await readFile(path.join(directory, 'report-2.txt'), 'utf8'), 'first');
+  assert.deepEqual((await readdir(directory)).sort(), ['notes.txt', 'report-2.txt', 'report.txt']);
+});
+
 test('state changes and malformed chunks never publish an output file', async t => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'outlook-attachments-'));
   t.after(() => rm(directory, { recursive: true, force: true }));

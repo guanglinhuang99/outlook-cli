@@ -2,7 +2,7 @@
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { definitionsForPlatform } from '../src/tools.mjs';
+import { toolNamesForPlatform } from '../src/mcp.mjs';
 
 const configPath = process.argv[2];
 let child;
@@ -59,14 +59,13 @@ try {
   if (!initialized?.capabilities?.tools || !initialized.protocolVersion) throw new Error('MCP initialization did not advertise tools.');
   send({ method: 'notifications/initialized' });
   const list = await request('tools/list');
-  const expected = definitionsForPlatform().map(([name]) => `outlook_${name}`);
-  const cacheWrites = process.platform !== 'win32';
+  const expected = toolNamesForPlatform();
   if (list.tools?.length !== expected.length || !expected.every(name => list.tools.some(tool => (
     tool.name === name
-      && tool.annotations?.readOnlyHint === !cacheWrites
-      && tool.annotations?.destructiveHint === cacheWrites
+      && tool.annotations?.readOnlyHint === true
+      && tool.annotations?.destructiveHint === false
   )))) {
-    throw new Error('MCP tools/list does not match the expected platform-aware Outlook annotations.');
+    throw new Error('MCP tools/list does not match the expected read-only Outlook tools for this platform.');
   }
   const report = { mcp: 'ready', transport: 'stdio', protocol: initialized.protocolVersion, tools: list.tools.map(tool => tool.name) };
   if (process.argv.includes('--health')) {

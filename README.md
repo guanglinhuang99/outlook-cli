@@ -2,7 +2,7 @@
 
 让本机 Agent 通过统一的 **CLI 和 MCP** 读取 Windows、macOS 上的 Outlook 邮件。支持邮件检索、中文正文读取、附件下载，以及按日期查询。
 
-**本地读取服务只读。** Outlook 负责登录和同步。本地附件与语义检索在本机处理。已读标记、移动、草稿与发送由单独授权的 `graph` 命令访问 Microsoft Graph。[Apple Mail 迁移对照和配置](docs/applemail-migration.md)
+**只读。** Outlook 负责登录和同步，本工具只读取本机已同步的邮件，不标记已读、不移动、不发送，也不连接任何云端邮件接口。本地附件与语义检索在本机处理。[Apple Mail 迁移对照和配置](docs/applemail-migration.md)
 
 > **v0.3.0** 支持 Windows 和 macOS。Windows 可下载安装包，macOS 从源码安装。
 
@@ -36,9 +36,10 @@ Codex / 其他 Agent / 命令行
 | 日期筛选 | 接收时间 `received_at` | 接收时间 `received_at`（验证后的 `LastDeliveryTime`） |
 | 正文 | 分页文本读取，视后端支持 HTML | 中文文本提取与分页，缺失状态明确返回 |
 | 搜索 | 主题、发件人，可选正文 | 主题、发件人，可选本地完整正文 |
+| 跨目录与批量读取 | 按文件夹读取当前邮件，支持收件箱和已发送一起查 | 从本机缓存快照查询和批量读取 |
 | 附件 | 普通文件附件，单个最大 10 MiB | 可可靠关联的缓存附件，单个最大 10 MiB |
 
-共享工具每次查询一个文件夹。读取所有子目录需要逐级遍历，不能把一次 `today` 或 `search` 的结果当成全部邮箱。Linux 可运行协议和合成缓存测试，暂不提供实际邮箱后端。
+`today` 和 `search` 每次查询一个文件夹。需要同时查看子目录时，可使用跨目录批量命令。Linux 可运行协议和合成缓存测试，暂不提供实际邮箱后端。
 
 ## 安装
 
@@ -78,11 +79,11 @@ node bin/outlook.mjs start
 3. 安装器会准备专用 Node.js、依赖和 OST/PST 解析器，并生成启动入口和 MCP 配置。
 4. 在安装目录运行 `outlook.cmd health` 检查后端，双击 `Setup-MCP.cmd` 查看接入说明，`Test-MCP.cmd` 验证连接。
 
-v0.3.0 安装包提供 `today` 命令和 9 个 MCP 工具。安装需要联网获取锁定的 npm 依赖，详见 [Windows 安装说明](INSTALL-WINDOWS.md)。
+安装包提供 `today` 命令和 13 个 MCP 工具。安装需要联网获取锁定的 npm 依赖，详见 [Windows 安装说明](INSTALL-WINDOWS.md)。
 
 ### Windows：从源码安装
 
-准备：Git、Node.js **22.13+（推荐 24 LTS）**、Windows PowerShell **5.1**，以及已配置的经典 Outlook 或支持的本地 OST/PST 文件。
+准备：Git、Node.js **24+**、Windows PowerShell **5.1**，以及已配置的经典 Outlook 或支持的本地 OST/PST 文件。
 
 ```powershell
 git clone --branch main https://github.com/guanglinhuang99/outlook-cli.git
@@ -135,7 +136,7 @@ node bin/outlook.mjs read --id '<message_id>' --body-offset 20000 --max-chars 20
 
 将示例占位符替换成响应中的真实 ID。检索结果的 `next_offset` 非空时，保持原筛选条件并用 `--offset` 继续；空白页不代表检索结束。Mac 的未读筛选仅匹配本地已验证的状态。正文搜索需显式设置 `--search-body true`，并按 `fulltext.pending` / `body_search_incomplete` 处理索引状态。Mac 的正文以文本返回。
 
-### 跨目录检索和批量读取（macOS）
+### 跨目录检索和批量读取
 
 ```sh
 node bin/outlook.mjs context-bundle --folder all --query '预算' --mode metadata
@@ -143,7 +144,7 @@ node bin/outlook.mjs messages-bundle --id '<message_id_1>' --id '<message_id_2>'
 node bin/outlook.mjs today-bundle --folder inbox --mode context --limit 10
 ```
 
-`context-bundle` 默认只读元数据。`today-bundle` 默认返回有预算限制的正文。`messages-bundle` 接受同一查询快照中的最多 25 个邮件 ID。跨目录日期筛选和翻页仍按 `received_at` 与 `Asia/Singapore`。详细参数及覆盖状态见 [macOS 批量工作流](docs/macos.md#跨目录查询与批量读取)。
+`context-bundle` 默认只读元数据。`today-bundle` 默认返回有预算限制的正文。`messages-bundle` 接受最多 25 个邮件 ID。macOS 批量读取使用同一缓存快照中的 ID。Windows 的 `all` 查询默认存储的收件箱和已发送及其子目录，翻页时以当时的文件夹内容为准。日期筛选按新加坡时区的接收时间。继续翻页时传回 `next_cursor` 并保留筛选条件。[详细用法](docs/usage-reference.md#跨目录查询与批量读取)
 
 ### 读取收件箱、已发送下的全部子目录
 
@@ -158,7 +159,7 @@ node bin/outlook.mjs messages --folder '<folder_id>' --limit 25
 
 搜索支持关键词 `query` 和相关人员 `person`，至少填一个；同时填写时两个条件都必须满足。`person_role` 可选 `any`（默认）、`sender`（发件人）、`to`（收件人）、`cc`（抄送人），按姓名或邮箱做大小写不敏感的字面子串匹配，返回 `matched_person_roles`。人员不会从正文中猜测。查看每页的 `person_search_incomplete`：本地未保存收件人等证据时，未命中不等于该人员没有相关邮件。
 
-Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa 日志中被脱敏的 To/Cc，并校验邮件和角色归属。`participants_status` 和 `participants_evidence` 区分本地验证通过、部分结果及冲突；未缓存或未知格式仍可能缺失。升级后重新连接 MCP 并刷新索引即可生效，无需 Graph 或 Outlook 网络 API，原始邮件始终只读。
+Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa 日志中被脱敏的 To/Cc，并校验邮件和角色归属。`participants_status` 和 `participants_evidence` 区分本地验证通过、部分结果及冲突；未缓存或未知格式仍可能缺失。升级后重新连接 MCP 并刷新索引即可生效，无需任何云端邮件接口，原始邮件始终只读。
 
 搜索性能：Mac 在常驻进程中复用已验证索引，仅复制返回页；用 Python 标准库 SQLite 持久保存 Osa 日志的解析元数据，重启后也可复用未变化的日志，仍检查完整日志清单和接收时间，正文按需读取。无需额外安装数据库服务，SQLite 文件位于程序自己的私有状态目录。Windows COM 搜索复用已经读取的发件人信息，单封读取复用附件集合；离线 OST/PST 搜索复用同一次读取的结果。两端均保留接收时间筛选及原始邮件只读行为。实际耗时取决于邮箱规模和后端，Mac 的测量不能代表 Windows 性能。
 
@@ -168,7 +169,7 @@ Windows COM 正文搜索默认使用自动策略（`--com-body-mode auto`，也�
 
 显式 `--com-body-mode direct` 每次直接扫描，不访问数据库；`--com-body-mode indexed` 首次立即建索引。CLI/MCP JSON 对应 `com_body_mode: "auto" | "direct" | "indexed"`。三种策略均保留摘要、人员筛选、分页、不完整状态及返回前的版本、位置、下载状态校验；`indexed=0` 不表示搜索未完成。
 
-`com_body_mode` 只作用于 Windows COM，其他后端忽略它。离线 OST/PST 保持原有索引方式，文件未变化时复用；目前解析器没有可靠的逐邮件变更标识，文件变化后会保守重校验本次候选正文，避免漏掉刚补下载的内容。Windows 索引模式使用 Node 内置 SQLite，无需另装数据库或 Python；源码运行全文搜索需 Node 22.13+，Windows 安装器附带的 Node 24 已满足要求。
+`com_body_mode` 只作用于 Windows COM，其他后端忽略它。离线 OST/PST 保持原有索引方式，文件未变化时复用；目前解析器没有可靠的逐邮件变更标识，文件变化后会保守重校验本次候选正文，避免漏掉刚补下载的内容。Windows 索引模式使用 Node 内置 SQLite，无需另装数据库或 Python；Windows 源码运行需 Node 24+，Windows 安装器附带的 Node 24 已满足要求。
 
 索引数据库上限 512 MiB。Windows 每次扫描最多 50 个候选项目，只允许收件箱、已发送及其子目录，排除已删除；共享接口每次查询一个文件夹，子目录需逐级遍历。首次正文读取受时间及大小预算限制：`retry_required=true` 时保持**本页原参数**重试；完成后才按 `next_offset` 翻页。检查 `fulltext` 与 `body_search_incomplete`，正文缺失、截断、格式不支持或索引错误均不能视作完整的无匹配结果。Mac 的 pending 重试与原生接口说明见下文。两平台均按接收时间筛选，不用发送时间作为增量水位；结果不代表服务器上的完整邮箱。
 ```sh
@@ -217,7 +218,7 @@ node bin/outlook.mjs restart
 node bin/outlook.mjs stop
 ```
 
-`status` 检查服务是否在线，`health` 检查邮箱后端是否可用。机器重启或注销后需重新启动；Windows 安装器可选登录自启。
+`status` 检查服务是否在线，`health` 检查邮箱后端是否可用。机器重启或注销后无需手动启动：MCP 和查询命令发现服务未运行时会自动启动它；Windows 安装器也可选登录自启。
 
 ## 接入 Codex 和其他 Agent
 
@@ -272,9 +273,9 @@ codex mcp list
 | `outlook_read` | 读取邮件与分页正文 |
 | `outlook_attachments` | 列出附件 |
 | `outlook_read_attachment` | 分块读取附件内容 |
-| `outlook_context_bundle`（macOS） | 一次跨目录检索元数据，按需读取该页正文 |
-| `outlook_today_bundle`（macOS） | 一次列出并读取今天或指定日期的同一页邮件 |
-| `outlook_messages_bundle`（macOS） | 批量读取选中的邮件和可用正文 |
+| `outlook_context_bundle` | 一次跨目录检索元数据，按需读取该页正文 |
+| `outlook_today_bundle` | 一次列出并读取今天或指定日期的同一页邮件 |
+| `outlook_messages_bundle` | 批量读取选中的邮件和可用正文 |
 
 可向 Agent 提出这样的请求：
 

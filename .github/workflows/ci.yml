@@ -13,12 +13,17 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
+        # macOS/Linux also run Node 22; Windows requires Node 24 (src/node-version.mjs), the bundled runtime.
+        node: ['22.16', '24']
+        exclude:
+          - os: windows-latest
+            node: '22.16'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm test

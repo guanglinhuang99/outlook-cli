@@ -522,7 +522,7 @@ async function exportRecords(archive, params, { assertSafePath, readState, platf
   if (platform === 'darwin') {
     await assertSafePath(input);
     const state = await readState({ requireMacProtectedRoots: true }).catch(error => {
-      if (error.code === 'SERVICE_UNAVAILABLE') return null;
+      if (error.code === 'SERVICE_UNAVAILABLE' || error.code === 'SERVICE_NOT_RUNNING') return null;
       throw error;
     });
     protectedRoots = state?.protected_mail_roots ?? [];

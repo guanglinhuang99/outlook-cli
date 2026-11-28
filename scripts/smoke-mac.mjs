@@ -8,6 +8,7 @@ import path from 'node:path';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { call, readState, root, runtimeDir } from '../src/runtime.mjs';
+import { toolNamesForPlatform } from '../src/mcp.mjs';
 
 let stage = 'platform';
 async function run() {
@@ -165,7 +166,7 @@ async function run() {
     try {
       await client.connect(transport);
       const tools = await client.listTools();
-      assert.equal(tools.tools.length, 12);
+      assert.deepEqual(tools.tools.map(tool => tool.name).sort(), toolNamesForPlatform().sort());
       const mail = await client.callTool({ name: 'outlook_today', arguments: { ...selection, limit: 1 } });
       assert.equal(mail.isError, undefined);
       assert.equal(mail.structuredContent.date_basis, 'received_at');

@@ -3,7 +3,7 @@
   "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Outlook CLI with a read-only local service and optional Microsoft Graph workflows",
+  "description": "Read-only Outlook CLI and MCP service for local agents on Windows and macOS",
   "engines": { "node": ">=22" },
   "bin": { "outlook-local": "bin/outlook.mjs" },
   "scripts": {

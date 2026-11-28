@@ -169,12 +169,10 @@ test('platform construction and foreign IDs never cross native backends', async 
   await assert.rejects(unsupported.call('health'), { code: 'UNSUPPORTED_PLATFORM' });
 });
 
-test('workflow bundles route to the macOS worker and never invoke Windows readers', async () => {
+test('workflow bundles still route to the macOS worker', async () => {
   const calls = [];
   const mac = stub(async (method, params) => { calls.push({ method, params }); return { backend: 'mac-cache' }; });
-  const forbidden = stub(async () => { assert.fail('bundle must not invoke a Windows reader'); });
   const macRouter = new BackendRouter({ platform: 'darwin', mac });
-  const winRouter = new BackendRouter({ platform: 'win32', com: forbidden, local: forbidden });
   const operations = [
     ['context_bundle', { folder: 'all' }],
     ['today_bundle', { date: '2026-11-25' }],
@@ -184,9 +182,6 @@ test('workflow bundles route to the macOS worker and never invoke Windows reader
     const result = await macRouter.call(method, { ...params, backend: 'local' });
     assert.equal(result.backend, 'mac-cache');
     assert.deepEqual(calls.at(-1), { method, params });
-    for (const backend of ['auto', 'local', 'com']) {
-      await assert.rejects(winRouter.call(method, { ...params, backend }), { code: 'UNSUPPORTED_PLATFORM' });
-    }
   }
 });
 

@@ -54,18 +54,12 @@ class McpServerTests(unittest.TestCase):
         self.assertEqual(actual, expected)
         for tool in mcp_server.TOOL_SCHEMAS:
             self.assertFalse(tool["inputSchema"]["additionalProperties"])
-            if tool["name"] == "outlook_local_status":
-                self.assertEqual(tool["annotations"], {
-                    "readOnlyHint": True,
-                    "destructiveHint": False,
-                    "openWorldHint": False,
-                })
-            else:
-                self.assertEqual(tool["annotations"], {
-                    "readOnlyHint": False,
-                    "destructiveHint": True,
-                    "openWorldHint": False,
-                })
+            self.assertEqual(tool["annotations"], {
+                "readOnlyHint": True,
+                "destructiveHint": False,
+                "openWorldHint": False,
+            })
+            if tool["name"] != "outlook_local_status":
                 self.assertIn("original Outlook mailbox is never modified", tool["description"])
         self.assertNotIn("output", str(mcp_server.TOOL_SCHEMAS))
 

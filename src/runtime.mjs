@@ -384,9 +384,12 @@ export async function readState({ target = statePath, requireMacProtectedRoots =
     }
     return validateState(await readStateFile(target), requireMacProtectedRoots);
   } catch (cause) {
-    const restartRequired = cause?.code === 'SERVICE_RESTART_REQUIRED';
-    throw Object.assign(new Error(restartRequired ? cause.message : 'Service state unavailable. Run: outlook-local start', { cause }), {
-      code: restartRequired ? cause.code : 'SERVICE_UNAVAILABLE'
+    if (cause?.code === 'SERVICE_RESTART_REQUIRED') throw cause;
+    if (cause?.code === 'ENOENT') {
+      throw Object.assign(new Error('Local service is not running. Run: outlook-local start', { cause }), { code: 'SERVICE_NOT_RUNNING' });
+    }
+    throw Object.assign(new Error(`Service state is invalid or untrusted (${cause?.message ?? 'unknown'}). Run: outlook-local restart`, { cause }), {
+      code: 'SERVICE_UNAVAILABLE'
     });
   }
 }
@@ -401,7 +404,10 @@ export async function request(endpoint, body, { timeoutMs = process.platform ===
       signal: AbortSignal.timeout(timeoutMs)
     });
   } catch (cause) {
-    throw Object.assign(new Error('Local service is unavailable or timed out. Run: outlook-local start', { cause }), { code: 'SERVICE_UNAVAILABLE' });
+    if (cause?.name === 'TimeoutError') {
+      throw Object.assign(new Error(`Local service did not answer within ${Math.round(timeoutMs / 1000)} s. It is still running and may be busy (for example building a first index); retry later instead of restarting.`, { cause }), { code: 'SERVICE_TIMEOUT' });
+    }
+    throw Object.assign(new Error('Local service is not running. Run: outlook-local start', { cause }), { code: 'SERVICE_NOT_RUNNING' });
   }
   const data = await response.json();
   if (!response.ok || data.error) throw Object.assign(new Error(data.error?.message ?? `HTTP ${response.status}`), { code: data.error?.code ?? 'HTTP_ERROR' });

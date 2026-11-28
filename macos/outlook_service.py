@@ -532,7 +532,9 @@ class MailService:
                 files.append((path, path.stat()))
         if count > MAX_EXPORT_FILES or size > MAX_EXPORT_BYTES:
             raise ValueError("attachment cache quota exhausted by active exports; retry later")
-        files.sort(key=lambda row: (row[0] == protected, row[1].st_mtime_ns), reverse=True)
+        # Coarse filesystem timestamps can tie; this process's export order breaks ties toward newer files.
+        recency = {Path(value["output"]): rank for rank, value in enumerate(self._attachment_exports.values())}
+        files.sort(key=lambda row: (row[0] == protected, row[1].st_mtime_ns, recency.get(row[0], -1)), reverse=True)
         for path, metadata in files:
             if count < MAX_EXPORT_FILES and size + metadata.st_size <= MAX_EXPORT_BYTES:
                 count += 1

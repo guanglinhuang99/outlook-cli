@@ -16,6 +16,8 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Mapping, TextIO
 
+from python_version import unsupported_message
+
 
 SUPPORTED_PROTOCOL_VERSIONS = (
     "2024-11-05",
@@ -73,9 +75,10 @@ def _integer(description: str, minimum: int, maximum: int, *, default: int | Non
 
 
 def _tool(name: str, description: str, properties: Mapping[str, dict[str, Any]],
-          required: tuple[str, ...] = (), *, read_only_hint: bool = True,
-          destructive_hint: bool = False) -> dict[str, Any]:
-    if not read_only_hint:
+          required: tuple[str, ...] = (), *, local_cache: bool = False) -> dict[str, Any]:
+    # Private cache upkeep is not a change to the user's mailbox or files, so every tool is
+    # annotated read-only; clients can then run mail reads without a confirmation prompt.
+    if local_cache:
         description += _LOCAL_CACHE_NOTE
     return {
         "name": name,
@@ -87,8 +90,8 @@ def _tool(name: str, description: str, properties: Mapping[str, dict[str, Any]],
             "additionalProperties": False,
         },
         "annotations": {
-            "readOnlyHint": read_only_hint,
-            "destructiveHint": destructive_hint,
+            "readOnlyHint": True,
+            "destructiveHint": False,
             "openWorldHint": False,
         },
     }
@@ -131,8 +134,7 @@ TOOL_SCHEMAS = (
         "outlook_local_folders",
         "List Inbox and all descendants, Sent Items and its known descendants present in the local snapshot; Deleted is excluded. Cache may be incomplete.",
         {},
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_refresh",
@@ -143,15 +145,13 @@ TOOL_SCHEMAS = (
                 max_length=MAX_DATE_LENGTH,
             )
         },
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_search",
         "Search messages only in Inbox and all descendants, Sent Items and its known descendants; Deleted is excluded. Cache may be incomplete; date filters use the received date in Asia/Singapore and to_date is inclusive.",
         _SEARCH_PROPERTIES,
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_today",
@@ -162,8 +162,7 @@ TOOL_SCHEMAS = (
             "limit": _integer("Maximum results per page.", 1, 100, default=100),
             "cursor": _string("Cursor returned by outlook_local_today.", max_length=MAX_CURSOR_LENGTH),
         },
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_read",
@@ -174,8 +173,7 @@ TOOL_SCHEMAS = (
             "body_max_chars": _integer("Maximum returned body characters.", 1, 100_000, default=20_000),
         },
         required=("id",),
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_digest",
@@ -201,8 +199,7 @@ TOOL_SCHEMAS = (
                 "minItems": 0, "maxItems": 5000,
             },
         },
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_messages_bundle",
@@ -220,8 +217,7 @@ TOOL_SCHEMAS = (
             "text_budget_chars": _integer("Maximum combined text characters.", 1_000, 200_000, default=60_000),
         },
         required=("ids",),
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_attachments",
@@ -231,8 +227,7 @@ TOOL_SCHEMAS = (
             "snapshot": _string("Optional snapshot identifier for a stable read.", max_length=MAX_SNAPSHOT_LENGTH),
         },
         required=("id",),
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
     _tool(
         "outlook_local_attachment",
@@ -243,8 +238,7 @@ TOOL_SCHEMAS = (
             "snapshot": _string("Optional snapshot identifier for a stable read.", max_length=MAX_SNAPSHOT_LENGTH),
         },
         required=("id", "attachment_id"),
-        read_only_hint=False,
-        destructive_hint=True,
+        local_cache=True,
     ),
 )
 
@@ -573,6 +567,10 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
     parser.add_argument("--from-date", default=DEFAULT_FROM_DATE)
     parser.add_argument("--refresh-seconds", type=_nonnegative_int, default=DEFAULT_REFRESH_SECONDS)
     args = parser.parse_args(argv)
+    too_old = unsupported_message()
+    if too_old:
+        print(f"outlook-local MCP: {too_old}", file=sys.stderr if stderr is None else stderr)
+        return 1
     if service is None and service_factory is None:
         service_factory = _service_factory(args.state, args.profile, args.from_date, args.refresh_seconds)
     return run_stdio(

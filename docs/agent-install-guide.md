@@ -2,7 +2,7 @@
 
 本文对应 Outlook CLI v0.3.0。Windows 可以使用 [发布安装包](https://github.com/guanglinhuang99/outlook-cli/releases/tag/v0.3.0)，安装及验收步骤见 [Windows 安装说明](../INSTALL-WINDOWS.md)。下面的步骤适用于从源码安装。
 
-该项目让**运行在邮箱所在电脑上的 Agent** 通过 CLI 或 MCP 只读访问 Outlook。邮箱登录和同步由本机 Outlook 完成，服务在本机创建索引和附件导出文件。可选的 `graph` CLI 使用单独的 Microsoft Graph 授权。[Graph 配置和命令](applemail-migration.md#microsoft-graph-授权与写操作)
+该项目让**运行在邮箱所在电脑上的 Agent** 通过 CLI 或 MCP 只读访问 Outlook。邮箱登录和同步由本机 Outlook 完成，服务在本机创建索引和附件导出文件，不连接任何云端邮件接口。
 
 ## 1. 先检查是否已经安装
 
@@ -20,7 +20,7 @@ node bin/outlook.mjs mcp-config
 
 ## 2. Windows 新安装
 
-准备 Git、Node.js 22.13 或更高版本（可使用 Node.js 24）、随 Node 安装的 npm，以及 Windows PowerShell 5.1。先打开**经典 Outlook**，完成登录和邮件同步；服务与 Outlook 应使用相同用户、会话和权限级别。新版 Windows Outlook 不支持此 COM 接口。
+准备 Git、Node.js 24 或更高版本、随 Node 安装的 npm，以及 Windows PowerShell 5.1。先打开**经典 Outlook**，完成登录和邮件同步；服务与 Outlook 应使用相同用户、会话和权限级别。新版 Windows Outlook 不支持此 COM 接口。
 
 在 PowerShell 中逐步执行；任何一步失败，先处理错误再继续。下面的目标目录应尚不存在，已有项目使用第 6 节的更新方法。
 
@@ -53,7 +53,7 @@ node bin/outlook.mjs health --backend local
 
 ## 3. macOS 新安装
 
-准备 Git、Node.js 22.13 或更高版本、npm、Python 3.11 或更高版本，以及已经登录并同步的 Outlook。Python 读取器使用标准库，无需 pip 依赖。
+准备 Git、Node.js 22 或更高版本、npm、Python 3.11 或更高版本，以及已经登录并同步的 Outlook。Python 读取器使用标准库，无需 pip 依赖。
 
 ```sh
 git clone --branch main --single-branch https://github.com/guanglinhuang99/outlook-cli.git "$HOME/outlook-cli"
@@ -82,7 +82,7 @@ node scripts/check-mcp.mjs mcp-config.local.json --health
 
 第二条命令生成 UTF-8 配置，避免 Windows PowerShell 5.1 普通重定向产生 UTF-16 文件。该文件已被 Git 忽略，不含访问令牌；不要手写或复制别台电脑的绝对路径。
 
-校验成功应显示 `mcp: "ready"`、`transport: "stdio"`、实际邮箱后端和相应的工具列表。Windows 有 9 个通用 `outlook_*` 工具，macOS 另有 3 个批量工具。协议和邮箱后端都连通时才算安装验收通过。
+校验成功应显示 `mcp: "ready"`、`transport: "stdio"`、实际邮箱后端和相应的工具列表。两个平台共有 13 个通用 `outlook_*` 工具，macOS 另有邮件往来和增量 2 个工具。协议和邮箱后端都连通时才算安装验收通过。
 
 ### 添加到客户端
 
@@ -136,12 +136,14 @@ node bin/outlook.mjs health
 node scripts/check-mcp.mjs mcp-config.local.json --health
 ```
 
-Windows 可将 `npm` 换成 `npm.cmd`。移动项目目录或更换 Node 路径后，重新生成 MCP 配置并更新客户端。机器重启或注销后需要执行 `node bin/outlook.mjs start`，本源码流程没有设置登录自启。
+Windows 可将 `npm` 换成 `npm.cmd`。移动项目目录或更换 Node 路径后，重新生成 MCP 配置并更新客户端。机器重启或注销后无需手动启动：MCP 和 CLI 在服务未运行时会自动启动它。
 
 | 现象 | 处理 |
 |---|---|
 | 找不到 node / npm | 安装带 npm 的受支持 Node，重开终端；Agent 自带 Node 不一定自带 npm。 |
-| `SERVICE_UNAVAILABLE` | 在正确项目及状态目录下启动服务；用 `status` 和 `health` 分别检查。 |
+| `SERVICE_NOT_RUNNING` | 服务未运行。MCP 和查询命令会自动启动；仍出现时查看状态目录下的 `service.log`。 |
+| `SERVICE_TIMEOUT` | 服务仍在运行但这次没有及时返回，例如首次建索引；稍后重试，不要重启。 |
+| `SERVICE_UNAVAILABLE` | 状态文件损坏或不可信；运行 `restart`，并确认使用正确的项目及状态目录。 |
 | COM 无法连接 | 打开经典 Outlook，检查登录同步、用户、会话和权限级别；不要依赖新版 Outlook。 |
 | `local` 后端缺失 | 若需要本地模式，运行 setup-reader，检查受支持的 OST/PST 和配置。 |
 | MCP 找不到命令或服务 | 使用本机生成的绝对路径；核对 command、两个 args 和状态目录；重新连接客户端。 |
