@@ -6,7 +6,7 @@ import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
 const root = fileURLToPath(new URL('..', import.meta.url));
-const self = path.relative(root, fileURLToPath(import.meta.url));
+const self = path.relative(root, fileURLToPath(import.meta.url)).split(path.sep).join('/');
 
 // The product reads only mail Outlook already synchronized to this computer; the owner
 // cannot use Microsoft Graph, so no Graph command, client, credential or doc may return.

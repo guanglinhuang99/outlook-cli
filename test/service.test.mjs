@@ -29,7 +29,8 @@ test('installed MCP checker accepts the real platform-aware annotations', async 
   assert.deepEqual(report.tools.sort(), toolNamesForPlatform().sort());
   assert.equal(report.tools.length, process.platform === 'darwin' ? 15 : process.platform === 'win32' ? 10 : 9);
   assert.ok(report.tools.includes('outlook_today'));
-  assert.deepEqual(report.tools.filter(name => name.endsWith('_bundle')).sort(), process.platform === 'darwin' ? bundleTools : []);
+  assert.deepEqual(report.tools.filter(name => name.endsWith('_bundle')).sort(),
+    process.platform === 'darwin' ? [...bundleTools, 'outlook_delta_bundle'].sort() : []);
 });
 
 test('shared MCP annotations reflect the backend platform', async t => {
