@@ -36,9 +36,10 @@ Codex / 其他 Agent / 命令行
 | 日期筛选 | 接收时间 `received_at` | 接收时间 `received_at`（验证后的 `LastDeliveryTime`） |
 | 正文 | 分页文本读取，视后端支持 HTML | 中文文本提取与分页，缺失状态明确返回 |
 | 搜索 | 主题、发件人，可选正文 | 主题、发件人，可选本地完整正文 |
+| 跨目录与批量读取 | 按文件夹读取当前邮件，支持收件箱和已发送一起查 | 从本机缓存快照查询和批量读取 |
 | 附件 | 普通文件附件，单个最大 10 MiB | 可可靠关联的缓存附件，单个最大 10 MiB |
 
-共享工具每次查询一个文件夹。读取所有子目录需要逐级遍历，不能把一次 `today` 或 `search` 的结果当成全部邮箱。Linux 可运行协议和合成缓存测试，暂不提供实际邮箱后端。
+`today` 和 `search` 每次查询一个文件夹。需要同时查看子目录时，可使用跨目录批量命令。Linux 可运行协议和合成缓存测试，暂不提供实际邮箱后端。
 
 ## 安装
 
@@ -78,7 +79,7 @@ node bin/outlook.mjs start
 3. 安装器会准备专用 Node.js、依赖和 OST/PST 解析器，并生成启动入口和 MCP 配置。
 4. 在安装目录运行 `outlook.cmd health` 检查后端，双击 `Setup-MCP.cmd` 查看接入说明，`Test-MCP.cmd` 验证连接。
 
-安装包提供 `today` 命令和 10 个 MCP 工具。安装需要联网获取锁定的 npm 依赖，详见 [Windows 安装说明](INSTALL-WINDOWS.md)。
+安装包提供 `today` 命令和 13 个 MCP 工具。安装需要联网获取锁定的 npm 依赖，详见 [Windows 安装说明](INSTALL-WINDOWS.md)。
 
 ### Windows：从源码安装
 
@@ -135,7 +136,7 @@ node bin/outlook.mjs read --id '<message_id>' --body-offset 20000 --max-chars 20
 
 将示例占位符替换成响应中的真实 ID。检索结果的 `next_offset` 非空时，保持原筛选条件并用 `--offset` 继续；空白页不代表检索结束。Mac 的未读筛选仅匹配本地已验证的状态。正文搜索需显式设置 `--search-body true`，并按 `fulltext.pending` / `body_search_incomplete` 处理索引状态。Mac 的正文以文本返回。
 
-### 跨目录检索和批量读取（macOS）
+### 跨目录检索和批量读取
 
 ```sh
 node bin/outlook.mjs context-bundle --folder all --query '预算' --mode metadata
@@ -143,7 +144,7 @@ node bin/outlook.mjs messages-bundle --id '<message_id_1>' --id '<message_id_2>'
 node bin/outlook.mjs today-bundle --folder inbox --mode context --limit 10
 ```
 
-`context-bundle` 默认只读元数据。`today-bundle` 默认返回有预算限制的正文。`messages-bundle` 接受同一查询快照中的最多 25 个邮件 ID。跨目录日期筛选和翻页仍按 `received_at` 与 `Asia/Singapore`。详细参数及覆盖状态见 [macOS 批量工作流](docs/macos.md#跨目录查询与批量读取)。
+`context-bundle` 默认只读元数据。`today-bundle` 默认返回有预算限制的正文。`messages-bundle` 接受最多 25 个邮件 ID。macOS 批量读取使用同一缓存快照中的 ID。Windows 的 `all` 查询默认存储的收件箱和已发送及其子目录，翻页时以当时的文件夹内容为准。日期筛选按新加坡时区的接收时间。继续翻页时传回 `next_cursor` 并保留筛选条件。[详细用法](docs/usage-reference.md#跨目录查询与批量读取)
 
 ### 读取收件箱、已发送下的全部子目录
 
@@ -272,9 +273,9 @@ codex mcp list
 | `outlook_read` | 读取邮件与分页正文 |
 | `outlook_attachments` | 列出附件 |
 | `outlook_read_attachment` | 分块读取附件内容 |
-| `outlook_context_bundle`（macOS） | 一次跨目录检索元数据，按需读取该页正文 |
-| `outlook_today_bundle`（macOS） | 一次列出并读取今天或指定日期的同一页邮件 |
-| `outlook_messages_bundle`（macOS） | 批量读取选中的邮件和可用正文 |
+| `outlook_context_bundle` | 一次跨目录检索元数据，按需读取该页正文 |
+| `outlook_today_bundle` | 一次列出并读取今天或指定日期的同一页邮件 |
+| `outlook_messages_bundle` | 批量读取选中的邮件和可用正文 |
 
 可向 Agent 提出这样的请求：
 

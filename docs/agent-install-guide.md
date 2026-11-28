@@ -82,7 +82,7 @@ node scripts/check-mcp.mjs mcp-config.local.json --health
 
 第二条命令生成 UTF-8 配置，避免 Windows PowerShell 5.1 普通重定向产生 UTF-16 文件。该文件已被 Git 忽略，不含访问令牌；不要手写或复制别台电脑的绝对路径。
 
-校验成功应显示 `mcp: "ready"`、`transport: "stdio"`、实际邮箱后端和相应的工具列表。两个平台共有 10 个通用 `outlook_*` 工具，macOS 另有跨目录、批量、邮件往来和增量 5 个工具。协议和邮箱后端都连通时才算安装验收通过。
+校验成功应显示 `mcp: "ready"`、`transport: "stdio"`、实际邮箱后端和相应的工具列表。两个平台共有 13 个通用 `outlook_*` 工具，macOS 另有邮件往来和增量 2 个工具。协议和邮箱后端都连通时才算安装验收通过。
 
 ### 添加到客户端
 

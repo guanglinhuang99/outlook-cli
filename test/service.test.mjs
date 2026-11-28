@@ -27,10 +27,10 @@ test('installed MCP checker accepts the real platform-aware annotations', async 
   const report = JSON.parse(result.stdout);
   assert.equal(report.mcp, 'ready');
   assert.deepEqual(report.tools.sort(), toolNamesForPlatform().sort());
-  assert.equal(report.tools.length, process.platform === 'darwin' ? 15 : process.platform === 'win32' ? 10 : 9);
+  assert.equal(report.tools.length, process.platform === 'darwin' ? 15 : process.platform === 'win32' ? 13 : 9);
   assert.ok(report.tools.includes('outlook_today'));
   assert.deepEqual(report.tools.filter(name => name.endsWith('_bundle')).sort(),
-    process.platform === 'darwin' ? [...bundleTools, 'outlook_delta_bundle'].sort() : []);
+    process.platform === 'darwin' ? [...bundleTools, 'outlook_delta_bundle'].sort() : process.platform === 'win32' ? bundleTools : []);
 });
 
 test('shared MCP annotations reflect the backend platform', async t => {
@@ -48,7 +48,8 @@ test('shared MCP annotations reflect the backend platform', async t => {
   }
 
   const windows = await listAnnotations('win32');
-  assert.equal(windows.length, 10);
+  assert.equal(windows.length, 13);
+  assert.deepEqual(windows.map(tool => tool.name).filter(name => name.endsWith('_bundle')).sort(), bundleTools);
   assert.ok(windows.some(tool => tool.name === 'outlook_attachment_text'));
   const mac = await listAnnotations('darwin');
   assert.equal(mac.length, 15);
@@ -89,7 +90,7 @@ test('HTTP rejects missing token, browser origins and rebinding hosts', () => {
   }
 });
 
-test('macOS bundle schemas apply workflow defaults and enforce cross-field limits', () => {
+test('Shared bundle schemas apply workflow defaults and enforce cross-field limits', () => {
   const context = validateCall('context_bundle', { query: '  项目  ', folder: 'all', limit: 100 });
   assert.equal(context.query, '项目');
   assert.equal(context.folder, 'all');
@@ -151,7 +152,7 @@ test('RPC and official MCP HTTP client share validated read-only backend', async
   const result = await client.callTool({ name: 'outlook_health', arguments: {} });
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.connected, true);
-  if (process.platform === 'darwin') {
+  if (['darwin', 'win32'].includes(process.platform)) {
     const bundle = await client.callTool({ name: 'outlook_context_bundle', arguments: { folder: 'all', limit: 100 } });
     assert.equal(bundle.isError, undefined);
     assert.equal(calls.at(-1).method, 'context_bundle');
@@ -172,10 +173,14 @@ test('RPC and official MCP HTTP client share validated read-only backend', async
     assert.equal(calls.at(-1).params.text_budget_chars, 5000);
     await cli('rpc', 'messages_bundle', '--json', '{"ids":["first_id"]}');
     assert.deepEqual(calls.at(-1).params.ids, ['first_id']);
-    await cli('context-bundle', '--folder', 'all', '--include-subfolders', 'false', '--has-cached-attachments', 'true');
+    const macFilters = process.platform === 'darwin' ? ['--has-cached-attachments', 'true'] : [];
+    await cli('context-bundle', '--folder', 'all', '--include-subfolders', 'false', ...macFilters);
     assert.equal(calls.at(-1).method, 'context_bundle');
     assert.equal(calls.at(-1).params.include_subfolders, false);
-    assert.equal(calls.at(-1).params.has_cached_attachments, true);
+    assert.equal(calls.at(-1).params.has_cached_attachments, process.platform === 'darwin' ? true : undefined);
+    await cli('today-bundle', '--date', '2026-11-28');
+    assert.equal(calls.at(-1).method, 'today_bundle');
+    assert.equal(calls.at(-1).params.date, '2026-11-28');
     await cli('read', '--id', 'first_id');
     assert.equal(calls.at(-1).method, 'read');
     assert.equal(calls.at(-1).params.id, 'first_id');

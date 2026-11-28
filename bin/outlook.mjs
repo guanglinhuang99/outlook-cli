@@ -9,7 +9,7 @@ import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { openRuntimeLog, prepareRuntime, runtimeDir, root, statePath, readState, request, call } from '../src/runtime.mjs';
 import { assertSafeMacPath } from '../src/mac-paths.mjs';
-import { validateCall, definitions, isMacWorkflow } from '../src/tools.mjs';
+import { validateCall, definitions, isBundleWorkflow } from '../src/tools.mjs';
 import { nodeVersionError } from '../src/node-version.mjs';
 
 const print = value => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
@@ -131,9 +131,9 @@ Both platforms filter by received_at; macOS uses verified LastDeliveryTime.
 On macOS, Python 3.11+ is required. Unread filters use verified local state.
 Set OUTLOOK_MAC_FOLDER_SCOPE=account and separate service/cache directories
 to opt in to verified account and archive folder trees. HTML is unsupported.
-Bundle commands are macOS-only. By default, folder queries include descendants;
+The context-bundle, today-bundle and messages-bundle commands support Windows and macOS. By default, folder queries include descendants;
 use --include-subfolders false to query the selected roots or folder only.
-Metadata mode allows 100 results per page. Context mode reads cached bodies
+Metadata mode allows 100 results per page. Context mode reads bodies
 with --max-chars and --text-budget-chars and allows 25 results per page.
 Local reads contain cached data only; COM and local IDs are different.
 Semantic search uses a local embedding provider and the macOS cache workflows.
@@ -266,11 +266,11 @@ async function main() {
     return;
   }
   const alias = command.replaceAll('-', '_');
-  const commandOperation = isMacWorkflow(alias) ? alias : command;
+  const commandOperation = isBundleWorkflow(alias) ? alias : command;
   const operation = command === 'download' ? 'read_attachment' : command === 'rpc' ? args.shift() : commandOperation;
   if (!Object.hasOwn(definitions, operation)) throw new Error(`Unknown command: ${command}`);
-  if (isMacWorkflow(operation) && process.platform !== 'darwin') {
-    throw Object.assign(new Error('This workflow is only supported by the macOS cache backend'), { code: 'UNSUPPORTED_PLATFORM' });
+  if (isBundleWorkflow(operation) && !['darwin', 'win32'].includes(process.platform)) {
+    throw Object.assign(new Error('Bundles are supported on Windows and macOS'), { code: 'UNSUPPORTED_PLATFORM' });
   }
   const parsed = parseArgs({ args, options: Object.fromEntries([
     'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'date', 'scan-limit', 'query', 'person', 'person-role', 'search-body', 'com-body-mode', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json',

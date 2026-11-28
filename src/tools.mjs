@@ -18,33 +18,33 @@ const filters = {
 };
 const define = (description, shape) => ({ description, schema: z.strictObject({ ...shape, backend: z.enum(['auto', 'com', 'local', 'mac-cache']).optional().describe('Windows auto/com may start classic Outlook on demand; local never starts Outlook. auto falls back to cached OST/PST only on unavailable/failed startup, with explicit warnings and fallback_reason; com never falls back. macOS uses HxStore cache. IDs are backend-specific; check data_scope and warnings for incomplete/stale cache reads.') }) });
 const bundleFilters = {
-  folder: z.union([z.enum(['inbox', 'sent', 'all', 'drafts', 'deleted', 'junk', 'outbox']), opaqueId]).default('inbox').describe('An allowed folder alias, all verified folders, or an ID from stores or folders. Drafts, Deleted, Junk and Outbox require account scope and verified local folders.'),
+  folder: z.union([z.enum(['inbox', 'sent', 'all', 'drafts', 'deleted', 'junk', 'outbox']), opaqueId]).default('inbox').describe('An allowed folder alias or folder ID. On Windows, all covers Inbox and Sent and uses live pagination. On macOS, all covers verified folders and Drafts, Deleted, Junk and Outbox require account scope.'),
   include_subfolders: z.boolean().default(true),
   limit: integer(1, 100, 25).describe('At most 25 per page when mode=context.'),
   cursor: z.string().min(1).max(4096).optional().describe('Opaque cursor from a previous page with the same filters.'),
   query: z.string().trim().max(500).default(''),
-  field: z.enum(['all', 'subject', 'sender', 'preview']).default('all'),
+  field: z.enum(['all', 'subject', 'sender', 'preview']).default('all').describe('Windows supports all only.'),
   person: z.string().trim().min(1).max(500).optional(),
   person_role: z.enum(['any', 'sender', 'to', 'cc']).default('any'),
   search_body: z.boolean().default(false),
-  has_cached_attachments: z.boolean().optional().describe('Filter on attachment entries marked cached_at_snapshot. False does not prove the original message has no attachments.'),
-  unread: z.boolean().optional().describe('Match only verified local unread or read states. Check unread_unknown_count for candidates without reliable state.'),
+  has_cached_attachments: z.boolean().optional().describe('macOS only. Filter on attachment entries marked cached_at_snapshot. False does not prove the original message has no attachments.'),
+  unread: z.boolean().optional().describe('Match unread or read messages. On macOS, unread_unknown_count reports candidates without reliable state.'),
   max_chars: integer(1, 100000, 4000),
   text_budget_chars: integer(1000, 200000, 60000)
 };
-const macWorkflows = {
-  context_bundle: define('List or search locally cached macOS mail across verified folders by Singapore received dates. Use metadata mode for previews, or context mode for selected bodies with a text budget. Follow next_cursor with the same filters.', {
+const bundleWorkflows = {
+  context_bundle: define('List or search mail across folders by Singapore received dates. Use metadata mode for previews or context mode to read bodies within a text budget. Follow next_cursor with the same filters. Windows pages through live folder results.', {
     ...bundleFilters,
     mode: z.enum(['metadata', 'context']).default('metadata'),
     from_date: todayDate.optional().describe('First received date, inclusive.'),
     to_date: todayDate.optional().describe('Last received date, inclusive.')
   }),
-  today_bundle: define('Read a page of today\'s locally cached macOS mail using Singapore received dates. A cursor preserves the first page\'s date across midnight. Use metadata mode to skip reading bodies.', {
+  today_bundle: define('Read a page of today\'s mail using Singapore received dates. A cursor preserves the first page\'s date across midnight. Use metadata mode to skip reading bodies.', {
     ...bundleFilters,
     mode: z.enum(['metadata', 'context']).default('context'),
     date: todayDate.optional()
   }),
-  messages_bundle: define('Read selected messages from the macOS cache using IDs from the same snapshot. Returns cached bodies and attachment metadata under a combined text budget.', {
+  messages_bundle: define('Read selected messages and attachment metadata under a combined text budget. Use backend-specific IDs. On macOS use IDs from the same cache snapshot.', {
     ids: z.array(opaqueId).min(1).max(25),
     max_chars: integer(1, 100000, 12000),
     text_budget_chars: integer(1000, 200000, 60000)
@@ -72,16 +72,16 @@ export const definitions = {
   read_attachment: define('Read a bounded chunk of a by-value file attachment as base64. Follow next_offset; sha256 covers the entire file. File limit 10 MiB; embedded Outlook items/OLE unsupported. Does not write a file.', {
     id: opaqueId, index: z.number().int().min(1).max(10000), max_bytes: integer(1, 10485760, 10485760), byte_offset: integer(0, 10485760, 0), chunk_bytes: integer(1, 1048576, 65536)
   }),
-  ...macWorkflows
+  ...bundleWorkflows
 };
 
-export function isMacWorkflow(method) {
-  return Object.hasOwn(macWorkflows, method);
+export function isBundleWorkflow(method) {
+  return Object.hasOwn(bundleWorkflows, method);
 }
 
 export function definitionsForPlatform(platform = process.platform) {
   const entries = Object.entries(definitions);
-  return platform === 'darwin' ? entries : entries.filter(([method]) => !isMacWorkflow(method));
+  return ['darwin', 'win32'].includes(platform) ? entries : entries.filter(([method]) => !isBundleWorkflow(method));
 }
 
 export function validateCall(method, params = {}) {

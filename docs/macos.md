@@ -36,7 +36,7 @@ node bin/outlook.mjs mcp-config
 }
 ```
 
-这套配置暴露 10 个通用 `outlook_*` 工具，以及跨目录、批量、邮件往来和增量 5 个 macOS 工具。端口、令牌鉴权和 Streamable HTTP 与 Windows 共用。`OUTLOOK_LOCAL_STATE_DIR` 必须与启动服务时一致；通常直接复制 `mcp-config` 的输出即可。 自定义服务状态路径的父目录须由当前用户或 root 控制，拒绝可被其他用户替换的共享目录。
+这套配置暴露 13 个通用 `outlook_*` 工具，以及邮件往来和增量 2 个 macOS 工具。端口、令牌鉴权和 Streamable HTTP 与 Windows 共用。`OUTLOOK_LOCAL_STATE_DIR` 必须与启动服务时一致；通常直接复制 `mcp-config` 的输出即可。 自定义服务状态路径的父目录须由当前用户或 root 控制，拒绝可被其他用户替换的共享目录。
 
 服务状态会保留启动时的自定义 profile 保护路径，后续下载命令无需重复设置该环境变量。升级旧版本后先执行 `node bin/outlook.mjs restart`；旧状态缺少保护路径时，下载会要求重启。接收时间筛选版本使用新的目录快照版本，重启后会重新构建索引。MCP 工具可能创建、刷新或清理私有缓存，因此安全注解会标明本地文件写入；这不改变原始 Outlook 邮件只读的约束。
 
