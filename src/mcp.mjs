@@ -1,5 +1,5 @@
 import { McpServer } from '@modelcontextprotocol/server';
-import { definitionsForPlatform } from './tools.mjs';
+import { definitionsForPlatform, schemaForPlatform } from './tools.mjs';
 import { workflowToolsForPlatform } from './workflow-tools.mjs';
 
 // Every tool only reads mail. Private index and cache upkeep does not change the user's
@@ -27,7 +27,7 @@ export function createMcp(call, { platform = process.platform, workflows } = {})
   }
   if (workflows) {
     for (const [name, tool] of workflowToolsForPlatform(platform)) {
-      server.registerTool(`outlook_${name}`, { description: tool.description + note, inputSchema: tool.schema, annotations },
+      server.registerTool(`outlook_${name}`, { description: tool.description + note, inputSchema: schemaForPlatform(tool.schema, platform), annotations },
         async args => { try { return reply(await tool.run(args, workflows)); } catch (error) { return failure(error); } });
     }
   }

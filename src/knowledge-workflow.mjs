@@ -7,6 +7,7 @@ import { createAppleEmbeddingProvider } from './apple-embedding.mjs';
 import { readAttachmentText as extractAttachmentText } from './attachment-workflows.mjs';
 import { assertSafeMacPath } from './mac-paths.mjs';
 import { call as serviceCall, prepareRuntime, readState as serviceState } from './runtime.mjs';
+import { withFullDetail } from './tools.mjs';
 
 const BACKEND = 'mac-cache';
 const VERIFIED_SCOPES = new Set(['verified_inbox_sent_cache', 'verified_account_cache']);
@@ -561,7 +562,7 @@ async function exportRecords(archive, params, { assertSafePath, readState, platf
 const bundleFields = ['ids', 'attachment_requests', 'body_max_chars', 'attachment_text_max_chars', 'text_budget_chars'];
 
 export async function runKnowledgeWorkflow(action, params = {}, {
-  stateDir, call = serviceCall, readAttachmentText = extractAttachmentText, readState = serviceState,
+  stateDir, call = (method, input, options) => serviceCall(method, withFullDetail(method, input), options), readAttachmentText = extractAttachmentText, readState = serviceState,
   createAppleProvider = createAppleEmbeddingProvider, env = process.env, assertSafePath = assertSafeMacPath,
   platform = process.platform
 } = {}) {

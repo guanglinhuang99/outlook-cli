@@ -139,10 +139,13 @@ test('RPC and official MCP HTTP client share validated read-only backend', async
   assert.equal(calls.length, 0);
   response = await fetch(base + '/rpc', { method: 'POST', headers, body: '{broken' });
   assert.equal(response.status, 400);
-  response = await fetch(base + '/rpc', { method: 'POST', headers, body: JSON.stringify({ method: 'messages', params: { limit: 2 } }) });
+  response = await fetch(base + '/rpc', { method: 'POST', headers, body: JSON.stringify({ method: 'messages', params: { limit: 2, detail: 'full' } }) });
   assert.equal(response.status, 200);
   assert.equal((await response.json()).result.sample, '中文');
   assert.equal(calls.at(-1).params.limit, 2);
+  assert.equal('detail' in calls.at(-1).params, false, 'detail is handled by the service, never sent to readers');
+  response = await fetch(base + '/rpc', { method: 'POST', headers, body: JSON.stringify({ method: 'messages', params: { limit: 2 } }) });
+  assert.equal((await response.json()).result.sample, undefined, 'mail lists are compact by default');
   const client = new Client({ name: 'integration-test', version: '1.0.0' });
   t.after(() => client.close());
   await client.connect(new StreamableHTTPClientTransport(new URL(base + '/mcp'), { requestInit: { headers } }));
