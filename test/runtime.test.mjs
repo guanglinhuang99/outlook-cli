@@ -392,3 +392,31 @@ test('CLI download pins the service state across chunks and refuses a restart be
   assert.equal(replacementRequests, 0);
   await assert.rejects(readFile(output));
 });
+
+test('CLI restart starts a service that is not running and replaces a running one', async t => {
+  if (process.platform === 'darwin') return t.skip('macOS service start requires an Outlook profile');
+  const base = await mkdtemp(path.join(os.tmpdir(), 'outlook-restart-'));
+  const runtime = path.join(base, 'service');
+  const port = String(20000 + Math.floor(Math.random() * 20000));
+  const env = { ...process.env, OUTLOOK_LOCAL_STATE_DIR: runtime, OUTLOOK_LOCAL_PORT: port };
+  const cli = (...args) => spawnSync(process.execPath, [
+    fileURLToPath(new URL('../bin/outlook.mjs', import.meta.url)), ...args
+  ], { env, encoding: 'utf8', timeout: 30000 });
+  t.after(async () => { cli('stop'); await rm(base, { recursive: true, force: true }); });
+  const first = cli('restart');
+  assert.equal(first.status, 0, first.stderr);
+  const firstPid = JSON.parse(first.stdout).pid;
+  const second = cli('restart');
+  assert.equal(second.status, 0, second.stderr);
+  assert.notEqual(JSON.parse(second.stdout).pid, firstPid);
+});
+
+test('CLI reports malformed --json as an invalid argument', () => {
+  const result = spawnSync(process.execPath, [
+    fileURLToPath(new URL('../bin/outlook.mjs', import.meta.url)), 'rpc', 'health', '--json', '{bad'
+  ], { encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.deepEqual(JSON.parse(result.stderr), {
+    error: { code: 'INVALID_ARGUMENT', message: '--json must be a valid JSON object' }
+  });
+});

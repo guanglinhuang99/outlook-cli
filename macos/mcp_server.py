@@ -16,6 +16,8 @@ from pathlib import Path
 import sys
 from typing import Any, Callable, Mapping, TextIO
 
+from python_version import unsupported_message
+
 
 SUPPORTED_PROTOCOL_VERSIONS = (
     "2024-11-05",
@@ -573,6 +575,10 @@ def main(argv: list[str] | None = None, *, stdin: Any = None, stdout: Any = None
     parser.add_argument("--from-date", default=DEFAULT_FROM_DATE)
     parser.add_argument("--refresh-seconds", type=_nonnegative_int, default=DEFAULT_REFRESH_SECONDS)
     args = parser.parse_args(argv)
+    too_old = unsupported_message()
+    if too_old:
+        print(f"outlook-local MCP: {too_old}", file=sys.stderr if stderr is None else stderr)
+        return 1
     if service is None and service_factory is None:
         service_factory = _service_factory(args.state, args.profile, args.from_date, args.refresh_seconds)
     return run_stdio(

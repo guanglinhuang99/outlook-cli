@@ -13,6 +13,8 @@ import stat
 import sys
 import tempfile
 
+from python_version import unsupported_message
+
 
 INSTALLER_MARKER = "# outlook-local-mcp managed wrapper v1"
 SERVER_NAME = "outlook-local"
@@ -25,6 +27,7 @@ REQUIRED_FILES = (
     "outlook_service.py",
     "fulltext_index.py",
     "mcp_server.py",
+    "python_version.py",
 )
 OPTIONAL_FILES = ("hxfolders.py",)
 
@@ -244,6 +247,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="installation prefix; defaults to ~/.local")
     parser.add_argument("--profile", help="Outlook profile for the generated MCP configuration")
     args = parser.parse_args(argv)
+    too_old = unsupported_message()
+    if too_old:
+        print(f"install_mcp: {too_old}", file=sys.stderr)
+        return 1
     try:
         result = install(prefix=args.prefix)
     except (InstallError, OSError) as error:

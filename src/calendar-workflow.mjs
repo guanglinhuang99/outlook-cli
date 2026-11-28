@@ -1,12 +1,9 @@
-import { execFile, spawn } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, lstat, mkdtemp, readFile, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { promisify } from 'node:util';
-import { prepareRuntime, runtimeDir } from './runtime.mjs';
-
-const exec = promisify(execFile);
+import { runtimeDir } from './runtime.mjs';
+import { buildSwiftHelper } from './swift-helper.mjs';
 const source = fileURLToPath(new URL('../macos/calendar.swift', import.meta.url));
 const bundleIdentifier = 'io.github.guanglinhuang99.outlook-cli.calendar';
 const infoPlist = `<?xml version="1.0" encoding="UTF-8"?>
@@ -32,44 +29,13 @@ function digest(value) {
   return createHash('sha256').update(JSON.stringify(value)).digest('hex');
 }
 
-async function buildHelper(stateDir) {
-  await prepareRuntime(stateDir);
-  const directory = await realpath(stateDir);
-  const sourceText = await readFile(source, 'utf8');
-  const version = digest([process.arch, sourceText, infoPlist]);
-  const helper = path.join(directory, `calendar-${version}`);
-  const info = await lstat(helper).catch(error => {
-    if (error?.code === 'ENOENT') return null;
-    throw error;
+function buildHelper(stateDir) {
+  return buildSwiftHelper({
+    stateDir, source, name: 'calendar', files: { 'Info.plist': infoPlist }, sign: bundleIdentifier,
+    flags: build => ['-parse-as-library', '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist',
+      '-Xlinker', path.join(build, 'Info.plist')],
+    fail: reason => calendarError('CALENDAR_UNAVAILABLE', `EventKit ${reason}`)
   });
-  if (info) {
-    if (!info.isFile() || info.nlink !== 1 || info.uid !== process.getuid() || (info.mode & 0o777) !== 0o700) {
-      throw calendarError('CALENDAR_UNAVAILABLE', 'EventKit helper has an unsafe file type, owner, or permissions');
-    }
-    return helper;
-  }
-  const build = await mkdtemp(path.join(directory, 'build-'));
-  try {
-    const plist = path.join(build, 'Info.plist');
-    const binary = path.join(build, 'calendar');
-    const input = path.join(build, 'calendar.swift');
-    await writeFile(plist, infoPlist, { mode: 0o600 });
-    await writeFile(input, sourceText, { mode: 0o600 });
-    const flags = ['-parse-as-library', '-module-cache-path', path.join(build, 'modules'), input, '-o', binary,
-      '-Xlinker', '-sectcreate', '-Xlinker', '__TEXT', '-Xlinker', '__info_plist', '-Xlinker', plist];
-    try {
-      await exec('/usr/bin/swiftc', flags, { timeout: 60000, maxBuffer: 16384 });
-      await exec('/usr/bin/codesign', ['--force', '--sign', '-', '--identifier', bundleIdentifier, binary],
-        { timeout: 10000, maxBuffer: 16384 });
-    } catch {
-      throw calendarError('CALENDAR_UNAVAILABLE', 'Building the local EventKit helper requires working macOS Swift and codesign tools');
-    }
-    await chmod(binary, 0o700);
-    await rename(binary, helper);
-    return helper;
-  } finally {
-    await rm(build, { force: true, recursive: true });
-  }
 }
 
 async function readEventKit(request, stateDir) {

@@ -46,8 +46,11 @@ async function workflowArguments(args) {
   const source = values['json-file'] !== undefined ? await readWorkflowInput(values['json-file']) : (values.json ?? '{}');
   if (Buffer.byteLength(source) > inputLimit) throw oversizedInput();
   let params;
-  try { params = JSON.parse(source); } catch { throw new Error('Invalid workflow JSON'); }
-  if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Workflow JSON must be an object');
+  try { params = JSON.parse(source); }
+  catch { throw Object.assign(new Error('--json/--json-file must be a valid JSON object'), { code: 'INVALID_ARGUMENT' }); }
+  if (!params || typeof params !== 'object' || Array.isArray(params)) {
+    throw Object.assign(new Error('--json/--json-file must be a valid JSON object'), { code: 'INVALID_ARGUMENT' });
+  }
   return params;
 }
 
@@ -179,7 +182,11 @@ async function main() {
   }
   if (command === 'start') return print(await start());
   if (command === 'stop') return print(await stop());
-  if (command === 'restart') { await stop(); return print(await start()); }
+  if (command === 'restart') {
+    // A service that is not running (or left a stale state file) only needs a start.
+    try { await stop(); } catch (error) { if (error.code !== 'SERVICE_UNAVAILABLE') throw error; }
+    return print(await start());
+  }
   if (command === 'status') return print(await request('/status'));
   if (command === 'download-all' || command === 'attachment-text') return print(await attachmentCommand(command, args));
   if (['conversation', 'delta-bundle', 'task-bundle'].includes(command)) {
@@ -260,7 +267,11 @@ async function main() {
   let params;
   if (values.json !== undefined) {
     if (Object.keys(values).length !== 1) throw new Error('--json cannot be combined with operation flags');
-    params = JSON.parse(values.json);
+    try { params = JSON.parse(values.json); }
+    catch { throw Object.assign(new Error('--json must be a valid JSON object'), { code: 'INVALID_ARGUMENT' }); }
+    if (!params || typeof params !== 'object' || Array.isArray(params)) {
+      throw Object.assign(new Error('--json must be a valid JSON object'), { code: 'INVALID_ARGUMENT' });
+    }
   } else {
     params = {};
     for (const [key, value] of Object.entries(values)) {

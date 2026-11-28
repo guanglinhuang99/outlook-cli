@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { link, open, realpath, stat, unlink } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { copyFile, link, open, realpath, stat, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertSafeMacPath } from './mac-paths.mjs';
@@ -19,8 +20,21 @@ function attachmentError(code, message) {
 }
 
 function backendOptions({ call = serviceCall, readState = serviceState, platform = process.platform,
-  assertSafePath = assertSafeMacPath } = {}) {
-  return { call, readState, platform, assertSafePath };
+  assertSafePath = assertSafeMacPath, linkFile = link } = {}) {
+  return { call, readState, platform, assertSafePath, linkFile };
+}
+
+// FAT/exFAT volumes, many SMB/NFS shares and some sync folders refuse hard links.
+const hardLinkUnsupported = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV', 'EINVAL', 'EMLINK']);
+
+async function publishCopy(pending, candidate) {
+  try {
+    await copyFile(pending, candidate, fsConstants.COPYFILE_EXCL);
+  } catch (error) {
+    // EEXIST means another file owns the name; any other failure may leave a partial copy we created.
+    if (error.code !== 'EEXIST') await unlink(candidate).catch(() => {});
+    throw error;
+  }
 }
 
 function sameState(first, second) {
@@ -165,10 +179,14 @@ async function publishAttachment(directory, attachment, index, pinned, options) 
       await checkDirectory();
       const candidate = path.join(directory.path, stem + (suffix === 1 ? '' : '-' + suffix) + extension);
       try {
-        await link(pending, candidate);
+        if (directory.copyOnly) await publishCopy(pending, candidate);
+        else await options.linkFile(pending, candidate);
         return candidate;
       } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
+        if (error.code === 'EEXIST') continue;
+        if (directory.copyOnly || !hardLinkUnsupported.has(error.code)) throw error;
+        directory.copyOnly = true;
+        suffix -= 1;
       }
     }
     throw attachmentError('ATTACHMENT_NAME_CONFLICT', 'No available attachment filename');

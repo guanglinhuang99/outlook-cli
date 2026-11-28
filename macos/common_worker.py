@@ -9,6 +9,12 @@ import os
 from pathlib import Path
 import sys
 
+from python_version import answer_unsupported, unsupported_message
+
+if __name__ == "__main__" and unsupported_message():
+    answer_unsupported(sys.stdin, sys.stdout, unsupported_message())
+    raise SystemExit(0)
+
 import outlook_local as core
 from outlook_service import BUNDLE_SOURCE_BYTES, BUNDLE_VERIFY_BYTES, TOKEN, MailService
 from mcp_server import _readline_limited
