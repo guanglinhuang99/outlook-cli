@@ -4,6 +4,8 @@ import path from 'node:path';
 
 import { prepareRuntime, runtimeDir } from './runtime.mjs';
 
+export const MINIMUM_NODE = '22.16';
+
 const DEFAULT_MAX_BYTES = 512 * 1024 * 1024;
 const DEFAULT_BODY_CODE_UNITS = 16_000_000;
 const DEFAULT_BATCH_BYTES = 128 * 1024 * 1024;
@@ -372,8 +374,14 @@ export class WindowsFulltextIndex {
   }
 
   async _sqlite() {
-    if (!this._sqlitePromise) this._sqlitePromise = import('node:sqlite').catch(() => {
-      throw errorWithCode('Windows full-text search requires Node.js 22.13+ with built-in SQLite; use the bundled Node 24 runtime.', 'FULLTEXT_UNAVAILABLE');
+    if (!this._sqlitePromise) this._sqlitePromise = import('node:sqlite').then(sqlite => {
+      // Node's bundled SQLite has FTS5 only from 22.16; without it every index open would look corrupt.
+      const probe = new sqlite.DatabaseSync(':memory:');
+      try { probe.exec("CREATE VIRTUAL TABLE probe USING fts5(text, tokenize='trigram')"); }
+      finally { probe.close(); }
+      return sqlite;
+    }).catch(() => {
+      throw errorWithCode(`Windows full-text search requires Node.js ${MINIMUM_NODE}+ with built-in SQLite FTS5 (this is ${process.version}); use the bundled Node 24 runtime.`, 'FULLTEXT_UNAVAILABLE');
     });
     return this._sqlitePromise;
   }

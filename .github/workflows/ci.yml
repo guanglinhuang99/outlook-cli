@@ -13,8 +13,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-latest, ubuntu-latest]
-        # 22.13 is the documented minimum for Windows full-text search; 24 is the bundled runtime.
-        node: ['22.13', '24']
+        # 22.16 is the documented minimum (first release whose built-in SQLite has FTS5); 24 is the bundled runtime.
+        node: ['22.16', '24']
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

@@ -82,7 +82,7 @@ v0.3.0 安装包提供 `today` 命令和 9 个 MCP 工具。安装需要联网�
 
 ### Windows：从源码安装
 
-准备：Git、Node.js **22.13+（推荐 24 LTS）**、Windows PowerShell **5.1**，以及已配置的经典 Outlook 或支持的本地 OST/PST 文件。
+准备：Git、Node.js **22.16+（推荐 24 LTS）**、Windows PowerShell **5.1**，以及已配置的经典 Outlook 或支持的本地 OST/PST 文件。
 
 ```powershell
 git clone --branch main https://github.com/guanglinhuang99/outlook-cli.git
@@ -168,7 +168,7 @@ Windows COM 正文搜索默认使用自动策略（`--com-body-mode auto`，也�
 
 显式 `--com-body-mode direct` 每次直接扫描，不访问数据库；`--com-body-mode indexed` 首次立即建索引。CLI/MCP JSON 对应 `com_body_mode: "auto" | "direct" | "indexed"`。三种策略均保留摘要、人员筛选、分页、不完整状态及返回前的版本、位置、下载状态校验；`indexed=0` 不表示搜索未完成。
 
-`com_body_mode` 只作用于 Windows COM，其他后端忽略它。离线 OST/PST 保持原有索引方式，文件未变化时复用；目前解析器没有可靠的逐邮件变更标识，文件变化后会保守重校验本次候选正文，避免漏掉刚补下载的内容。Windows 索引模式使用 Node 内置 SQLite，无需另装数据库或 Python；源码运行全文搜索需 Node 22.13+，Windows 安装器附带的 Node 24 已满足要求。
+`com_body_mode` 只作用于 Windows COM，其他后端忽略它。离线 OST/PST 保持原有索引方式，文件未变化时复用；目前解析器没有可靠的逐邮件变更标识，文件变化后会保守重校验本次候选正文，避免漏掉刚补下载的内容。Windows 索引模式使用 Node 内置 SQLite，无需另装数据库或 Python；源码运行全文搜索需 Node 22.16+（内置 SQLite 从这一版起带全文检索模块），Windows 安装器附带的 Node 24 已满足要求。
 
 索引数据库上限 512 MiB。Windows 每次扫描最多 50 个候选项目，只允许收件箱、已发送及其子目录，排除已删除；共享接口每次查询一个文件夹，子目录需逐级遍历。首次正文读取受时间及大小预算限制：`retry_required=true` 时保持**本页原参数**重试；完成后才按 `next_offset` 翻页。检查 `fulltext` 与 `body_search_incomplete`，正文缺失、截断、格式不支持或索引错误均不能视作完整的无匹配结果。Mac 的 pending 重试与原生接口说明见下文。两平台均按接收时间筛选，不用发送时间作为增量水位；结果不代表服务器上的完整邮箱。
 ```sh
