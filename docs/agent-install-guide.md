@@ -2,7 +2,7 @@
 
 本文对应 Outlook CLI v0.3.0。Windows 可以使用 [发布安装包](https://github.com/guanglinhuang99/outlook-cli/releases/tag/v0.3.0)，安装及验收步骤见 [Windows 安装说明](../INSTALL-WINDOWS.md)。下面的步骤适用于从源码安装。
 
-该项目让**运行在邮箱所在电脑上的 Agent** 通过 CLI 或 MCP 只读访问 Outlook。邮箱登录和同步由本机 Outlook 完成，服务在本机创建索引和附件导出文件。可选的 `graph` CLI 使用单独的 Microsoft Graph 授权。[Graph 配置和命令](applemail-migration.md#microsoft-graph-授权与写操作)
+该项目让**运行在邮箱所在电脑上的 Agent** 通过 CLI 或 MCP 只读访问 Outlook。邮箱登录和同步由本机 Outlook 完成，服务在本机创建索引和附件导出文件，不连接任何云端邮件接口。
 
 ## 1. 先检查是否已经安装
 

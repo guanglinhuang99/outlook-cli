@@ -1,6 +1,6 @@
 # Apple Mail CLI 迁移到 Outlook CLI
 
-在项目目录运行 `node bin/outlook.mjs`。本地服务和 Microsoft Graph 使用不同的邮件 ID。下表列出可迁移的工作流和使用的后端。
+在项目目录运行 `node bin/outlook.mjs`。下表列出可迁移的工作流和数据来源，全部只读本机数据。
 
 | 工作流 | Outlook CLI | 来源 |
 |---|---|---|
@@ -11,10 +11,6 @@
 | 按语义查找正文 | `semantic sync`、`semantic search`、`semantic status` | 本机模型与可验证的缓存正文 |
 | 一次读取 50 封邮件与指定附件，查询和导出证据 | `knowledge bundle`、`knowledge sync/search/read/source/export` | 本地缓存派生文本、私有索引与 SHA-256 |
 | 查看日历和日程 | `calendar status/calendars/agenda` | 已授权的 macOS EventKit |
-| 查服务器目录、未读邮件、正文和附件 | `graph folders`、`graph list`、`graph read`、`graph attachments`、`graph attachment-read` | 已授权的 Microsoft 邮箱 |
-| 获取服务器提供的邮件 MIME | `graph mime` | 已授权的 Microsoft 邮箱 |
-| 设置已读、旗标、移动及批量更新 | `graph mark-read`、`graph flag`、`graph move`、`graph batch-update` | 已授权的 Microsoft 邮箱 |
-| 草稿、回复、转发、发送 | `graph drafts`、`graph compose`、`graph draft-update`、`graph draft-attach`、`graph draft-discard`、`graph reply`、`graph reply-all`、`graph forward`、`graph draft-send` | 已授权的 Microsoft 邮箱 |
 
 跨目录查询按 `received_at` 和新加坡时区筛选。邮件缓存范围与分页规则见 [macOS 批量工具](macos.md#跨目录查询与批量读取)。现有 12 个 macOS MCP 工具可继续用于本地只读查询和正文。下面的新增命令通过 CLI 调用。
 
@@ -91,34 +87,4 @@ node bin/outlook.mjs calendar agenda --json '{"date":"2026-11-25","time_zone":"A
 
 连接的是当前用户的 macOS 日历数据。Outlook 账户的日程需已同步到 macOS Calendar。首次授权需在有图形会话的 Mini 上运行 `calendar authorize` 并授予完整日历访问；普通查询遇到权限缺失时会返回 `CALENDAR_AUTH_REQUIRED`。日程支持精确的 `calendar_ids`、日期范围、重复和全天事件、分页，以及显式开启的 `include_details`。
 
-## Microsoft Graph 授权与写操作
-
-使用组织批准的 Microsoft Entra 公共客户端注册，并允许设备代码登录。在本机环境设置 `OUTLOOK_GRAPH_CLIENT_ID` 和 `OUTLOOK_GRAPH_TENANT_ID`。登录默认申请 `Mail.ReadWrite`，只读可传 `{"read_only":true}`。确需发送时传 `{"send":true}` 单独请求 `Mail.Send`。也可从组织批准的身份工具提供委托访问令牌 `OUTLOOK_GRAPH_ACCESS_TOKEN`。设备登录令牌和刷新凭证仅保存在当前服务状态目录的私有 `graph-auth` 子目录。[Microsoft Entra 设备代码授权](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-device-code) · [Outlook 邮件 API](https://learn.microsoft.com/en-us/graph/outlook-create-send-messages)
-
-```sh
-node bin/outlook.mjs graph login --json '{"send":true}'
-node bin/outlook.mjs graph status --json '{"verify":true}'
-node bin/outlook.mjs graph folders
-node bin/outlook.mjs graph list --json '{"folder":"inbox","unread":true,"limit":25}'
-node bin/outlook.mjs graph resolve --json '{"internet_message_id":"<message@example.invalid>"}'
-```
-
-如果从本地查询开始，用返回的 `internet_message_id` 做 `graph resolve`，并核对唯一命中的 Graph 邮件。`graph list` 的 `after` 和 `before` 使用带时区的 ISO 接收时间，分别含起点和不含终点。写操作都须提供每次操作唯一的 `request_id`。移动、丢弃、上传到草稿和发送还要求明确的 `confirm:true`。如果请求回执不确定，先在 Outlook 核对结果并保留原请求 ID。发送前可用 `graph read` 核对已有草稿。正文和附件内容优先通过 `--json-file <path>` 或 `--json-file -` 传入，避免放在命令行参数里。[Microsoft Graph 草稿发送](https://learn.microsoft.com/en-us/graph/api/message-send?view=graph-rest-1.0)
-
-| 动作 | JSON 字段 |
-|---|---|
-| `mark-read` | `id`, `is_read`, `request_id` |
-| `flag` | `id`, `flag`, `request_id`，旗标值为 `notFlagged`、`flagged` 或 `complete` |
-| `move` | `id`, `folder`, `request_id`, `confirm` |
-| `batch-update` | `ids`, `request_id`，任选 `is_read`、`flag`、`move_to`；移动时提供 `confirm` |
-| `compose` | `request_id`，可选 `subject`, `body`, `to`, `cc`, `bcc`，收件人为地址数组 |
-| `draft-update` | `id`, `request_id`，以及需要改动的草稿字段 |
-| `reply` / `reply-all` / `forward` | `id`, `request_id`，可选 `comment`；转发还需 `to` |
-| `draft-attach` | `id`, `request_id`, `confirm`, `name`, `content_base64`，可选 `content_type`，文件小于 3 MB |
-| `draft-discard` / `draft-send` | `id`, `request_id`, `confirm` |
-
-`compose`、`reply`、`reply-all` 和 `forward` 创建草稿。只有 `draft-send` 发送。`graph attachments` 列服务器附件，`graph attachment-read` 读取一个普通附件的 Base64 和 SHA-256，最多 10 MiB。`graph logout` 清理此 CLI 缓存的设备授权，调用方通过环境提供的访问令牌仍由调用方管理。
-
-`graph mime --json '{"id":"<graph_id>"}'` 返回 Graph 提供的 MIME 字节，附 Base64、字节数和 SHA-256，最多 10 MiB。使用已获准的 Graph 邮件读取权限，来源标记为 `graph_mime_representation`。[Microsoft Graph MIME 接口](https://learn.microsoft.com/en-us/graph/outlook-get-mime-message)
-
-在 Mini 切换脚本时，先用同账号、同日期、同目录的两套只读命令核对邮件、正文和附件覆盖，再启用需要 Graph 的写操作。
+Apple Mail CLI 中标记已读、旗标、移动、草稿和发送这类写操作不迁移：本工具只读本机缓存，需要时在 Outlook 中手动完成。

@@ -91,7 +91,7 @@ function downloadStateChanged() {
   });
 }
 
-const help = `Outlook CLI — local cache and optional Microsoft Graph workflows
+const help = `Outlook CLI — read-only local Outlook mail for agents
 
   outlook-local start | stop | restart | status | health
   outlook-local clipboard start|stop|status  Windows Outlook copy-to-MSG bridge
@@ -114,7 +114,6 @@ const help = `Outlook CLI — local cache and optional Microsoft Graph workflows
   outlook-local knowledge status|sync|search|read|source|export|bundle [--json '<JSON object>' | --json-file <file|->]
   outlook-local calendar status|calendars|agenda|authorize [--json '<JSON object>' | --json-file <file|->]
   outlook-local semantic sync|search|status [--json '<JSON object>' | --json-file <file|->]
-  outlook-local graph <action>   [--json '<JSON object>' | --json-file <file|->]
   outlook-local mcp              MCP stdio adapter; requires running service
   outlook-local mcp-config       Print MCP stdio configuration (no secrets)
   outlook-local rpc <operation> --json '<JSON object>'
@@ -137,8 +136,7 @@ Metadata mode allows 100 results per page. Context mode reads cached bodies
 with --max-chars and --text-budget-chars and allows 25 results per page.
 Local reads contain cached data only; COM and local IDs are different.
 Semantic search uses a local embedding provider and the macOS cache workflows.
-Graph uses a separately authorized Microsoft mailbox. Drafts are sent only with graph draft-send.
-Use --json-file - to pass Graph draft content through stdin.
+Use --json-file - to pass workflow JSON through stdin.
 Use stores -> root_id -> folders to discover other folders.
 All output is JSON, except help. Errors go to stderr with nonzero exit status.
 `;
@@ -212,28 +210,13 @@ async function main() {
     const { runKnowledgeWorkflow } = await import('../src/knowledge-workflow.mjs');
     return print(await runKnowledgeWorkflow(action, params, { call, stateDir, readAttachmentText }));
   }
-  if (command === 'semantic' || command === 'graph') {
+  if (command === 'semantic') {
     const [action, ...options] = args;
-    if (command === 'semantic') {
-      const { runSemanticWorkflow } = await import('../src/semantic-workflow.mjs');
-      if (!action || action === 'help' || action === '--help') return print({ actions: ['status', 'sync', 'search'] });
-      return print(await runSemanticWorkflow(action, await workflowArguments(options), {
-        call, stateDir: path.join(runtimeDir, 'semantic')
-      }));
-    }
-    const { runGraphWorkflow, GRAPH_ACTIONS } = await import('../src/graph-workflow.mjs');
-    if (!action || action === 'help' || action === '--help') return print({ actions: ['login', 'logout', ...GRAPH_ACTIONS] });
-    const params = await workflowArguments(options);
-    const { graphAccessToken, graphLogin, graphLogout } = await import('../src/graph-auth.mjs');
-    if (action === 'login') return print(await graphLogin(params));
-    if (action === 'logout') {
-      if (Object.keys(params).length) throw new Error('graph logout accepts no parameters');
-      const loggedOut = await graphLogout();
-      return print({ ...loggedOut, environment_token_configured: Boolean(process.env.OUTLOOK_GRAPH_ACCESS_TOKEN) });
-    }
-    if (!GRAPH_ACTIONS.includes(action)) return print(await runGraphWorkflow(action, params));
-    const token = await graphAccessToken({ refresh: action !== 'status' || params.verify === true });
-    return print(await runGraphWorkflow(action, params, { token }));
+    const { runSemanticWorkflow } = await import('../src/semantic-workflow.mjs');
+    if (!action || action === 'help' || action === '--help') return print({ actions: ['status', 'sync', 'search'] });
+    return print(await runSemanticWorkflow(action, await workflowArguments(options), {
+      call, stateDir: path.join(runtimeDir, 'semantic')
+    }));
   }
   if (command === 'mcp-config') return print({ mcpServers: { 'outlook-local': { command: process.execPath, args: [fileURLToPath(import.meta.url), 'mcp'], env: { OUTLOOK_LOCAL_STATE_DIR: runtimeDir } } } });
   if (command === 'serve') {

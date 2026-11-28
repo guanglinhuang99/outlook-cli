@@ -1,5 +1,5 @@
 // Windows source installs need Node 24: on Node 22 for Windows, file identity checks used
-// by Graph sign-in and the knowledge archive fail, and built-in SQLite lacks FTS5 before 22.16.
+// by the knowledge archive fail, and built-in SQLite lacks FTS5 before 22.16.
 // The Windows installer bundles Node 24.
 export const WINDOWS_MINIMUM_NODE_MAJOR = 24;
 

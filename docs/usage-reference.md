@@ -2,7 +2,7 @@
 
 首次使用请先看 [项目首页](../README.md)。本页保留安装参数、后端限制和协议细节。
 
-Windows 和 macOS Outlook 的本机只读服务共用 **CLI、MCP stdio、MCP Streamable HTTP**。邮箱登录及同步由本机 Outlook 完成。可选的 `graph` CLI 使用单独的 Microsoft Graph 授权。[Graph 配置和命令](applemail-migration.md#microsoft-graph-授权与写操作)
+Windows 和 macOS Outlook 的本机只读服务共用 **CLI、MCP stdio、MCP Streamable HTTP**。邮箱登录及同步由本机 Outlook 完成，不连接任何云端邮件接口。
 
 源码 v0.3.0 按平台自动选择读取器，共享 9 个 `outlook_*` 工具。已有 Windows COM / OST/PST 用法保持兼容；Mac 的 HxStore 格式由独立 Python 读取器处理，邮件 ID 不跨后端通用。
 
@@ -204,7 +204,7 @@ COM 模式下，服务应在与 Outlook **相同的 Windows 用户、交互式�
 | `attachments` | `outlook_attachments` | 附件名称、类型、大小、序号 |
 | `read_attachment` / `download` | `outlook_read_attachment` | 分块读取附件；CLI download 合并并保存文件 |
 
-本地服务和这些 MCP 工具以只读方式访问邮箱。CLI `download` 将附件保存到用户指定的本机路径，拒绝覆盖已有文件。更改服务器邮件状态或发送草稿可使用单独授权的 `graph` 命令。[Graph 写操作](applemail-migration.md#microsoft-graph-授权与写操作)
+本地服务和这些 MCP 工具以只读方式访问邮箱。CLI `download` 将附件保存到用户指定的本机路径，拒绝覆盖已有文件。本工具不提供标记已读、移动、草稿或发送。
 
 ### 文件夹和邮件 ID
 

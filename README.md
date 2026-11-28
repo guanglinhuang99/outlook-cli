@@ -2,7 +2,7 @@
 
 让本机 Agent 通过统一的 **CLI 和 MCP** 读取 Windows、macOS 上的 Outlook 邮件。支持邮件检索、中文正文读取、附件下载，以及按日期查询。
 
-**本地读取服务只读。** Outlook 负责登录和同步。本地附件与语义检索在本机处理。已读标记、移动、草稿与发送由单独授权的 `graph` 命令访问 Microsoft Graph。[Apple Mail 迁移对照和配置](docs/applemail-migration.md)
+**只读。** Outlook 负责登录和同步，本工具只读取本机已同步的邮件，不标记已读、不移动、不发送，也不连接任何云端邮件接口。本地附件与语义检索在本机处理。[Apple Mail 迁移对照和配置](docs/applemail-migration.md)
 
 > **v0.3.0** 支持 Windows 和 macOS。Windows 可下载安装包，macOS 从源码安装。
 
@@ -158,7 +158,7 @@ node bin/outlook.mjs messages --folder '<folder_id>' --limit 25
 
 搜索支持关键词 `query` 和相关人员 `person`，至少填一个；同时填写时两个条件都必须满足。`person_role` 可选 `any`（默认）、`sender`（发件人）、`to`（收件人）、`cc`（抄送人），按姓名或邮箱做大小写不敏感的字面子串匹配，返回 `matched_person_roles`。人员不会从正文中猜测。查看每页的 `person_search_incomplete`：本地未保存收件人等证据时，未命中不等于该人员没有相关邮件。
 
-Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa 日志中被脱敏的 To/Cc，并校验邮件和角色归属。`participants_status` 和 `participants_evidence` 区分本地验证通过、部分结果及冲突；未缓存或未知格式仍可能缺失。升级后重新连接 MCP 并刷新索引即可生效，无需 Graph 或 Outlook 网络 API，原始邮件始终只读。
+Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa 日志中被脱敏的 To/Cc，并校验邮件和角色归属。`participants_status` 和 `participants_evidence` 区分本地验证通过、部分结果及冲突；未缓存或未知格式仍可能缺失。升级后重新连接 MCP 并刷新索引即可生效，无需任何云端邮件接口，原始邮件始终只读。
 
 搜索性能：Mac 在常驻进程中复用已验证索引，仅复制返回页；用 Python 标准库 SQLite 持久保存 Osa 日志的解析元数据，重启后也可复用未变化的日志，仍检查完整日志清单和接收时间，正文按需读取。无需额外安装数据库服务，SQLite 文件位于程序自己的私有状态目录。Windows COM 搜索复用已经读取的发件人信息，单封读取复用附件集合；离线 OST/PST 搜索复用同一次读取的结果。两端均保留接收时间筛选及原始邮件只读行为。实际耗时取决于邮箱规模和后端，Mac 的测量不能代表 Windows 性能。
 
