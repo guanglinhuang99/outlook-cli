@@ -3,7 +3,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { readFile, unlink } from 'node:fs/promises';
 import { NodeStreamableHTTPServerTransport } from '@modelcontextprotocol/node';
 import { BackendRouter } from './backend.mjs';
-import { validateCall } from './tools.mjs';
+import { validateCall, withFullDetail } from './tools.mjs';
+import { compactMethods, compactResult } from './compact.mjs';
 import { createMcp } from './mcp.mjs';
 import path from 'node:path';
 import { prepareRuntime, publishState, runtimeDir, statePath, port } from './runtime.mjs';
@@ -50,11 +51,15 @@ export async function startService({ bridge, listenPort = port, token = randomBy
     : new BackendRouter());
   let closing = false;
   const sockets = new Set();
-  const invoke = (method, params) => serviceBridge.call(method, validateCall(method, params));
+  const invoke = async (method, params) => {
+    const { detail, ...input } = validateCall(method, params);
+    const result = await serviceBridge.call(method, input);
+    return compactMethods.has(method) && detail !== 'full' ? compactResult(method, result) : result;
+  };
   // Workflow tools run inside this process; their state pin is this service instance.
   const serviceState = { port: listenPort, token, pid: process.pid, startedAt,
     ...(protectedMailRoots ? { protected_mail_roots: protectedMailRoots } : {}) };
-  const workflows = { call: (method, params) => invoke(method, params), readState: async () => serviceState,
+  const workflows = { call: (method, params) => invoke(method, withFullDetail(method, params)), readState: async () => serviceState,
     stateDir: path.join(runtimeDir, 'read-parity') };
   const server = http.createServer(async (req, res) => {
     try {

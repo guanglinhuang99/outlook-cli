@@ -9,10 +9,11 @@ import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { openRuntimeLog, prepareRuntime, runtimeDir, root, statePath, readState, request, call } from '../src/runtime.mjs';
 import { assertSafeMacPath } from '../src/mac-paths.mjs';
-import { validateCall, definitions, isBundleWorkflow } from '../src/tools.mjs';
+import { validateCall, definitions, isBundleWorkflow, withFullDetail } from '../src/tools.mjs';
 import { nodeVersionError } from '../src/node-version.mjs';
 
-const print = value => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+// Agents read piped output, where indentation only costs tokens; terminals stay readable.
+const print = value => process.stdout.write(JSON.stringify(value, null, process.stdout.isTTY ? 2 : 0) + '\n');
 const inputLimit = 4 * 1024 * 1024 + 32768;
 const oversizedInput = () => new Error(`Workflow JSON exceeds ${inputLimit} bytes`);
 
@@ -65,7 +66,7 @@ async function attachmentCommand(command, args) {
   const { values } = parseArgs({ args, options, strict: true, allowPositionals: false });
   const { id, backend } = validateCall('attachments', { id: values.id, backend: values.backend });
   const workflows = await import('../src/attachment-workflows.mjs');
-  const service = { call: callStarting, readState: readStateStarting };
+  const service = { call: callFull, readState: readStateStarting };
   if (command === 'download-all') {
     if (!values['out-dir']) throw new Error('download-all requires --out-dir');
     return workflows.downloadAllAttachments({ id, backend, out_dir: values['out-dir'] }, service);
@@ -139,6 +140,7 @@ Local reads contain cached data only; COM and local IDs are different.
 Semantic search uses a local embedding provider and the macOS cache workflows.
 Use --json-file - to pass workflow JSON through stdin.
 Use stores -> root_id -> folders to discover other folders.
+Mail lists, search, read and bundles are compact; add --detail full for diagnostic fields.
 All output is JSON, except help. Errors go to stderr with nonzero exit status.
 `;
 
@@ -178,6 +180,9 @@ async function callStarting(method, params, options) {
     return call(method, params, options);
   }
 }
+
+// Client-side workflows read fields the compact view omits.
+const callFull = (method, params, options) => callStarting(method, withFullDetail(method, params), options);
 
 async function readStateStarting(options) {
   try { return await readState(options); }
@@ -219,7 +224,7 @@ async function main() {
   if (command === 'download-all' || command === 'attachment-text') return print(await attachmentCommand(command, args));
   if (['conversation', 'delta-bundle', 'task-bundle'].includes(command)) {
     const { runReadParity } = await import('../src/read-parity.mjs');
-    return print(await runReadParity(command, await workflowArguments(args), { call: callStarting, stateDir: path.join(runtimeDir, 'read-parity') }));
+    return print(await runReadParity(command, await workflowArguments(args), { call: callFull, stateDir: path.join(runtimeDir, 'read-parity') }));
   }
   if (command === 'knowledge' || command === 'calendar') {
     const [action, ...options] = args;
@@ -235,14 +240,14 @@ async function main() {
     }
     const { readAttachmentText } = await import('../src/attachment-workflows.mjs');
     const { runKnowledgeWorkflow } = await import('../src/knowledge-workflow.mjs');
-    return print(await runKnowledgeWorkflow(action, params, { call: callStarting, stateDir, readAttachmentText }));
+    return print(await runKnowledgeWorkflow(action, params, { call: callFull, stateDir, readAttachmentText }));
   }
   if (command === 'semantic') {
     const [action, ...options] = args;
     const { runSemanticWorkflow } = await import('../src/semantic-workflow.mjs');
     if (!action || action === 'help' || action === '--help') return print({ actions: ['status', 'sync', 'search'] });
     return print(await runSemanticWorkflow(action, await workflowArguments(options), {
-      call: callStarting, stateDir: path.join(runtimeDir, 'semantic')
+      call: callFull, stateDir: path.join(runtimeDir, 'semantic')
     }));
   }
   if (command === 'mcp-config') return print({ mcpServers: { 'outlook-local': { command: process.execPath, args: [fileURLToPath(import.meta.url), 'mcp'], env: { OUTLOOK_LOCAL_STATE_DIR: runtimeDir } } } });
@@ -259,7 +264,7 @@ async function main() {
     const { createMcp } = await import('../src/mcp.mjs');
     const { StdioServerTransport } = await import('@modelcontextprotocol/server/stdio');
     const server = createMcp(callStarting, { workflows: {
-      call: callStarting, readState: readStateStarting, stateDir: path.join(runtimeDir, 'read-parity')
+      call: callFull, readState: readStateStarting, stateDir: path.join(runtimeDir, 'read-parity')
     } });
     await server.connect(new StdioServerTransport());
     process.stdin.once('end', () => { void server.close(); });
@@ -274,7 +279,7 @@ async function main() {
   }
   const parsed = parseArgs({ args, options: Object.fromEntries([
     'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'date', 'scan-limit', 'query', 'person', 'person-role', 'search-body', 'com-body-mode', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json',
-    'mode', 'from-date', 'to-date', 'cursor', 'field', 'include-subfolders', 'has-cached-attachments', 'text-budget-chars'
+    'mode', 'from-date', 'to-date', 'cursor', 'field', 'include-subfolders', 'has-cached-attachments', 'text-budget-chars', 'detail'
   ].map(key => [key, { type: 'string', multiple: key === 'id' && operation === 'messages_bundle' }])), strict: true, allowPositionals: false });
   const values = { ...parsed.values };
   const outputPath = values.out;

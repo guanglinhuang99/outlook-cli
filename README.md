@@ -106,6 +106,8 @@ COM 服务应与 Outlook 使用相同的 Windows 用户、交互式会话和权�
 
 单封和单目录的 `node bin/outlook.mjs` 命令在两个平台通用。Windows 也可换成 `.\outlook.cmd`。成功结果为 JSON；错误写入 stderr，退出码非零。
 
+邮件列表、搜索、读信和批量结果默认是精简版：只保留选邮件、读邮件需要的字段；异常状态、未完成标记和非零计数照常返回，值为 false 的标记和为 0 的计数省略。需要诊断字段（人员、接收时间、目录的验证证据，快照和覆盖说明）时，加 `--detail full`，MCP 传 `"detail": "full"`。命令行输出到终端时带缩进，被程序读取时为单行 JSON。
+
 ### 今天和最近的邮件
 
 ```sh
@@ -159,7 +161,7 @@ node bin/outlook.mjs messages --folder '<folder_id>' --limit 25
 
 搜索支持关键词 `query` 和相关人员 `person`，至少填一个；同时填写时两个条件都必须满足。`person_role` 可选 `any`（默认）、`sender`（发件人）、`to`（收件人）、`cc`（抄送人），按姓名或邮箱做大小写不敏感的字面子串匹配，返回 `matched_person_roles`。人员不会从正文中猜测。查看每页的 `person_search_incomplete`：本地未保存收件人等证据时，未命中不等于该人员没有相关邮件。
 
-Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa 日志中被脱敏的 To/Cc，并校验邮件和角色归属。`participants_status` 和 `participants_evidence` 区分本地验证通过、部分结果及冲突；未缓存或未知格式仍可能缺失。升级后重新连接 MCP 并刷新索引即可生效，无需任何云端邮件接口，原始邮件始终只读。
+Mac 支持从 HxStore 本地人员对象读取真实姓名和邮箱，补充 Osa 日志中被脱敏的 To/Cc，并校验邮件和角色归属。完整结果中的 `participants_status` 和 `participants_evidence` 区分本地验证通过、部分结果及冲突；未缓存或未知格式仍可能缺失。升级后重新连接 MCP 并刷新索引即可生效，无需任何云端邮件接口，原始邮件始终只读。
 
 搜索性能：Mac 在常驻进程中复用已验证索引，仅复制返回页；用 Python 标准库 SQLite 持久保存 Osa 日志的解析元数据，重启后也可复用未变化的日志，仍检查完整日志清单和接收时间，正文按需读取。无需额外安装数据库服务，SQLite 文件位于程序自己的私有状态目录。Windows COM 搜索复用已经读取的发件人信息，单封读取复用附件集合；离线 OST/PST 搜索复用同一次读取的结果。两端均保留接收时间筛选及原始邮件只读行为。实际耗时取决于邮箱规模和后端，Mac 的测量不能代表 Windows 性能。
 

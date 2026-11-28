@@ -65,14 +65,14 @@ node bin/outlook.mjs mcp-config
 - 接收时间缺失、无效或证据冲突时，`received_at` 为 null，`received_time_status` 说明原因；不回退到发送时间。无日期条件仍可检索和读取这些邮件，有日期条件时排除并通过 `received_time_unknown` / `date_filter_incomplete` 提示范围不完整。结果按已验证接收时间倒序，缺失时间置后。接收时间只覆盖本地日志可可靠关联的记录，不保证全部服务器邮件。
 - `sent_at` 用于显示与身份核对。HxStore 字段 271 按毫秒对齐的 .NET DateTime ticks 解码，支持从公元 1 年起、至 UTC `9999-12-31 16:00:00` 之前的有效值。字段缺失时，只有 EntryID 与 InternetMessageId 均匹配，且对应 Osa 日志的 `SentTime` 都有效并指向同一时刻，才回填 `sent_at`。邮件日期筛选使用 `received_at`。
 - 共享服务的 `unread` 来自经 EntryID、InternetMessageId、发送时间和目录校验的最新本地 Osa 邮件头或通知。冲突和缺失返回 null。使用 `--unread true` 或 `--unread false` 时，未知状态均排除，并通过 `unread_unknown_count` 和 `unread_filter_incomplete` 回报。目录计数仅统计本地索引，`unread_evidence.observed_at` 是日志观察时间。
-- 只能读取已缓存、且能可靠关联的内容。`captured_at` 是快照生成时间，不是服务器同步时间；`coverage` 说明本地证据范围，不保证服务器邮箱完整。
+- 只能读取已缓存、且能可靠关联的内容。完整结果（`detail: "full"`）中的 `captured_at` 是快照生成时间，不是服务器同步时间；`coverage` 说明本地证据范围，不保证服务器邮箱完整。
 - 每次成功刷新后最多保留当前目录快照和共用同一源容器的最近两个历史视图；源快照变化时清理旧源及其视图、正文和附件导出。失败的目录刷新回退源指针并清理未发布视图的容器副本。旧 ID/游标超过保留范围会失效，或在并发刷新清理时返回读取错误，应重新检索；原始 Outlook 缓存不参与清理。任何相关 Osa 日志读取失败时刷新报错，旧目录范围也不再视为有效。
 
 ## 搜索与重复读取性能
 
 原生 MCP 的 `outlook_local_search` 支持 `query`、`field`、`person`、`person_role` 和 `search_body`，人员角色为 `any` / `sender` / `to` / `cc`；关键词和人员条件按 AND 组合。Osa 收件人被脱敏或缺失时，服务读取本地 HxStore 的 Person 对象，按 UTF-16LE 解码真实姓名、邮箱，并通过邮件头及 To/Cc 父集合引用关联邮件；不解码 `pii:` 占位符，不从正文猜测，也不依赖网络 API。只接受已验证的对象布局，排除阅读窗对象、密送和歧义关联。
 
-`participants_status` 按角色标记 `verified`、`partial`、`missing`、`redacted` 或 `conflict` 等状态；`participants_evidence` 说明 HxStore 来源、解析人数和日志人数。HxStore 人员只有在没有拒绝记录、且人数与最新明确完整的 Osa 观察一致时才标为 `verified`；没有完整日志或部分对象解析失败时，可搜索已确认人员，但标为 `partial`。对象版本冲突不返回该角色名单。`verified` 是本地证据一致，不保证服务端或整个邮箱完整。`person_search_incomplete` 提醒本地证据可能漏项；原始 Exchange 地址不等于已验证的 SMTP 别名。共享 CLI 用 `search --query '预算' --person '张三' --person-role any`，按文件夹分别检索。
+完整结果（`detail: "full"`）中的 `participants_status` 按角色标记 `verified`、`partial`、`missing`、`redacted` 或 `conflict` 等状态；`participants_evidence` 说明 HxStore 来源、解析人数和日志人数。HxStore 人员只有在没有拒绝记录、且人数与最新明确完整的 Osa 观察一致时才标为 `verified`；没有完整日志或部分对象解析失败时，可搜索已确认人员，但标为 `partial`。对象版本冲突不返回该角色名单。`verified` 是本地证据一致，不保证服务端或整个邮箱完整。`person_search_incomplete` 提醒本地证据可能漏项；原始 Exchange 地址不等于已验证的 SMTP 别名。共享 CLI 用 `search --query '预算' --person '张三' --person-role any`，按文件夹分别检索。
 
 常驻进程最多缓存 3 个已验证索引，文件内容、身份或权限变化会使缓存失效。宽范围搜索只为返回页生成完整元数据，正文按需解析。默认刷新周期为 300 秒。目录快照格式为 8，升级后首次使用会重建索引。升级已安装 MCP 后须重新连接客户端，让常驻进程加载新代码。
 
@@ -114,7 +114,7 @@ HxStore 的 LZ4 解压改用批量复制，保留重叠复制语义、CRC 和边
 | `format: "html"` | `UNSUPPORTED_FORMAT` |
 | 已删除、草稿、垃圾邮件、发件箱 | 默认范围返回 `SCOPE_DENIED`。账户范围缺少相应目录证据时返回 `FOLDER_UNAVAILABLE` |
 
-未验证的已读状态、收件人等字段为 null。附件列表只包含识别到的记录，`attachments_complete: false`；不能由列表为空推断原邮件无附件。读取前核对附件指纹，按需复制到服务自己的导出目录，分块返回 base64 与整文件 SHA-256。私有附件导出最多保留 64 个文件、总计 512 MiB，淘汰后可重新从仍有效的原始缓存读取。CLI `download` 校验大小和哈希，使用独占创建拒绝覆盖，单附件上限 10 MiB。
+未验证的已读状态、收件人等字段为 null。附件列表只包含识别到的记录，完整结果中为 `attachments_complete: false`；不能由列表为空推断原邮件无附件。读取前核对附件指纹，按需复制到服务自己的导出目录，分块返回 base64 与整文件 SHA-256。私有附件导出最多保留 64 个文件、总计 512 MiB，淘汰后可重新从仍有效的原始缓存读取。CLI `download` 校验大小和哈希，使用独占创建拒绝覆盖，单附件上限 10 MiB。
 
 原生 MCP 批量正文读取的 64 MiB 预算计入实际读取的外部正文文件、解码后的 HTML 字节和实际解压的数据块；gzip 解压受剩余预算限制。已恢复的正文缓存命中不消耗该源处理预算，同次读取命中块缓存不重复计费，淘汰后再次解压会再次计费。另设 64 MiB 的批量缓存校验预算，限制重启后首次读取的正文哈希和文本块校验；进程内已校验且指纹未变的内容不重复计费。超出预算的邮件返回明确错误，可改为单封读取。
 

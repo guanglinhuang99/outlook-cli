@@ -240,7 +240,7 @@ ID 编码了后端和对象身份，Mac ID 还绑定缓存快照；调用方应�
 ```
 
 - 日期范围是 `[after, before)`，须带时区。Windows 和 Mac 均按接收时间筛选，`date_basis` 为 `received_at`。Mac 使用经时间戳核对、且身份关联可靠的 Osa `LastDeliveryTime`；缺失或冲突时返回 null，不回退到发送时间。
-- Mac 返回 `received_time_status`、`received_time_method` 标明接收时间证据。无日期条件时仍可检索、阅读缺失接收时间的邮件；有日期条件时排除这些邮件，并返回 `received_time_unknown` 及 `date_filter_incomplete`，不会伪装成完整日期结果。按接收时间倒序排列，缺失时间排在末尾。
+- Mac 在完整结果（`detail: "full"`）中返回 `received_time_status`、`received_time_method` 标明接收时间证据；精简结果只在接收时间未验证时返回 `received_time_status`。无日期条件时仍可检索、阅读缺失接收时间的邮件；有日期条件时排除这些邮件，并返回 `received_time_unknown` 及 `date_filter_incomplete`，不会伪装成完整日期结果。按接收时间倒序排列，缺失时间排在末尾。
 - `today` 使用 `Asia/Singapore` 的当天零点至次日零点。 显式 `date` 支持 `1970-01-01` 至 `9999-12-30`，按历史时区规则计算零点。翻页时传回第一页返回的 `date` 和 `next_offset`，防止跨午夜后切换日期。例如 `node bin/outlook.mjs today --date 2026-10-20 --offset 25`。默认只查收件箱根目录；已发送用 `--folder sent`，子目录传对应 ID。
 - 每页默认 25，最多 200。每次最多检查 `scan_limit` 个项目，默认 500，上限 2,000。
 - **搜索只覆盖指定文件夹。** 查询是大小写不敏感的字面子串，不是 SQL 或正则表达式。`search_body` 默认 false。

@@ -23,7 +23,7 @@ node bin/outlook.mjs messages --folder inbox --unread true --limit 25
 node bin/outlook.mjs context-bundle --folder all --unread true --limit 100
 ```
 
-未知未读状态会从筛选结果排除，并计入 `unread_unknown_count`。每封邮件的 `unread_evidence.observed_at` 是最新通过校验的本地观察时间。
+未知未读状态会从筛选结果排除，并计入 `unread_unknown_count`。完整结果（`detail: "full"`）中每封邮件的 `unread_evidence.observed_at` 是最新通过校验的本地观察时间。
 
 ## 会话、增量与任务
 
