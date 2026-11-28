@@ -14,6 +14,7 @@ from hxrecords import (  # noqa: E402
     FRAME_PREFIX,
     Frame,
     INLINE_BODY_CLASS_OFFSET,
+    INLINE_BODY_PADDED_CLASS_OFFSET,
     INLINE_BODY_EXTRA_VARIANT,
     INLINE_BODY_EXTRA_POOL_LENGTH,
     INLINE_BODY_EXTRA_POOL_OFFSET,
@@ -212,10 +213,14 @@ def inline_body_frame(key, full_html, unique_html=None, owner=None, **overrides)
         owner_cursor += len(marker_prefix) + 8
 
     payload_base = INLINE_BODY_PAYLOAD_BASE
-    if (extra_variant in (INLINE_BODY_EXTRA_VARIANT,
-                          INLINE_BODY_STANDARD_VARIANT,
-                          INLINE_BODY_VARIANT_5)
-            and extra_offset == 18 and extra_length == 16):
+    if extra_offset == 0 and extra_length == 0:
+        # Standard payloads begin immediately after the sole class anchor.
+        # This keeps the fixture aligned when testing the padded 1884 layout.
+        payload_base = class_offset + len(ANCHOR)
+    elif (extra_variant in (INLINE_BODY_EXTRA_VARIANT,
+                            INLINE_BODY_STANDARD_VARIANT,
+                            INLINE_BODY_VARIANT_5)
+          and extra_offset == 18 and extra_length == 16):
         payload_base = INLINE_BODY_CLASS_OFFSET + extra_offset + extra_length
 
     # Avoid allocating unbounded memory for a deliberately invalid offset.
@@ -826,6 +831,51 @@ class HxRecordTests(unittest.TestCase):
         self.assertEqual(parsed["evidence"]["extra_pool_field"]["offset"], 0)
         self.assertEqual(parsed["evidence"]["extra_pool_field"]["length"], 0)
         self.assertNotIn("requires_preview_match", parsed["evidence"])
+
+    def test_inline_body_accepts_padded_class_layout_with_preview_guard(self):
+        key = 0xA113
+        body = "<html><body>新布局完整正文中文😀。</body></html>".encode()
+        raw = inline_body_frame(
+            key,
+            body,
+            class_offset=INLINE_BODY_PADDED_CLASS_OFFSET,
+        )
+
+        self.assertEqual(INLINE_BODY_PADDED_CLASS_OFFSET, 1884)
+        self.assertEqual(raw.count(ANCHOR), 1)
+        self.assertEqual(raw[INLINE_BODY_CLASS_OFFSET:INLINE_BODY_PADDED_CLASS_OFFSET], b"\0" * 4)
+        parsed = parse_inline_body(as_frame(raw, kind=202, key=key))
+
+        self.assertEqual(parsed["data"], body)
+        self.assertEqual(parsed["evidence"]["class_offset"], 1884)
+        self.assertEqual(parsed["evidence"]["payload_base"], 1902)
+        self.assertTrue(parsed["evidence"]["requires_preview_match"])
+
+    def test_inline_body_padded_layout_rejects_bad_padding_unknown_variant_and_bounds(self):
+        key = 0xA114
+        body = b"<html><body>padded layout guards</body></html>"
+
+        bad_padding = bytearray(
+            inline_body_frame(key, body, class_offset=INLINE_BODY_PADDED_CLASS_OFFSET)
+        )
+        bad_padding[INLINE_BODY_CLASS_OFFSET:INLINE_BODY_PADDED_CLASS_OFFSET] = b"\x01\0\0\0"
+
+        unknown_variant = inline_body_frame(
+            key,
+            body,
+            class_offset=INLINE_BODY_PADDED_CLASS_OFFSET,
+            extra_pool_variant=2,
+        )
+
+        out_of_bounds = inline_body_frame(
+            key,
+            body,
+            class_offset=INLINE_BODY_PADDED_CLASS_OFFSET,
+            full_offset=0x100001,
+        )
+
+        for raw in (bytes(bad_padding), unknown_variant, out_of_bounds):
+            self.assertIsNone(parse_inline_body(as_frame(raw, kind=202, key=key)))
 
     def test_inline_body_accepts_variant_five_standard_with_preview_guard(self):
         key = 0xA112

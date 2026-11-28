@@ -78,6 +78,37 @@ def message_header(entry, message_id, sent, folder, received=None, received_tick
     """
 
 
+def notification_new_message(entry, message_id, sent, folder, received=None,
+                             received_ticks=None, data=None):
+    """Build one strictly typed GetNotification NewMessage response."""
+
+    receipt = ""
+    if received is not None:
+        receipt += f"<LastDeliveryTime>{escape(received)}</LastDeliveryTime>"
+    if received_ticks is not None:
+        receipt += f"<ReceivedOrRenewTime>{escape(str(received_ticks))}</ReceivedOrRenewTime>"
+    return f"""
+      <NewMessage>
+        <MessageHeader>
+          <ImmId>{escape(entry)}</ImmId>
+          <InternetMessageId>{escape(message_id)}</InternetMessageId>
+          <SentTime>{escape(sent)}</SentTime>
+          {receipt}
+          <ViewId><OutlookId></OutlookId><ImmId>{escape(folder)}</ImmId><Type>1</Type></ViewId>
+        </MessageHeader>
+        {data if data is not None else message_data(entry)}
+      </NewMessage>
+    """
+
+
+def notification_response(new_message, *, include_get_notification=True,
+                          log_time="2026-10-20T02:01:00Z"):
+    path = "<NotificationBatch><Notification>" + new_message + "</Notification></NotificationBatch>"
+    if include_get_notification:
+        path = "<GetNotification>" + path + "</GetNotification>"
+    return f"<Response><LogTime>{escape(log_time)}</LogTime>{path}</Response>"
+
+
 class OsaScopeTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -864,6 +895,244 @@ class OsaScopeTests(unittest.TestCase):
         )
         self.assertEqual(result["messages"]["hx_epoch"]["folder_id"], "CHILD")
 
+    def test_getnotification_fallback_maps_exact_entry_and_preserves_receipt(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        sent = "2026-10-20T01:59:00Z"
+        received = "2026-10-20T02:00:00Z"
+        response = notification_response(
+            notification_new_message(
+                "ENTRY-NOTIFICATION",
+                "<notification@example.test>",
+                sent,
+                "CHILD",
+                received,
+                osa_scope._parse_explicit_time_ticks(received),
+            )
+        )
+        self.write_log("x.GetNotification.1.res.xmlgz", response)
+
+        result = osa_scope.read_scope(
+            self.profile,
+            [{
+                "id": "hx_notification",
+                "message_id": "<notification@example.test>",
+                "sent_unix": osa_scope._parse_time(sent),
+                "entry_ids": ["ENTRY-NOTIFICATION"],
+            }],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_notification"]
+        self.assertEqual(row["folder_id"], "CHILD")
+        self.assertEqual(row["received_unix"], osa_scope._parse_time(received))
+        self.assertEqual(row["received_time_status"], "verified")
+        self.assertEqual(row["evidence"]["match_method"], "exact_entry_id_notification")
+
+    def test_getnotification_does_not_override_primary_observation(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        sent = "2026-10-20T01:59:00Z"
+        entry = "ENTRY-NOTIFICATION-PRIMARY"
+        message_id = "<notification-primary@example.test>"
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><LogTime>2026-10-20T02:01:00Z</LogTime>"
+            + message_header(entry, message_id, sent, "CHILD")
+            + "</Response>",
+        )
+        self.write_log(
+            "x.GetNotification.1.res.xmlgz",
+            notification_response(notification_new_message(entry, message_id, sent, "SENT")),
+        )
+
+        result = osa_scope.read_scope(
+            self.profile,
+            [{
+                "id": "hx_notification_primary",
+                "message_id": message_id,
+                "sent_unix": osa_scope._parse_time(sent),
+                "entry_ids": [entry],
+            }],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_notification_primary"]
+        self.assertEqual(row["folder_id"], "CHILD")
+        self.assertEqual(row["evidence"]["match_method"], "exact_entry_id")
+
+    def test_getnotification_requires_typed_path_complete_data_and_inbox_scope(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        sent = "2026-10-20T01:59:00Z"
+        cases = [
+            (
+                "hx_notification_spoofed_path",
+                "<notification-spoofed@example.test>",
+                "ENTRY-NOTIFICATION-SPOOFED",
+                notification_response(
+                    notification_new_message(
+                        "ENTRY-NOTIFICATION-SPOOFED",
+                        "<notification-spoofed@example.test>",
+                        sent,
+                        "CHILD",
+                    ),
+                    include_get_notification=False,
+                ),
+            ),
+            (
+                "hx_notification_wrong_folder",
+                "<notification-deleted@example.test>",
+                "ENTRY-NOTIFICATION-DELETED",
+                notification_response(
+                    notification_new_message(
+                        "ENTRY-NOTIFICATION-DELETED",
+                        "<notification-deleted@example.test>",
+                        sent,
+                        "NO-SUCH-FOLDER",
+                    )
+                ),
+            ),
+            (
+                "hx_notification_partial",
+                "<notification-partial@example.test>",
+                "ENTRY-NOTIFICATION-PARTIAL",
+                notification_response(
+                    notification_new_message(
+                        "ENTRY-NOTIFICATION-PARTIAL",
+                        "<notification-partial@example.test>",
+                        sent,
+                        "CHILD",
+                        data=message_data(
+                            "ENTRY-NOTIFICATION-PARTIAL", partial="1"
+                        ),
+                    )
+                ),
+            ),
+            (
+                "hx_notification_unmatched",
+                "<notification-unmatched@example.test>",
+                "ENTRY-NOTIFICATION-UNMATCHED",
+                notification_response(
+                    notification_new_message(
+                        "ENTRY-NOTIFICATION-OTHER",
+                        "<notification-other@example.test>",
+                        sent,
+                        "CHILD",
+                    )
+                ),
+            ),
+        ]
+        for index, (_, _, _, response) in enumerate(cases, 1):
+            self.write_log(f"x.GetNotification.{index}.res.xmlgz", response)
+
+        result = osa_scope.read_scope(
+            self.profile,
+            [
+                {
+                    "id": identifier,
+                    "message_id": message_id,
+                    "sent_unix": osa_scope._parse_time(sent),
+                    "entry_ids": [entry],
+                }
+                for identifier, message_id, entry, _ in cases
+            ],
+            log_root=self.log_root,
+        )
+        for identifier, _, _, _ in cases:
+            self.assertNotIn(identifier, result["messages"])
+
+    def test_unread_requires_identity_consistent_latest_observation(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        sent = "2026-10-20T01:59:00Z"
+        entries = {"updated", "conflict", "wrong-mid", "missing", "primary"}
+        headers = "".join(
+            message_header(entry, f"<{entry}@example.test>", sent, "INBOX").replace(
+                "</MessageHeader>", ("" if entry == "missing" else "<UnReadCount>1</UnReadCount>")
+                + "</MessageHeader>")
+            for entry in sorted(entries)
+        )
+        self.write_log("x.GetMessage.1.res.xmlgz",
+                       f"<Response><LogTime>2026-10-20T02:01:00Z</LogTime>{headers}</Response>")
+
+        def change(entry, value, mid=None):
+            return (f"<UpdatedMessageHeader><ImmId>{entry}</ImmId>"
+                    f"<InternetMessageId>{escape(mid or f'<{entry}@example.test>')}</InternetMessageId>"
+                    f"<SentTime>{sent}</SentTime><UnReadCount>{value}</UnReadCount>"
+                    "<ViewId><ImmId>INBOX</ImmId></ViewId></UpdatedMessageHeader>")
+
+        self.write_log("x.GetNotification.1.res.xmlgz", notification_response(
+            change("updated", 0) + change("conflict", 0) + change("conflict", 1)
+            + change("wrong-mid", 0, "<wrong@example.test>"), log_time="2026-10-20T02:02:00Z"))
+        result = osa_scope.read_scope(self.profile, [
+            {"id": entry, "entry_ids": [entry], "message_id": f"<{entry}@example.test>",
+             "sent_unix": osa_scope._parse_time(sent)} for entry in entries
+        ], log_root=self.log_root)["messages"]
+        self.assertEqual({key: row["unread"] for key, row in result.items()},
+                         {"updated": False, "primary": True, "conflict": None,
+                          "wrong-mid": None, "missing": None})
+        self.assertEqual(result["updated"]["unread_evidence"], {
+            "observed_at": "2026-10-20T02:02:00Z", "method": "osa_notification",
+        })
+
+    def test_getnotification_deletions_and_folder_changes_block_supplemental_access(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        sent = "2026-10-20T01:59:00Z"
+        values = [("deleted", "INBOX"), ("moved", "INBOX"), ("removed-folder", "CHILD"),
+                  ("same-folder-update", "INBOX")]
+        self.write_log(
+            "x.GetNotification.1.res.xmlgz",
+            notification_response("".join(
+                notification_new_message(key, f"<{key}@example.test>", sent, folder)
+                for key, folder in values
+            )),
+        )
+        self.write_log(
+            "x.GetNotification.2.res.xmlgz",
+            notification_response(
+                "<DeletedMessage><ImmId>deleted</ImmId></DeletedMessage>"
+                "<DeletedFolder><ImmId>CHILD</ImmId></DeletedFolder>"
+                "<UpdatedMessageHeader><ImmId>moved</ImmId>"
+                "<InternetMessageId>&lt;moved@example.test&gt;</InternetMessageId>"
+                "<ViewId><ImmId>DELETED</ImmId></ViewId></UpdatedMessageHeader>"
+                "<UpdatedMessageHeader><ImmId>same-folder-update</ImmId>"
+                "<InternetMessageId>&lt;same-folder-update@example.test&gt;</InternetMessageId>"
+                "<ViewId><ImmId>INBOX</ImmId></ViewId></UpdatedMessageHeader>",
+                log_time="2026-10-20T02:02:00Z",
+            ),
+        )
+        rows = [{"id": key, "entry_ids": [key], "message_id": f"<{key}@example.test>",
+                 "time_method": "missing_header_field_271"} for key, _ in values]
+        cache_path = self.profile.parent / "notifications.sqlite3"
+        for _ in range(2):
+            cache = osa_scope.LogParseCache(path=cache_path)
+            result = osa_scope.read_scope(self.profile, rows, log_root=self.log_root, parse_cache=cache)
+            self.assertEqual(set(result["messages"]), {"same-folder-update"})
+            self.assertEqual(result["evidence"]["messages_notification_conflict"], 3)
+        self.assertTrue(cache_path.is_file())
+
+    def test_getnotification_competing_mid_under_different_entry_is_rejected(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        sent = "2026-10-20T01:59:00Z"
+        message_id = "<notification-competing@example.test>"
+        response = (
+            "<Response><GetNotification><NotificationBatch>"
+            "<Notification>"
+            + notification_new_message("ENTRY-NOTIFICATION-A", message_id, sent, "CHILD")
+            + "</Notification><Notification>"
+            + notification_new_message("ENTRY-NOTIFICATION-B", message_id, sent, "CHILD")
+            + "</Notification>"
+            "</NotificationBatch></GetNotification></Response>"
+        )
+        self.write_log("x.GetNotification.1.res.xmlgz", response)
+
+        result = osa_scope.read_scope(
+            self.profile,
+            [{
+                "id": "hx_notification_competing",
+                "message_id": message_id,
+                "sent_unix": osa_scope._parse_time(sent),
+                "entry_ids": ["ENTRY-NOTIFICATION-A"],
+            }],
+            log_root=self.log_root,
+        )
+        self.assertNotIn("hx_notification_competing", result["messages"])
+
     def test_exact_entry_id_conflicts_are_excluded_without_mid_fallback(self):
         self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
         self.write_log(
@@ -898,6 +1167,75 @@ class OsaScopeTests(unittest.TestCase):
         )
         self.assertNotIn("hx_time", result["messages"])
         self.assertEqual(result["evidence"]["messages_exact_time_conflict"], 1)
+
+    def test_missing_hx_sent_time_backfills_from_matching_osa_identity(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        received = "2026-10-20T02:00:00Z"
+        received_ticks = osa_scope._parse_explicit_time_ticks(received)
+        entry, mid = "ENTRY-MISSING-271", "<missing-271@example.test>"
+        for number, sent in enumerate(("2026-10-20T01:59:00Z", "2026-10-20T09:59:00+08:00"), 1):
+            self.write_log(
+                f"x.GetMessage.{number}.res.xmlgz",
+                f"<Response><LogTime>2026-10-20T02:0{number}:00Z</LogTime>"
+                + message_header(entry, mid, sent, "CHILD", received, received_ticks)
+                + "</Response>",
+            )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": "hx_missing_271", "message_id": mid, "entry_ids": [entry],
+              "time_method": "missing_header_field_271"}],
+            log_root=self.log_root,
+        )
+        row = result["messages"]["hx_missing_271"]
+        self.assertEqual(row["sent_unix"], osa_scope._parse_time("2026-10-20T01:59:00Z"))
+        self.assertEqual(row["received_unix"], osa_scope._parse_time(received))
+        self.assertEqual(row["received_time_status"], "verified")
+
+    def test_missing_hx_sent_time_requires_both_identities_and_missing_field(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        entry, mid = "ENTRY-MISSING-271", "<missing-271@example.test>"
+        self.write_log(
+            "x.GetMessage.1.res.xmlgz",
+            "<Response><LogTime>2026-10-20T02:01:00Z</LogTime>"
+            + message_header(entry, mid, "2026-10-20T01:59:00Z", "CHILD")
+            + "</Response>",
+        )
+        candidates = [
+            {"id": "wrong_entry", "message_id": mid, "entry_ids": ["OTHER-ENTRY"],
+             "time_method": "missing_header_field_271"},
+            {"id": "wrong_mid", "message_id": "<other@example.test>", "entry_ids": [entry],
+             "time_method": "missing_header_field_271"},
+            {"id": "no_entry", "message_id": mid, "time_method": "missing_header_field_271"},
+            {"id": "unknown_field", "message_id": mid, "entry_ids": [entry]},
+        ]
+        result = osa_scope.read_scope(self.profile, candidates, log_root=self.log_root)
+        self.assertEqual(result["messages"], {})
+
+    def test_missing_hx_sent_time_rejects_missing_invalid_and_conflicting_osa_times(self):
+        self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())
+        candidates = [
+            ("missing", "", "2026-10-20T01:59:00Z"),
+            ("invalid", "not-a-date", "2026-10-20T01:59:00Z"),
+            ("conflict", "2026-10-20T01:59:00.0000001Z", "2026-10-20T01:59:00.0000002Z"),
+        ]
+        for number in (1, 2):
+            self.write_log(
+                f"x.GetMessage.{number}.res.xmlgz",
+                f"<Response><LogTime>2026-10-20T02:0{number}:00Z</LogTime>"
+                + "".join(
+                    message_header(f"ENTRY-{row[0]}", f"<{row[0]}@example.test>", row[number], "CHILD")
+                    for row in candidates
+                )
+                + "</Response>",
+            )
+        result = osa_scope.read_scope(
+            self.profile,
+            [{"id": f"hx_{key}", "message_id": f"<{key}@example.test>", "entry_ids": [f"ENTRY-{key}"],
+              "time_method": "missing_header_field_271"} for key, _, _ in candidates],
+            log_root=self.log_root,
+        )
+        self.assertEqual(result["messages"], {})
+        self.assertEqual(result["evidence"]["messages_exact_time_conflict"], len(candidates))
 
     def test_partial_exact_entry_id_hit_is_excluded_without_mid_fallback(self):
         self.write_log("x.GetFolder.1.res.xmlgz", self.folder_log())

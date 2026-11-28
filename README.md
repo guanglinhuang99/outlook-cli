@@ -2,7 +2,7 @@
 
 让本机 Agent 通过统一的 **CLI 和 MCP** 读取 Windows、macOS 上的 Outlook 邮件。支持邮件检索、中文正文读取、附件下载，以及按日期查询。
 
-**原始邮件只读**：不发送、删除、移动邮件，也不修改已读状态。邮箱登录和同步由 Outlook 完成；本项目不内置 AI 模型，不需要模型 API Key 或 Microsoft Graph OAuth。
+**本地读取服务只读。** Outlook 负责登录和同步。本地附件与语义检索在本机处理。已读标记、移动、草稿与发送由单独授权的 `graph` 命令访问 Microsoft Graph。[Apple Mail 迁移对照和配置](docs/applemail-migration.md)
 
 > **v0.3.0** 支持 Windows 和 macOS。Windows 可下载安装包，macOS 从源码安装。
 
@@ -103,7 +103,7 @@ COM 服务应与 Outlook 使用相同的 Windows 用户、交互式会话和权�
 
 ## 日常使用
 
-下列 `node bin/outlook.mjs` 命令在两个平台通用。Windows 也可换成 `.\outlook.cmd`。成功结果为 JSON；错误写入 stderr，退出码非零。
+单封和单目录的 `node bin/outlook.mjs` 命令在两个平台通用。Windows 也可换成 `.\outlook.cmd`。成功结果为 JSON；错误写入 stderr，退出码非零。
 
 ### 今天和最近的邮件
 
@@ -133,7 +133,17 @@ node bin/outlook.mjs read --id '<message_id>' --max-chars 20000
 node bin/outlook.mjs read --id '<message_id>' --body-offset 20000 --max-chars 20000
 ```
 
-将示例占位符替换成响应中的真实 ID。检索结果的 `next_offset` 非空时，保持原筛选条件并用 `--offset` 继续；空白页不代表检索结束。Mac 暂不支持未读筛选或 HTML 原文请求；正文搜索需显式设置 `--search-body true`，并按 `fulltext.pending` / `body_search_incomplete` 处理索引状态。
+将示例占位符替换成响应中的真实 ID。检索结果的 `next_offset` 非空时，保持原筛选条件并用 `--offset` 继续；空白页不代表检索结束。Mac 的未读筛选仅匹配本地已验证的状态。正文搜索需显式设置 `--search-body true`，并按 `fulltext.pending` / `body_search_incomplete` 处理索引状态。Mac 的正文以文本返回。
+
+### 跨目录检索和批量读取（macOS）
+
+```sh
+node bin/outlook.mjs context-bundle --folder all --query '预算' --mode metadata
+node bin/outlook.mjs messages-bundle --id '<message_id_1>' --id '<message_id_2>'
+node bin/outlook.mjs today-bundle --folder inbox --mode context --limit 10
+```
+
+`context-bundle` 默认只读元数据。`today-bundle` 默认返回有预算限制的正文。`messages-bundle` 接受同一查询快照中的最多 25 个邮件 ID。跨目录日期筛选和翻页仍按 `received_at` 与 `Asia/Singapore`。详细参数及覆盖状态见 [macOS 批量工作流](docs/macos.md#跨目录查询与批量读取)。
 
 ### 读取收件箱、已发送下的全部子目录
 
@@ -177,7 +187,7 @@ Mac 原生 `outlook_local_search` 的 JSON 参数：
 
 Mac 原生 MCP 使用 `outlook_local_search`，例如 `{"query":"预算","field":"all","search_body":true,"person":"张三","person_role":"any","from_date":"2026-10-01","limit":20}`。不指定 `folder_id` 时覆盖已验证的收件箱、已发送及子目录；指定后默认含子目录。原生分页使用 `next_cursor`，共享 CLI/MCP 使用 `next_offset`。原生 `complete` 仍表示分页是否结束；正文索引状态单独看 `body_search_incomplete` 和 `fulltext`，pending 大于 0 时先重复第一页。
 
-Mac 只公开已确认的收件箱和已发送目录树。目录名可能被 Outlook 脱敏，服务不会猜测原名称。邮件 ID 属于具体后端和缓存快照，失效时重新检索获取。
+Mac 默认公开已确认的收件箱和已发送目录树。共享服务可以显式启用 `account` 范围，纳入有证据的账户和联机存档目录。目录名可能被 Outlook 脱敏。邮件 ID 属于具体后端和缓存快照，失效时重新检索获取。
 
 ### 复制邮件为 MSG 文件（Windows）
 
@@ -192,6 +202,8 @@ Mac 只公开已确认的收件箱和已发送目录树。目录名可能被 Out
 ```sh
 node bin/outlook.mjs attachments --id '<message_id>'
 node bin/outlook.mjs download --id '<message_id>' --index 1 --out './report.xlsx'
+node bin/outlook.mjs download-all --id '<message_id>' --out-dir './downloads'
+node bin/outlook.mjs attachment-text --id '<message_id>' --index 1 --max-chars 8000
 ```
 
 附件序号从 1 开始。下载自动分块并校验 SHA-256，拒绝覆盖已有文件。只支持可读取的普通文件附件；Mac 附件列表可能不完整，列表为空不证明原邮件没有附件。
@@ -260,6 +272,9 @@ codex mcp list
 | `outlook_read` | 读取邮件与分页正文 |
 | `outlook_attachments` | 列出附件 |
 | `outlook_read_attachment` | 分块读取附件内容 |
+| `outlook_context_bundle`（macOS） | 一次跨目录检索元数据，按需读取该页正文 |
+| `outlook_today_bundle`（macOS） | 一次列出并读取今天或指定日期的同一页邮件 |
+| `outlook_messages_bundle`（macOS） | 批量读取选中的邮件和可用正文 |
 
 可向 Agent 提出这样的请求：
 
@@ -286,7 +301,7 @@ codex mcp list
 | Mac profile 不唯一 | 设置 `OUTLOOK_MAC_PROFILE` 后重新启动服务 |
 | `FOLDER_AMBIGUOUS` | 通过 `stores` → `folders` 获取明确目录 ID |
 | 正文或附件缺失 | 检查返回的状态和诊断，确认 Outlook 已同步；不要把缺失当成空内容 |
-| Mac 参数不支持 | 移除 `unread` 或 `format: html`；正文搜索使用 `search_body: true` 明确启用 |
+| Mac 返回 `UNSUPPORTED_FORMAT` | 移除 `format: html`，使用默认文本格式 |
 | Windows COM 不可用 | 检查经典 Outlook 和服务的登录会话，或使用已配置的本地 OST/PST |
 | Agent 连接失败 | 确认服务已启动，配置中的绝对路径和状态目录一致 |
 

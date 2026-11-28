@@ -2,7 +2,7 @@
 
 本文对应 Outlook CLI v0.3.0。Windows 可以使用 [发布安装包](https://github.com/guanglinhuang99/outlook-cli/releases/tag/v0.3.0)，安装及验收步骤见 [Windows 安装说明](../INSTALL-WINDOWS.md)。下面的步骤适用于从源码安装。
 
-该项目让**运行在邮箱所在电脑上的 Agent** 通过 CLI 或 MCP 读取 Outlook。它不需要模型 API Key，也不通过 Microsoft Graph 登录；邮箱登录和同步由本机 Outlook 完成。原始邮件只读，不发送、删除、移动邮件或修改已读状态。程序会创建自己的索引及附件导出文件。
+该项目让**运行在邮箱所在电脑上的 Agent** 通过 CLI 或 MCP 只读访问 Outlook。邮箱登录和同步由本机 Outlook 完成，服务在本机创建索引和附件导出文件。可选的 `graph` CLI 使用单独的 Microsoft Graph 授权。[Graph 配置和命令](applemail-migration.md#microsoft-graph-授权与写操作)
 
 ## 1. 先检查是否已经安装
 
@@ -82,7 +82,7 @@ node scripts/check-mcp.mjs mcp-config.local.json --health
 
 第二条命令生成 UTF-8 配置，避免 Windows PowerShell 5.1 普通重定向产生 UTF-16 文件。该文件已被 Git 忽略，不含访问令牌；不要手写或复制别台电脑的绝对路径。
 
-校验成功应显示 `mcp: "ready"`、`transport: "stdio"`、实际邮箱后端，以及 9 个 `outlook_*` 工具。协议连接成功但邮箱未连接时不算安装验收通过。
+校验成功应显示 `mcp: "ready"`、`transport: "stdio"`、实际邮箱后端和相应的工具列表。Windows 有 9 个通用 `outlook_*` 工具，macOS 另有 3 个批量工具。协议和邮箱后端都连通时才算安装验收通过。
 
 ### 添加到客户端
 

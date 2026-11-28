@@ -32,7 +32,7 @@ from hxrecords import (entry_ids, file_references, iter_frames, normalize_subjec
                        parse_person, person_parent)
 
 
-VERSION = 21
+VERSION = 22
 MAX_BODY = 64 * 1024 * 1024
 MAX_ATTACHMENT = 256 * 1024 * 1024
 MAX_IN_MEMORY_SOURCE = 64 * 1024**2
@@ -433,13 +433,14 @@ def _frozen_source(directory, index):
     return source
 
 
-def reusable_snapshot(state, profile, source, from_date, freeze_bodies=True):
+def reusable_snapshot(state, profile, source, from_date, freeze_bodies=True, include_osa_candidates=False):
     body_mode = "eager" if freeze_bodies else "deferred"
     try:
         directory, index = load_index(state)
         if (index.get("profile") != str(profile)
                 or index.get("summary", {}).get("scope_from_date") != from_date
-                or index.get("summary", {}).get("body_mode", "eager") != body_mode):
+                or index.get("summary", {}).get("body_mode", "eager") != body_mode
+                or ("osa_sent_candidates" in index) != include_osa_candidates):
             return None
         if not freeze_bodies:
             _frozen_source(directory, index)
@@ -655,7 +656,8 @@ def make_snapshot(args):
     state = state_root(args.state, profile, create=True)
     source = profile / "HxStore.hxd"
     freeze_bodies = getattr(args, "freeze_bodies", True)
-    reused = reusable_snapshot(state, profile, source, args.from_date, freeze_bodies)
+    include_osa_candidates = getattr(args, "include_osa_candidates", False)
+    reused = reusable_snapshot(state, profile, source, args.from_date, freeze_bodies, include_osa_candidates)
     if reused is not None:
         return reused
     build = Path(tempfile.mkdtemp(prefix=f".building-{os.getpid()}-", dir=state))
@@ -705,7 +707,10 @@ def make_snapshot(args):
             raise ValueError("Outlook cache kept changing; no snapshot published")
         assets = asset_digest(profile)
         body_mode = "eager" if freeze_bodies else "deferred"
-        snapshot_id = sha(f"{VERSION}|{profile}|{digest}|{assets}|{args.from_date}|{body_mode}".encode())[:24]
+        snapshot_key = f"{VERSION}|{profile}|{digest}|{assets}|{args.from_date}|{body_mode}"
+        if include_osa_candidates:
+            snapshot_key += "|osa-sent-candidates-v1"
+        snapshot_id = sha(snapshot_key.encode())[:24]
         final = state / "snapshots" / snapshot_id
         if final.is_symlink():
             raise ValueError("snapshot directory must not be a symbolic link")
@@ -861,11 +866,15 @@ def make_snapshot(args):
             if row["sent_unix"] is None:
                 if len(sent_times) == 1:
                     row.update(sent_unix=next(iter(sent_times)), time_method="header_field_271_same_identity")
+                elif (include_osa_candidates and row["entry_ids"]
+                      and not any(version["has_send_time_field"] for version in versions)):
+                    row["time_method"] = "missing_header_field_271"
                 else:
                     unresolved_times += 1
                     continue
-            if row["sent_unix"] is None or row["sent_unix"] < cutoff:
+            if row["sent_unix"] is not None and row["sent_unix"] < cutoff:
                 continue
+            row.pop("has_send_time_field")
             row["attachments"] = []
             row["mailbox_state"] = "unverified"
             targets = header_body_targets[key]
@@ -979,7 +988,8 @@ def make_snapshot(args):
                 temporary = body.get("data_path")
                 if temporary is not None:
                     Path(temporary).unlink(missing_ok=True)
-        items = sorted(chosen.values(), key=lambda row: (-row["sent_unix"], row["id"]))
+        items = sorted((row for row in chosen.values() if row["sent_unix"] is not None),
+                       key=lambda row: (-row["sent_unix"], row["id"]))
         summary = {"scope_from_date": args.from_date, "timezone": "Asia/Singapore",
                    "body_mode": body_mode,
                    "messages": len(items), "paired_subjects": sum(bool(r["subject"]) for r in items),
@@ -1004,6 +1014,8 @@ def make_snapshot(args):
                  "source_copy_fingerprint": source_copy_fingerprint,
                  "source_block_bytes": source_block_bytes,
                  "created_at": datetime.now(timezone.utc).isoformat(), "summary": summary, "items": items}
+        if include_osa_candidates:
+            index["osa_sent_candidates"] = [row for row in chosen.values() if row["sent_unix"] is None]
         (build / "index.json").write_text(json.dumps(index, ensure_ascii=False))
         build.rename(final)
         publish_current(state, snapshot_id)
@@ -1117,8 +1129,15 @@ def search_candidates(index, args):
     person = getattr(args, "person", None)
     role = getattr(args, "person_role", "any")
     person_incomplete = False
-    unknown_times = sum(row.get("received_unix") is None for row in index["items"])
-    for row in sorted(index["items"], key=received_sort_key):
+    rows = index["items"]
+    has_cached_attachments = getattr(args, "has_cached_attachments", None)
+    if has_cached_attachments is not None:
+        rows = [row for row in rows if any(attachment.get("status") == "cached_at_snapshot"
+                                           for attachment in row["attachments"]) == has_cached_attachments]
+    unknown_times = sum(row.get("received_unix") is None for row in rows)
+    unread = getattr(args, "unread", None)
+    unknown_unread = 0
+    for row in sorted(rows, key=received_sort_key):
         received = row.get("received_unix")
         if start is not None or end is not None:
             if received is None or (start is not None and received < start) or (end is not None and received >= end):
@@ -1127,10 +1146,15 @@ def search_candidates(index, args):
         person_incomplete |= incomplete
         if person and not person_roles:
             continue
+        unknown_unread += row.get("unread") is None
+        if unread is not None and row.get("unread") is not unread:
+            continue
         candidates.append((row, person_roles))
     return candidates, {"received_time_unknown": unknown_times,
                         "date_filter_incomplete": bool(unknown_times and (start is not None or end is not None)),
-                        "person_search_incomplete": person_incomplete}
+                        "person_search_incomplete": person_incomplete,
+                        "unread_unknown_count": unknown_unread,
+                        "unread_filter_incomplete": bool(unread is not None and unknown_unread)}
 
 
 def search(index, args):
@@ -1148,9 +1172,13 @@ def search(index, args):
         if query and not hits:
             continue
         matched.append((row, hits if query else [], person_roles))
-    signature = sha(json.dumps([index["snapshot"], args.query, args.field, args.from_date, args.to_date,
-                               args.limit, person, role, getattr(args, "search_body", False),
-                               getattr(args, "body_revision", None)]).encode())[:16]
+    selection = [index["snapshot"], args.query, args.field, args.from_date, args.to_date,
+                 args.limit, person, role, getattr(args, "search_body", False), getattr(args, "body_revision", None)]
+    if (has_cached_attachments := getattr(args, "has_cached_attachments", None)) is not None:
+        selection.append(has_cached_attachments)
+    if (unread := getattr(args, "unread", None)) is not None:
+        selection.append({"unread": unread})
+    signature = sha(json.dumps(selection).encode())[:16]
     offset = 0
     if args.cursor:
         cursor_signature, offset_value = args.cursor.split(":")

@@ -1,6 +1,7 @@
 import { OutlookBridge } from './bridge.mjs';
 import { MacCacheBridge } from './mac.mjs';
 import { LocalFileBridge, decodeId, localError } from './offline.mjs';
+import { isMacWorkflow } from './tools.mjs';
 
 const modes = ['auto', 'com', 'local', 'mac-cache'];
 const singaporeTimezone = 'Asia/Singapore';
@@ -101,6 +102,9 @@ export class BackendRouter {
   get active() { return this.bridges.find(bridge => bridge.active) ?? false; }
   async call(method, params = {}) {
     if (method === 'today') return this.today(params);
+    if (isMacWorkflow(method) && this.platform !== 'darwin') {
+      throw localError('UNSUPPORTED_PLATFORM', 'This workflow is only supported by the macOS cache backend');
+    }
     const { backend, com_body_mode, ...args } = params;
     const mode = backend ?? this.mode;
     const id = decodeId(args.id ?? args.folder);

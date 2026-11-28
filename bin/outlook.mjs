@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
-import { writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -8,9 +9,67 @@ import { parseArgs } from 'node:util';
 import { setTimeout as delay } from 'node:timers/promises';
 import { openRuntimeLog, prepareRuntime, runtimeDir, root, statePath, readState, request, call } from '../src/runtime.mjs';
 import { assertSafeMacPath } from '../src/mac-paths.mjs';
-import { validateCall, definitions } from '../src/tools.mjs';
+import { validateCall, definitions, isMacWorkflow } from '../src/tools.mjs';
 
 const print = value => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+const inputLimit = 4 * 1024 * 1024 + 32768;
+const oversizedInput = () => new Error(`Workflow JSON exceeds ${inputLimit} bytes`);
+
+async function readWorkflowInput(file) {
+  const chunks = [];
+  let size = 0;
+  const handle = file === '-' ? null : await open(file, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+  try {
+    if (handle) {
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error('--json-file requires a regular file or -');
+      if (info.size > inputLimit) throw oversizedInput();
+    }
+    const input = handle ? handle.createReadStream({ autoClose: false }) : process.stdin;
+    for await (const chunk of input) {
+      size += chunk.length;
+      if (size > inputLimit) throw oversizedInput();
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks).toString('utf8');
+  } finally {
+    if (handle) await handle.close();
+  }
+}
+
+async function workflowArguments(args) {
+  const { values } = parseArgs({ args, options: { json: { type: 'string' }, 'json-file': { type: 'string' } },
+    strict: true, allowPositionals: false });
+  if (values.json !== undefined && values['json-file'] !== undefined) {
+    throw new Error('--json and --json-file are mutually exclusive');
+  }
+  const source = values['json-file'] !== undefined ? await readWorkflowInput(values['json-file']) : (values.json ?? '{}');
+  if (Buffer.byteLength(source) > inputLimit) throw oversizedInput();
+  let params;
+  try { params = JSON.parse(source); } catch { throw new Error('Invalid workflow JSON'); }
+  if (!params || typeof params !== 'object' || Array.isArray(params)) throw new Error('Workflow JSON must be an object');
+  return params;
+}
+
+async function attachmentCommand(command, args) {
+  const options = { id: { type: 'string' }, backend: { type: 'string' } };
+  if (command === 'download-all') options['out-dir'] = { type: 'string' };
+  else {
+    options.index = { type: 'string' };
+    options['max-chars'] = { type: 'string' };
+  }
+  const { values } = parseArgs({ args, options, strict: true, allowPositionals: false });
+  const { id, backend } = validateCall('attachments', { id: values.id, backend: values.backend });
+  const workflows = await import('../src/attachment-workflows.mjs');
+  if (command === 'download-all') {
+    if (!values['out-dir']) throw new Error('download-all requires --out-dir');
+    return workflows.downloadAllAttachments({ id, backend, out_dir: values['out-dir'] });
+  }
+  const { index } = validateCall('read_attachment', { id, backend, index: Number(values.index) });
+  const maximum = values['max-chars'] === undefined ? {} : { max_chars: Number(values['max-chars']) };
+  return workflows.readAttachmentText({ id, backend, index, ...maximum });
+}
+
 function sameDownloadState(left, right) {
   const leftRoots = left.protected_mail_roots;
   const rightRoots = right.protected_mail_roots;
@@ -28,7 +87,7 @@ function downloadStateChanged() {
   });
 }
 
-const help = `Outlook Local Service — read-only, no AI
+const help = `Outlook CLI — local cache and optional Microsoft Graph workflows
 
   outlook-local start | stop | restart | status | health
   outlook-local clipboard start|stop|status  Windows Outlook copy-to-MSG bridge
@@ -39,8 +98,19 @@ const help = `Outlook Local Service — read-only, no AI
   outlook-local search [--query text] [--person name-or-email] [--person-role any|sender|to|cc]
                        [--search-body true] [--com-body-mode auto|direct|indexed] [--scan-limit 500]
   outlook-local read --id <message-id> [--max-chars 20000] [--body-offset 0]
+  outlook-local context-bundle [--folder inbox|sent|all|<id>] [--from-date YYYY-MM-DD] [--to-date YYYY-MM-DD]
+                               [--query text] [--unread true] [--mode metadata|context] [--cursor <cursor>]
+  outlook-local today-bundle [--folder inbox|sent|all|<id>] [--date YYYY-MM-DD] [--mode context|metadata]
+  outlook-local messages-bundle --id <message-id> [--id <message-id>] [--max-chars 12000]
   outlook-local attachments --id <message-id>
   outlook-local download --id <message-id> --index 1 --out <file>
+  outlook-local download-all --id <message-id> --out-dir <directory>
+  outlook-local attachment-text --id <message-id> --index 1 [--max-chars N]
+  outlook-local conversation | delta-bundle | task-bundle [--json '<JSON object>' | --json-file <file|->]
+  outlook-local knowledge status|sync|search|read|source|export|bundle [--json '<JSON object>' | --json-file <file|->]
+  outlook-local calendar status|calendars|agenda|authorize [--json '<JSON object>' | --json-file <file|->]
+  outlook-local semantic sync|search|status [--json '<JSON object>' | --json-file <file|->]
+  outlook-local graph <action>   [--json '<JSON object>' | --json-file <file|->]
   outlook-local mcp              MCP stdio adapter; requires running service
   outlook-local mcp-config       Print MCP stdio configuration (no secrets)
   outlook-local rpc <operation> --json '<JSON object>'
@@ -54,8 +124,17 @@ Windows auto/com may start classic Outlook on demand (OUTLOOK_AUTO_START=0 disab
 local never starts Outlook. auto reports explicit warnings when falling back to cached mail.
 Startup timeouts do not auto-fallback; check Outlook prompts or explicitly select local.
 Both platforms filter by received_at; macOS uses verified LastDeliveryTime.
-On macOS, Python 3.11+ is required; unread filters and HTML are unsupported.
+On macOS, Python 3.11+ is required. Unread filters use verified local state.
+Set OUTLOOK_MAC_FOLDER_SCOPE=account and separate service/cache directories
+to opt in to verified account and archive folder trees. HTML is unsupported.
+Bundle commands are macOS-only. By default, folder queries include descendants;
+use --include-subfolders false to query the selected roots or folder only.
+Metadata mode allows 100 results per page. Context mode reads cached bodies
+with --max-chars and --text-budget-chars and allows 25 results per page.
 Local reads contain cached data only; COM and local IDs are different.
+Semantic search uses a local embedding provider and the macOS cache workflows.
+Graph uses a separately authorized Microsoft mailbox. Drafts are sent only with graph draft-send.
+Use --json-file - to pass Graph draft content through stdin.
 Use stores -> root_id -> folders to discover other folders.
 All output is JSON, except help. Errors go to stderr with nonzero exit status.
 `;
@@ -102,6 +181,50 @@ async function main() {
   if (command === 'stop') return print(await stop());
   if (command === 'restart') { await stop(); return print(await start()); }
   if (command === 'status') return print(await request('/status'));
+  if (command === 'download-all' || command === 'attachment-text') return print(await attachmentCommand(command, args));
+  if (['conversation', 'delta-bundle', 'task-bundle'].includes(command)) {
+    const { runReadParity } = await import('../src/read-parity.mjs');
+    return print(await runReadParity(command, await workflowArguments(args), { call, stateDir: path.join(runtimeDir, 'read-parity') }));
+  }
+  if (command === 'knowledge' || command === 'calendar') {
+    const [action, ...options] = args;
+    const actions = command === 'knowledge'
+      ? ['status', 'sync', 'search', 'read', 'source', 'export', 'bundle']
+      : ['status', 'calendars', 'agenda', 'authorize'];
+    if (!action || action === 'help' || action === '--help') return print({ actions });
+    const params = await workflowArguments(options);
+    const stateDir = path.join(runtimeDir, command);
+    if (command === 'calendar') {
+      const { runCalendarWorkflow } = await import('../src/calendar-workflow.mjs');
+      return print(await runCalendarWorkflow(action, params));
+    }
+    const { readAttachmentText } = await import('../src/attachment-workflows.mjs');
+    const { runKnowledgeWorkflow } = await import('../src/knowledge-workflow.mjs');
+    return print(await runKnowledgeWorkflow(action, params, { call, stateDir, readAttachmentText }));
+  }
+  if (command === 'semantic' || command === 'graph') {
+    const [action, ...options] = args;
+    if (command === 'semantic') {
+      const { runSemanticWorkflow } = await import('../src/semantic-workflow.mjs');
+      if (!action || action === 'help' || action === '--help') return print({ actions: ['status', 'sync', 'search'] });
+      return print(await runSemanticWorkflow(action, await workflowArguments(options), {
+        call, stateDir: path.join(runtimeDir, 'semantic')
+      }));
+    }
+    const { runGraphWorkflow, GRAPH_ACTIONS } = await import('../src/graph-workflow.mjs');
+    if (!action || action === 'help' || action === '--help') return print({ actions: ['login', 'logout', ...GRAPH_ACTIONS] });
+    const params = await workflowArguments(options);
+    const { graphAccessToken, graphLogin, graphLogout } = await import('../src/graph-auth.mjs');
+    if (action === 'login') return print(await graphLogin(params));
+    if (action === 'logout') {
+      if (Object.keys(params).length) throw new Error('graph logout accepts no parameters');
+      const loggedOut = await graphLogout();
+      return print({ ...loggedOut, environment_token_configured: Boolean(process.env.OUTLOOK_GRAPH_ACCESS_TOKEN) });
+    }
+    if (!GRAPH_ACTIONS.includes(action)) return print(await runGraphWorkflow(action, params));
+    const token = await graphAccessToken({ refresh: action !== 'status' || params.verify === true });
+    return print(await runGraphWorkflow(action, params, { token }));
+  }
   if (command === 'mcp-config') return print({ mcpServers: { 'outlook-local': { command: process.execPath, args: [fileURLToPath(import.meta.url), 'mcp'], env: { OUTLOOK_LOCAL_STATE_DIR: runtimeDir } } } });
   if (command === 'serve') {
     const { startService } = await import('../src/service.mjs');
@@ -120,11 +243,17 @@ async function main() {
     process.stdin.once('end', () => { void server.close(); });
     return;
   }
-  const operation = command === 'download' ? 'read_attachment' : command === 'rpc' ? args.shift() : command;
+  const alias = command.replaceAll('-', '_');
+  const commandOperation = isMacWorkflow(alias) ? alias : command;
+  const operation = command === 'download' ? 'read_attachment' : command === 'rpc' ? args.shift() : commandOperation;
   if (!Object.hasOwn(definitions, operation)) throw new Error(`Unknown command: ${command}`);
+  if (isMacWorkflow(operation) && process.platform !== 'darwin') {
+    throw Object.assign(new Error('This workflow is only supported by the macOS cache backend'), { code: 'UNSUPPORTED_PLATFORM' });
+  }
   const parsed = parseArgs({ args, options: Object.fromEntries([
-    'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'date', 'scan-limit', 'query', 'person', 'person-role', 'search-body', 'com-body-mode', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json'
-  ].map(key => [key, { type: 'string' }])), strict: true, allowPositionals: false });
+    'backend', 'folder', 'limit', 'offset', 'unread', 'after', 'before', 'date', 'scan-limit', 'query', 'person', 'person-role', 'search-body', 'com-body-mode', 'id', 'format', 'body-offset', 'max-chars', 'index', 'max-bytes', 'byte-offset', 'chunk-bytes', 'out', 'json',
+    'mode', 'from-date', 'to-date', 'cursor', 'field', 'include-subfolders', 'has-cached-attachments', 'text-budget-chars'
+  ].map(key => [key, { type: 'string', multiple: key === 'id' && operation === 'messages_bundle' }])), strict: true, allowPositionals: false });
   const values = { ...parsed.values };
   const outputPath = values.out;
   delete values.out;
@@ -136,10 +265,11 @@ async function main() {
     params = {};
     for (const [key, value] of Object.entries(values)) {
       const name = key.replaceAll('-', '_');
-      if (['unread', 'search_body'].includes(name)) {
+      if (name === 'id' && operation === 'messages_bundle') params.ids = value;
+      else if (['unread', 'search_body', 'include_subfolders', 'has_cached_attachments'].includes(name)) {
         if (!['true', 'false'].includes(value)) throw new Error(`--${key} requires true or false`);
         params[name] = value === 'true';
-      } else if (['limit', 'offset', 'scan_limit', 'body_offset', 'max_chars', 'index', 'max_bytes', 'byte_offset', 'chunk_bytes'].includes(name)) params[name] = Number(value);
+      } else if (['limit', 'offset', 'scan_limit', 'body_offset', 'max_chars', 'index', 'max_bytes', 'byte_offset', 'chunk_bytes', 'text_budget_chars'].includes(name)) params[name] = Number(value);
       else params[name] = value;
     }
   }

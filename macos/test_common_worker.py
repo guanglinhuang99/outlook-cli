@@ -79,7 +79,7 @@ class CommonWorkerTests(unittest.TestCase):
         self.assertTrue(next(row for row in roots if row['name'] == '已发送')['is_sent'])
         children = self.reader.perform('folders', {'folder': 'inbox'})['folders']
         self.assertEqual(children[0]['name'], '研究')
-        self.assertIsNone(children[0]['unread_count'])
+        self.assertEqual(children[0]['unread_count'], 0)
         with self.assertRaisesRegex(common.ReadError, 'Inbox'):
             self.reader.perform('messages', {'folder': 'deleted'})
 
@@ -291,7 +291,7 @@ class CommonWorkerTests(unittest.TestCase):
             self.assertEqual(previous_day['messages'], [])
 
     def test_unsupported_filters_and_foreign_ids_fail_explicitly(self):
-        for method, params in [('messages', {'unread': False}),
+        for method, params in [('messages', {'unread': 'false'}),
                                ('read', {'id': self.message_id(self.fixture.ids[0]), 'format': 'html'})]:
             with self.assertRaises(common.ReadError):
                 self.reader.perform(method, params)
@@ -304,6 +304,45 @@ class CommonWorkerTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 'SCOPE_DENIED')
         with self.assertRaises(common.ReadError):
             self.reader.perform('delete', {'id': self.message_id(self.fixture.ids[0])})
+
+    def test_unread_filter_keeps_unknown_out_of_read_and_unread_results(self):
+        initial = self.reader.perform('messages', {'unread': False})
+        self.assertEqual(initial['messages'], [])
+        self.assertEqual(initial['unread_unknown_count'], 1)
+        self.assertTrue(initial['unread_filter_incomplete'])
+        self.fixture.scope['messages'][self.fixture.ids[0]].update(
+            unread=True, unread_evidence={'observed_at': '2026-10-20T02:01:00Z', 'method': 'osa_notification'})
+        self.fixture.refresh()
+        result = self.reader.perform('messages', {'unread': True})
+        self.assertEqual([row['unread'] for row in result['messages']], [True])
+        self.assertFalse(result['unread_filter_incomplete'])
+        bundle = self.reader.perform('context_bundle', {'folder': 'all', 'unread': True})
+        self.assertEqual([row['unread'] for row in bundle['items']], [True])
+        self.assertEqual(bundle['unread_unknown_count'], 1)
+        self.assertTrue(bundle['unread_filter_incomplete'])
+
+    def test_opt_in_account_scope_only_includes_folders_under_proven_roots(self):
+        self.fixture.scope['folders'].extend([
+            dict(id='root', parent_id='remote', name='mailbox', is_mail_root=True),
+            dict(id='drafts', parent_id='root', name='草稿', is_drafts=True),
+            dict(id='archive', parent_id='remote', name='联机存档', is_archive_root=True),
+            dict(id='archive-child', parent_id='archive', name='2026'),
+            dict(id='orphan', parent_id='remote', name='Orphan'),
+        ])
+        service = common.MailService(self.fixture.fixture.state.parent / 'account-state',
+                                     self.fixture.fixture.profile, folder_scope='account')
+        reader = common.CommonReader(service)
+        self.assertEqual(reader.perform('health', {})['data_scope'], 'verified_account_cache')
+        trash = reader.perform('messages', {'folder': 'deleted'})
+        self.assertEqual(len(trash['messages']), 1)
+        self.assertEqual(reader.perform('messages', {'folder': 'drafts'})['messages'], [])
+        _, index = service._load()
+        folders = {folder['id']: folder for folder in index['folders']}
+        self.assertNotIn('orphan', folders)
+        self.assertEqual(folders['archive-child']['path'], '联机存档/2026')
+        self.assertEqual(reader.perform('context_bundle', {'folder': 'all'})['total_matched'], 3)
+        with self.assertRaisesRegex(common.ReadError, 'Inbox'):
+            self.reader.perform('messages', {'folder': 'deleted'})
 
     def test_utf16_body_pagination_preserves_chinese_and_surrogate_pairs(self):
         source = self.fixture.fixture.gzip_body_source
@@ -401,6 +440,104 @@ class CommonWorkerTests(unittest.TestCase):
         self.fixture.refresh()
         with self.assertRaisesRegex(ValueError, 'folder access changed'):
             self.reader.perform('read', {'id': identifier})
+
+    def test_context_bundle_pages_verified_roots_without_reading_bodies(self):
+        store = self.reader.perform('stores', {})['stores'][0]['root_id']
+        params = {'folder': store, 'limit': 1}
+        with patch.object(common.core, 'resolve_message_body', side_effect=AssertionError('metadata read a body')):
+            first = self.reader.perform('context_bundle', params)
+            second = self.reader.perform('context_bundle', {**params, 'cursor': first['next_cursor']})
+            plain_roots = self.reader.perform('context_bundle', {
+                'folder': 'all', 'include_subfolders': False})
+        self.assertEqual(first['date_basis'], 'received_at')
+        self.assertEqual(first['snapshot'], second['snapshot'])
+        self.assertFalse(first['complete'])
+        self.assertTrue(second['complete'])
+        self.assertIsNone(first['body_complete'])
+        self.assertEqual({item['id'] for page in (first, second) for item in page['items']},
+                         {self.message_id(identifier) for identifier in self.fixture.ids[:2]})
+        self.assertEqual([item['id'] for item in plain_roots['items']], [self.message_id(self.fixture.ids[0])])
+        for changed in ({**params, 'folder': 'sent'}, {**params, 'has_cached_attachments': False}):
+            with self.assertRaises(common.ReadError) as error:
+                self.reader.perform('context_bundle', {**changed, 'cursor': first['next_cursor']})
+            self.assertEqual(error.exception.code, 'INVALID_ARGUMENT')
+
+    def test_today_bundle_cursor_preserves_received_day_after_midnight(self):
+        _, index = self.fixture.client._current()
+        for row in index['items']:
+            row['received_unix'] = common.timestamp('2000-01-02T08:00:00+08:00')
+        before = common.datetime.fromisoformat('2000-01-02T23:59:00+08:00')
+        after = common.datetime.fromisoformat('2000-01-03T00:01:00+08:00')
+        params = {'folder': 'all', 'mode': 'metadata', 'limit': 1}
+        with patch.object(common, 'datetime', wraps=common.datetime) as clock:
+            clock.now.side_effect = [before, after]
+            first = self.reader.perform('today_bundle', params)
+            second = self.reader.perform('today_bundle', {**params, 'cursor': first['next_cursor']})
+            new_day = self.reader.perform('today_bundle', params)
+        self.assertEqual(first['date'], '2000-01-02')
+        self.assertEqual(second['date'], first['date'])
+        self.assertNotEqual(first['items'][0]['id'], second['items'][0]['id'])
+        self.assertEqual(new_day['date'], '2000-01-03')
+        self.assertEqual(new_day['items'], [])
+        with self.assertRaisesRegex(common.ReadError, 'does not match'):
+            self.reader.perform('today_bundle', {**params, 'cursor': first['next_cursor'], 'date': '2000-01-03'})
+
+    def test_today_context_keeps_metadata_for_missing_bodies(self):
+        result = self.reader.perform('today_bundle', {'date': '2000-01-01', 'folder': 'inbox'})
+        by_id = {item['id']: item for item in result['items']}
+        self.assertEqual(result['mode'], 'context')
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['body_complete'])
+        self.assertTrue(by_id[self.message_id(self.fixture.ids[1])]['body']['available'])
+        self.assertIsNone(by_id[self.message_id(self.fixture.ids[0])]['body']['text'])
+        self.assertEqual(result['errors'], [])
+
+    def test_messages_bundle_deduplicates_and_reports_scope_and_snapshot_errors(self):
+        available = self.message_id(self.fixture.ids[1])
+        absent = self.message_id(self.fixture.ids[0])
+        deleted = self.message_id(self.fixture.ids[2])
+        foreign = common.encode_id('message', self.fixture.ids[1], 'a' * 24)
+        result = self.reader.perform('messages_bundle', {
+            'ids': [available, absent, available, deleted, foreign, 'invalid-id'], 'max_chars': 2})
+        self.assertEqual([item['id'] for item in result['items']], [available, absent])
+        self.assertTrue(result['items'][0]['body']['truncated'])
+        self.assertIsNone(result['items'][1]['body']['text'])
+        self.assertEqual(result['body_text_chars'], 2)
+        self.assertFalse(result['body_complete'])
+        self.assertEqual({item['id']: item['code'] for item in result['errors']},
+                         {deleted: 'SCOPE_DENIED', foreign: 'SNAPSHOT_MISMATCH', 'invalid-id': 'BACKEND_ID_MISMATCH'})
+
+    def test_messages_bundle_shares_utf16_budget_and_keeps_skipped_metadata(self):
+        source = self.fixture.fixture.gzip_body_source
+        original = gzip.decompress(source.read_bytes()).decode()
+        source.write_bytes(gzip.compress(original.replace('</body>', '<p>' + '🧪' * 600 + '</p></body>').encode()))
+        self.fixture.refresh()
+        first, second = (self.message_id(self.fixture.ids[position]) for position in (1, 0))
+        result = self.reader.perform('messages_bundle', {'ids': [first, second], 'text_budget_chars': 1000})
+        self.assertEqual([item['id'] for item in result['items']], [first, second])
+        body = result['items'][0]['body']
+        self.assertEqual(len(body['text'].encode('utf-16-le', 'surrogatepass')) // 2, 1000)
+        self.assertEqual(body['next_offset'], 1000)
+        self.assertEqual(result['body_text_chars'], 1000)
+        self.assertFalse(result['body_complete'])
+        self.assertNotIn('body', result['items'][1])
+        self.assertEqual(result['errors'][0]['id'], second)
+        self.assertEqual(result['errors'][0]['code'], 'TEXT_BUDGET_EXHAUSTED')
+
+    def test_context_bundle_pending_body_search_publishes_no_body_expansion(self):
+        item = self.fixture.ids[1]
+        stats = dict(candidates=2, indexed=1, missing=0, errors=0, pending=1,
+                     updated=1, reused=0, complete=False, revision='partial')
+        with patch.object(self.fixture.client._fulltext_index, 'search',
+                          return_value=({item: '正文片段'}, stats)), \
+                patch.object(self.reader, '_read', side_effect=AssertionError('pending search read a body')):
+            context = self.reader.perform('context_bundle', {
+                'query': '正文片段', 'mode': 'context', 'search_body': True})
+        self.assertTrue(context['retry_required'])
+        self.assertTrue(context['body_search_incomplete'])
+        self.assertFalse(context['body_complete'])
+        self.assertIsNone(context['next_cursor'])
+        self.assertEqual(context['items'][0]['body_snippet'], '正文片段')
 
 
 if __name__ == '__main__':

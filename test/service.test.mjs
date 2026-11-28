@@ -12,6 +12,8 @@ import { startService, authenticate } from '../src/service.mjs';
 import { validateCall } from '../src/tools.mjs';
 import { createMcp } from '../src/mcp.mjs';
 
+const bundleTools = ['outlook_context_bundle', 'outlook_messages_bundle', 'outlook_today_bundle'];
+
 test('installed MCP checker accepts the real platform-aware annotations', async t => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'outlook-mcp-check-'));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -24,8 +26,9 @@ test('installed MCP checker accepts the real platform-aware annotations', async 
   ], { timeout: 20000 });
   const report = JSON.parse(result.stdout);
   assert.equal(report.mcp, 'ready');
-  assert.equal(report.tools.length, 9);
+  assert.equal(report.tools.length, process.platform === 'darwin' ? 12 : 9);
   assert.ok(report.tools.includes('outlook_today'));
+  assert.deepEqual(report.tools.filter(name => name.endsWith('_bundle')).sort(), process.platform === 'darwin' ? bundleTools : []);
 });
 
 test('shared MCP annotations reflect the backend platform', async t => {
@@ -46,8 +49,11 @@ test('shared MCP annotations reflect the backend platform', async t => {
   assert.equal(windows.length, 9);
   assert.ok(windows.every(tool => tool.annotations.readOnlyHint === true && tool.annotations.destructiveHint === false));
   const mac = await listAnnotations('darwin');
-  assert.equal(mac.length, 9);
+  assert.equal(mac.length, 12);
+  assert.deepEqual(mac.map(tool => tool.name).filter(name => name.endsWith('_bundle')).sort(), bundleTools);
   assert.ok(mac.every(tool => tool.annotations.readOnlyHint === false && tool.annotations.destructiveHint === true));
+  const linux = await listAnnotations('linux');
+  assert.equal(linux.length, 9);
 });
 
 test('input contract rejects writes, unknown fields, bad bounds, malformed dates', () => {
@@ -75,6 +81,38 @@ test('HTTP rejects missing token, browser origins and rebinding hosts', () => {
   }
 });
 
+test('macOS bundle schemas apply workflow defaults and enforce cross-field limits', () => {
+  const context = validateCall('context_bundle', { query: '  项目  ', folder: 'all', limit: 100 });
+  assert.equal(context.query, '项目');
+  assert.equal(context.folder, 'all');
+  assert.equal(context.field, 'all');
+  assert.equal(context.include_subfolders, true);
+  assert.equal(context.mode, 'metadata');
+  assert.equal(context.max_chars, 4000);
+  const accountFolder = validateCall('context_bundle', { folder: 'deleted', unread: true });
+  assert.equal(accountFolder.folder, 'deleted');
+  assert.equal(accountFolder.unread, true);
+  const today = validateCall('today_bundle', { date: '2024-02-29', has_cached_attachments: false });
+  assert.equal(today.mode, 'context');
+  assert.equal(today.limit, 25);
+  assert.equal(today.has_cached_attachments, false);
+  assert.equal(validateCall('messages_bundle', { ids: ['first_id'] }).max_chars, 12000);
+  for (const [method, params] of [
+    ['context_bundle', { mode: 'context', limit: 26 }],
+    ['context_bundle', { from_date: '1970-02-01', to_date: '1970-01-01' }],
+    ['context_bundle', { from_date: '1969-12-31' }],
+    ['context_bundle', { to_date: '9999-12-31' }],
+    ['context_bundle', { person_role: 'cc' }],
+    ['context_bundle', { folder: 'unsupported.folder' }],
+    ['context_bundle', { cursor: 'x'.repeat(4097) }],
+    ['today_bundle', { from_date: '2026-11-01' }],
+    ['today_bundle', { date: '2026-02-29' }],
+    ['messages_bundle', { ids: [] }],
+    ['messages_bundle', { ids: Array(26).fill('first_id') }],
+    ['messages_bundle', { ids: ['first_id'], text_budget_chars: 999 }]
+  ]) assert.throws(() => validateCall(method, params), { code: 'INVALID_ARGUMENT' });
+});
+
 test('RPC and official MCP HTTP client share validated read-only backend', async t => {
   const reservation = net.createServer();
   await new Promise(resolve => reservation.listen(0, '127.0.0.1', resolve));
@@ -100,10 +138,39 @@ test('RPC and official MCP HTTP client share validated read-only backend', async
   t.after(() => client.close());
   await client.connect(new StreamableHTTPClientTransport(new URL(base + '/mcp'), { requestInit: { headers } }));
   const list = await client.listTools();
-  assert.equal(list.tools.length, 9);
+  assert.equal(list.tools.length, process.platform === 'darwin' ? 12 : 9);
   const cacheWrites = process.platform !== 'win32';
   assert.ok(list.tools.every(tool => tool.annotations.readOnlyHint === !cacheWrites && tool.annotations.destructiveHint === cacheWrites));
   const result = await client.callTool({ name: 'outlook_health', arguments: {} });
   assert.equal(result.isError, undefined);
   assert.equal(result.structuredContent.connected, true);
+  if (process.platform === 'darwin') {
+    const bundle = await client.callTool({ name: 'outlook_context_bundle', arguments: { folder: 'all', limit: 100 } });
+    assert.equal(bundle.isError, undefined);
+    assert.equal(calls.at(-1).method, 'context_bundle');
+    assert.equal(calls.at(-1).params.mode, 'metadata');
+    const rejected = await client.callTool({ name: 'outlook_today_bundle', arguments: { limit: 26 } });
+    assert.equal(rejected.isError, true);
+    assert.equal(calls.at(-1).method, 'context_bundle');
+
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'outlook-cli-bundle-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    await writeFile(path.join(directory, 'service.json'), JSON.stringify({ port, token: service.token }), { mode: 0o600 });
+    const cli = (...args) => promisify(execFile)(process.execPath, [
+      fileURLToPath(new URL('../bin/outlook.mjs', import.meta.url)), ...args
+    ], { env: { ...process.env, OUTLOOK_LOCAL_STATE_DIR: directory }, timeout: 20000 });
+    await cli('messages-bundle', '--id', 'first_id', '--id', 'second_id', '--text-budget-chars', '5000');
+    assert.equal(calls.at(-1).method, 'messages_bundle');
+    assert.deepEqual(calls.at(-1).params.ids, ['first_id', 'second_id']);
+    assert.equal(calls.at(-1).params.text_budget_chars, 5000);
+    await cli('rpc', 'messages_bundle', '--json', '{"ids":["first_id"]}');
+    assert.deepEqual(calls.at(-1).params.ids, ['first_id']);
+    await cli('context-bundle', '--folder', 'all', '--include-subfolders', 'false', '--has-cached-attachments', 'true');
+    assert.equal(calls.at(-1).method, 'context_bundle');
+    assert.equal(calls.at(-1).params.include_subfolders, false);
+    assert.equal(calls.at(-1).params.has_cached_attachments, true);
+    await cli('read', '--id', 'first_id');
+    assert.equal(calls.at(-1).method, 'read');
+    assert.equal(calls.at(-1).params.id, 'first_id');
+  }
 });

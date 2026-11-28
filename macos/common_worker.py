@@ -3,14 +3,14 @@ from __future__ import annotations
 
 import base64
 from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime
 import json
 import os
 from pathlib import Path
 import sys
 
 import outlook_local as core
-from outlook_service import MailService
+from outlook_service import BUNDLE_SOURCE_BYTES, BUNDLE_VERIFY_BYTES, TOKEN, MailService
 from mcp_server import _readline_limited
 
 
@@ -64,6 +64,40 @@ def timestamp(value):
         fail("INVALID_ARGUMENT", "after/before must be ISO timestamps with timezone")
 
 
+BUNDLE_OPTIONS = {"folder", "include_subfolders", "mode", "limit", "cursor", "query", "field",
+                  "person", "person_role", "search_body", "has_cached_attachments", "unread", "max_chars",
+                  "text_budget_chars"}
+BUNDLE_CURSOR = "workflow-v1"
+
+
+def bundle_day(value, name):
+    try:
+        parsed = date.fromisoformat(value).isoformat()
+        if value != parsed or not "1970-01-01" <= parsed <= "9999-12-30":
+            raise ValueError()
+        return parsed
+    except (TypeError, ValueError):
+        fail("INVALID_ARGUMENT", f"{name} must be YYYY-MM-DD in 1970-01-01..9999-12-30")
+
+
+def unpack_bundle_cursor(value, method):
+    if not isinstance(value, str) or not 1 <= len(value) <= 4096:
+        fail("INVALID_ARGUMENT", "cursor must be a nonempty workflow cursor")
+    pieces = value.split("|", 3)
+    if len(pieces) != 4 or pieces[:2] != [BUNDLE_CURSOR, method]:
+        fail("INVALID_ARGUMENT", "cursor belongs to another workflow or is invalid")
+    _, _, day, native = pieces
+    if day and method != "today_bundle":
+        fail("INVALID_ARGUMENT", "cursor belongs to another workflow or is invalid")
+    parsed = native.split(".", 3)
+    if len(parsed) != 4 or parsed[0] != "v1" or TOKEN.fullmatch(parsed[1]) is None:
+        fail("INVALID_ARGUMENT", "invalid workflow cursor")
+    _, separator, offset = parsed[3].partition(":")
+    if not separator or not offset.isascii() or not offset.isdecimal():
+        fail("INVALID_ARGUMENT", "invalid workflow cursor")
+    return day, native, parsed[1]
+
+
 FIELDS = {
     "health": set(), "stores": set(),
     "folders": {"folder", "offset", "limit"},
@@ -72,6 +106,9 @@ FIELDS = {
     "read": {"id", "format", "body_offset", "max_chars"},
     "attachments": {"id"},
     "read_attachment": {"id", "index", "max_bytes", "byte_offset", "chunk_bytes"},
+    "context_bundle": BUNDLE_OPTIONS | {"from_date", "to_date"},
+    "today_bundle": BUNDLE_OPTIONS | {"date"},
+    "messages_bundle": {"ids", "max_chars", "text_budget_chars"},
 }
 
 
@@ -80,14 +117,18 @@ class CommonReader:
         self.service = service or MailService(
             state=os.environ.get("OUTLOOK_MAC_STATE_DIR", str(Path.home() / "Library/Caches/outlook-cli/mac-cache")),
             profile=os.environ.get("OUTLOOK_MAC_PROFILE"),
+            folder_scope=os.environ.get("OUTLOOK_MAC_FOLDER_SCOPE", "inbox-sent"),
         )
 
     @staticmethod
     def groups(index):
         result = {}
+        account = index.get("scope_policy") == "verified-account-cache"
         for folder in index["folders"]:
-            if folder.get("is_inbox") or folder.get("is_sent"):
-                key = "store:" + (folder.get("parent_id") or folder["id"])
+            is_root = (folder["id"] == folder.get("scope_root_id") if account
+                       else folder.get("is_inbox") or folder.get("is_sent"))
+            if is_root:
+                key = "store:" + (folder.get("account_root_id") or folder.get("parent_id") or folder["id"])
                 result.setdefault(key, []).append(folder)
         return result
 
@@ -106,22 +147,31 @@ class CommonReader:
 
     def folder_key(self, value, index):
         folders = {row["id"]: row for row in index["folders"]}
-        if value in ("deleted", "drafts", "junk", "outbox"):
+        specials = {"inbox", "sent", "deleted", "drafts", "junk", "outbox"}
+        if value in specials - {"inbox", "sent"} and index.get("scope_policy") != "verified-account-cache":
             fail("SCOPE_DENIED", "macOS exposes only verified Inbox, Sent Items and their known descendants")
-        if value in ("inbox", "sent"):
+        if value in specials:
             groups = self.groups(index)
-            active = self.active_groups(index, groups)
-            choices = active or list(groups.values())
-            if len(choices) != 1:
+            flag = "is_" + value
+            def matching_aliases(rows):
+                if index.get("scope_policy") == "verified-account-cache":
+                    root_ids = {row["id"] for row in rows}
+                    return [row for row in folders.values()
+                            if row.get(flag) and row.get("scope_root_id") in root_ids]
+                return [row for row in rows if row.get(flag)]
+            if index.get("scope_policy") == "verified-account-cache":
+                groups = {key: rows for key, rows in groups.items() if matching_aliases(rows)}
+            choices = self.active_groups(index, groups) or list(groups.values())
+            if len(choices) > 1:
                 fail("FOLDER_AMBIGUOUS", "Select a store and explicit folder ID; no unique cached default account")
-            roots = [row for row in choices[0] if row.get("is_inbox" if value == "inbox" else "is_sent")]
+            roots = matching_aliases(choices[0]) if choices else []
             if len(roots) != 1:
                 fail("FOLDER_UNAVAILABLE", "The requested special folder is not verified in this cache")
             return roots[0]["id"]
         payload = decode_id(value, "folder")
         key = payload["key"]
         if key not in folders and key not in self.groups(index):
-            fail("SCOPE_DENIED", "Folder is outside the verified Inbox/Sent scope")
+            fail("SCOPE_DENIED", "Folder is outside the verified cache scope")
         return key
 
     def folder_info(self, key, index):
@@ -131,23 +181,31 @@ class CommonReader:
         return {"id": encode_id("folder", key, index["snapshot"]),
                 "name": row["name"] if row else "Outlook cache " + core.sha(key.encode())[:8],
                 "path": row["path"] if row else "/", "item_count": row["cached_messages"] if row else 0,
-                "unread_count": None, "child_count": len(children), "counts_scope": "local_index",
+                "unread_count": row.get("known_unread_count") if row and row.get("unread_unknown_count") == 0 else None,
+                "known_unread_count": row.get("known_unread_count") if row else None,
+                "unread_unknown_count": row.get("unread_unknown_count") if row else None,
+                "child_count": len(children), "counts_scope": "local_index",
                 "is_inbox": bool(row.get("is_inbox")) if row else False,
                 "is_sent": bool(row.get("is_sent")) if row else False,
+                "folder_type": row.get("evidence", {}).get("folder_type") if row else None,
                 "name_status": row.get("evidence", {}).get("name_status", "unavailable") if row else "unavailable"}
 
     @staticmethod
     def metadata(row, index):
         native = core.metadata(row)
         address = row.get("sender") or None
+        related = dict.fromkeys(mid for mid in row.get("related_message_ids", []) if mid != native["message_id"])
         return {"id": encode_id("message", row["id"], index["snapshot"]),
+                "internet_message_id": native["message_id"],
+                "related_internet_message_ids": list(related),
                 "subject": row["subject"] or None, "subject_status": row["subject_status"],
                 "sender": {"name": row.get("sender_name") or None, "address": address,
                            "address_type": "SMTP" if address and "@" in address else None,
                            "smtp_address": address if address and "@" in address else None},
                 "received_at": native["received_at"], "sent_at": native["sent_at"],
                 "received_time_status": native["received_time_status"],
-                "received_time_method": native["received_time_method"], "unread": None,
+                "received_time_method": native["received_time_method"], "unread": row.get("unread"),
+                "unread_evidence": row.get("unread_evidence"),
                 "participants": row.get("participants"),
                 "participants_status": row.get("participants_status"),
                 "participants_evidence": row.get("participants_evidence"),
@@ -164,14 +222,199 @@ class CommonReader:
                  "type": 1 if a["status"] == "cached_at_snapshot" else None,
                  "status": a["status"]} for position, a in enumerate(row["attachments"], 1)]
 
+    @staticmethod
+    def cache_context(index):
+        account = index and index.get("scope_policy") == "verified-account-cache"
+        return {"backend": "mac-cache",
+                "data_scope": "verified_account_cache" if account else "verified_inbox_sent_cache",
+                "date_basis": "received_at",
+                "snapshot": index["snapshot"] if index else None,
+                "captured_at": index["created_at"] if index else None,
+                "coverage": index["summary"]["coverage"] if index else None}
+
+    def _read(self, directory, index, row, offset, maximum):
+        row = {**row, "body": core.resolve_message_body(directory, index, row["id"])}
+        page = core.read_body_page(directory, {**index, "items": [row]}, row["id"], offset, maximum)
+        text = None if page is None else page["text"]
+        total = None if page is None else page["total_chars"]
+        start = 0 if page is None else page["offset"]
+        next_offset = None if page is None else page["next_offset"]
+        display = {role: ("; ".join(f"{p['name']} <{p['address']}>" for p in row['participants'][role])
+                          if (row.get('participants_status') or {}).get(role) == 'verified'
+                          else None) for role in ('to', 'cc')}
+        return {**self.metadata(row, index), **display, "attachments": self.attachment_metadata(row),
+                "body": {"format": "text", "derived_from": "html" if text is not None else None,
+                         "text": text, "available": text is not None, "total_chars": total,
+                         "offset": start, "next_offset": next_offset, "truncated": next_offset is not None,
+                         "source_truncated": False, "status": row["body"]["status"],
+                         "diagnosis": row["body"]["diagnosis"]}}
+
+    def _bundle_rows(self, directory, index, selections, maximum, budget):
+        items, errors, used, complete = [], [], 0, True
+        source_budget = {"remaining": BUNDLE_SOURCE_BYTES, "verification_remaining": BUNDLE_VERIFY_BYTES}
+        for row, item in selections:
+            if used >= budget:
+                errors.append({"id": item["id"], "code": "TEXT_BUDGET_EXHAUSTED",
+                               "message": "Bundle text budget exhausted"})
+                complete = False
+            else:
+                try:
+                    with core.source_read_budget(source_budget):
+                        item = {**item, **self._read(directory, index, row, 0, min(maximum, budget - used))}
+                    body = item["body"]
+                    if body["available"]:
+                        end = body["next_offset"] if body["truncated"] else body["total_chars"]
+                        used += end - body["offset"]
+                    complete = complete and body["available"] and not body["truncated"]
+                except (ValueError, OSError):
+                    errors.append({"id": item["id"], "code": "BODY_READ_FAILED",
+                                   "message": "Could not read the local Outlook body"})
+                    complete = False
+            items.append(item)
+        return {"items": items, "errors": errors, "body_text_chars": used, "body_complete": complete}
+
+    def _messages_bundle(self, params):
+        maximum = number(params, "max_chars", 12000, 1, 100000)
+        budget = number(params, "text_budget_chars", 60000, 1000, 200000)
+        ids = params.get("ids")
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= 25
+                or any(not isinstance(v, str) or len(v) > 16000 for v in ids)):
+            fail("INVALID_ARGUMENT", "ids must contain 1..25 message IDs")
+        snapshot, identities, errors = None, [], []
+        for identifier in dict.fromkeys(ids):
+            try:
+                identity = decode_id(identifier, "message")
+                if TOKEN.fullmatch(identity["snapshot"]) is None:
+                    fail("INVALID_ID", "Invalid message snapshot")
+                snapshot = snapshot or identity["snapshot"]
+                if identity["snapshot"] != snapshot:
+                    fail("SNAPSHOT_MISMATCH", "Message IDs in a bundle must use the same snapshot")
+                identities.append((identifier, identity["key"]))
+            except ReadError as error:
+                errors.append({"id": identifier, "code": error.code, "message": str(error)})
+        if snapshot is None:
+            return {**self.cache_context(None), "items": [], "errors": errors,
+                    "body_text_chars": 0, "body_complete": False}
+        directory, index = self.service._current(snapshot)
+        rows = {row["id"]: row for row in index["items"]}
+        selected = []
+        for identifier, key in identities:
+            if key not in rows:
+                errors.append({"id": identifier, "code": "SCOPE_DENIED",
+                               "message": "Message is outside the verified cache scope"})
+            else:
+                selected.append((rows[key], self.metadata(rows[key], index)))
+        result = self._bundle_rows(directory, index, selected, maximum, budget)
+        return {**self.cache_context(index), **result, "errors": errors + result["errors"],
+                "body_complete": not errors and result["body_complete"]}
+
+    def _context_bundle(self, method, params):
+        today = method == "today_bundle"
+        mode = params.get("mode", "context" if today else "metadata")
+        if mode not in ("metadata", "context"):
+            fail("INVALID_ARGUMENT", "mode must be metadata or context")
+        limit = number(params, "limit", 25, 1, 25 if mode == "context" else 100)
+        maximum = number(params, "max_chars", 4000, 1, 100000)
+        budget = number(params, "text_budget_chars", 60000, 1000, 200000)
+        for flag in ("include_subfolders", "search_body", "has_cached_attachments", "unread"):
+            if flag in params and type(params[flag]) is not bool:
+                fail("INVALID_ARGUMENT", f"{flag} must be boolean")
+        descendants = params.get("include_subfolders", True)
+        field, query = params.get("field", "all"), params.get("query", "")
+        if field not in ("all", "subject", "sender", "preview"):
+            fail("INVALID_ARGUMENT", "field must be all, subject, sender or preview")
+        if not isinstance(query, str) or len(query.strip()) > 500:
+            fail("INVALID_ARGUMENT", "query must be a string of at most 500 characters")
+        person, role = params.get("person"), params.get("person_role", "any")
+        if isinstance(person, str) and person.strip():
+            person = person.strip()
+        try:
+            core.person_matches({}, person, role)
+        except ValueError as error:
+            fail("INVALID_ARGUMENT", str(error))
+
+        day, native_cursor, snapshot = "", None, None
+        if "cursor" in params:
+            day, native_cursor, snapshot = unpack_bundle_cursor(params["cursor"], method)
+        if today:
+            requested = bundle_day(params["date"], "date") if "date" in params else None
+            if native_cursor:
+                day = bundle_day(day, "cursor date")
+                if requested and requested != day:
+                    fail("INVALID_ARGUMENT", "date does not match the cursor date")
+            else:
+                day = requested or datetime.now(core.ZONE).date().isoformat()
+            first = last = day
+        else:
+            first = bundle_day(params["from_date"], "from_date") if "from_date" in params else None
+            last = bundle_day(params["to_date"], "to_date") if "to_date" in params else None
+            if first and last and first > last:
+                fail("INVALID_ARGUMENT", "from_date must not exceed to_date")
+
+        folder = params.get("folder", "inbox")
+        if not isinstance(folder, str):
+            fail("INVALID_ARGUMENT", "folder must be a folder name or ID")
+        if folder not in ("inbox", "sent", "all", "deleted", "drafts", "junk", "outbox"):
+            folder_snapshot = decode_id(folder, "folder")["snapshot"]
+            if snapshot and folder_snapshot != snapshot:
+                fail("INVALID_ARGUMENT", "folder ID and cursor refer to different snapshots")
+            snapshot = folder_snapshot
+        directory, index = self.service._current(snapshot)
+        folder_id, roots = None, None
+        if folder != "all":
+            folder_id = self.folder_key(folder, index)
+            groups = self.groups(index)
+            if folder_id in groups:
+                roots = tuple(sorted(row["id"] for row in groups[folder_id]))
+                folder_id = None
+        elif not descendants:
+            roots = tuple(sorted(row["id"] for row in index["folders"]
+                                 if row["id"] == row.get("scope_root_id")))
+
+        options = {"query": query.strip(), "field": field, "person": person, "person_role": role,
+                   "from_date": first, "to_date": last, "cursor": native_cursor, "limit": limit,
+                   "folder_id": folder_id, "include_subfolders": descendants,
+                   "search_body": params.get("search_body", False)}
+        if "has_cached_attachments" in params:
+            options["has_cached_attachments"] = params["has_cached_attachments"]
+        if "unread" in params:
+            options["unread"] = params["unread"]
+        try:
+            page = self.service._search(options, snapshot=index["snapshot"], root_folders=roots)
+        except ValueError as error:
+            if native_cursor and "cursor" in str(error):
+                fail("INVALID_ARGUMENT", "cursor belongs to another folder or query, or is invalid")
+            raise
+        rows = {row["id"]: row for row in index["items"]}
+        selected = []
+        for match in page["items"]:
+            row = rows[match["id"]]
+            details = {key: match[key] for key in ("matched_fields", "matched_person_roles", "body_snippet") if key in match}
+            selected.append((row, {**self.metadata(row, index), **details}))
+        if mode == "context" and not page.get("retry_required"):
+            result = self._bundle_rows(directory, index, selected, maximum, budget)
+        else:
+            result = {"items": [item for _, item in selected], "errors": [],
+                      "body_text_chars": 0, "body_complete": None if mode == "metadata" else False}
+        next_cursor = page["next_cursor"]
+        if next_cursor:
+            next_cursor = f"{BUNDLE_CURSOR}|{method}|{day}|{next_cursor}"
+        page.pop("folder_id", None)
+        return {**self.cache_context(index), **page, **result, "next_cursor": next_cursor,
+                "folder": folder, "mode": mode, **({"date": day} if today else {})}
+
     def perform(self, method, params):
         return deepcopy(self._perform(method, params))
 
     def _perform(self, method, params):
         if method not in FIELDS or not isinstance(params, dict) or set(params) - FIELDS[method]:
             fail("INVALID_ARGUMENT", "Unknown operation or parameters")
-        if "unread" in params:
-            fail("UNSUPPORTED_FILTER", "Unread state is not verified by the macOS cache parser")
+        if method in ("context_bundle", "today_bundle"):
+            return self._context_bundle(method, params)
+        if method == "messages_bundle":
+            return self._messages_bundle(params)
+        if "unread" in params and type(params["unread"]) is not bool:
+            fail("INVALID_ARGUMENT", "unread must be boolean")
         if params.get("format", "text") != "text":
             fail("UNSUPPORTED_FORMAT", "Common macOS reads currently return text only")
         person, role = params.get("person"), params.get("person_role", "any")
@@ -190,16 +433,14 @@ class CommonReader:
         identity = None if value in ("inbox", "sent", "deleted", "drafts", "junk", "outbox") else decode_id(value, kind)
         directory, index = self.service._current(identity["snapshot"] if identity else None)
         groups = self.groups(index)
-        context = {"backend": "mac-cache", "data_scope": "verified_inbox_sent_cache", "date_basis": "received_at",
-                   "snapshot": index["snapshot"], "captured_at": index["created_at"],
-                   "coverage": index["summary"]["coverage"]}
+        context = self.cache_context(index)
         if method == "health":
             return {**context, "connected": True, "offline": True, "outlook_required": False,
                     "store_count": len(groups), "readable_store_count": len(groups),
                     "outlook_version": None, "cache_summary": index["summary"],
-                    "capabilities": {"unread_filter": False, "body_search": True, "html_body": False,
+                    "capabilities": {"unread_filter": True, "body_search": True, "html_body": False,
                                      "received_time": True, "sent_time": True},
-                    "limitations": ["Only recoverable cache in verified Inbox/Sent folders is exposed.",
+                    "limitations": [index["summary"]["coverage"],
                                     "Folder names may be redacted; membership is a local observation, not live server state."]}
         if method == "stores":
             return {**context, "stores": [{"name": self.folder_info(key, index)["name"],
@@ -227,6 +468,10 @@ class CommonReader:
                                and (after is None or row["received_unix"] >= after)
                                and (before is None or row["received_unix"] < before))),
                           key=core.received_sort_key)
+            unread = params.get("unread")
+            unread_unknown = sum(row.get("unread") is None for row in rows)
+            if unread is not None:
+                rows = [row for row in rows if row.get("unread") is unread]
             offset = number(params, "offset", 0, 0, 10000000)
             limit = number(params, "limit", 25, 1, 200)
             scan = number(params, "scan_limit", 500, 1, 2000)
@@ -283,6 +528,8 @@ class CommonReader:
                       "body_search_incomplete": bool(fulltext and not fulltext.get("complete", False)),
                       "person_search_incomplete": person_incomplete,
                       "received_time_unknown": unknown_times,
+                      "unread_unknown_count": unread_unknown,
+                      "unread_filter_incomplete": unread is not None and unread_unknown > 0,
                       "date_filter_incomplete": bool(dated and unknown_times)}
             if fulltext is not None:
                 result["fulltext"] = fulltext
@@ -293,27 +540,14 @@ class CommonReader:
             fail("INVALID_ID", "Expected a message ID")
         row = next((row for row in index["items"] if row["id"] == identity["key"]), None)
         if row is None:
-            fail("SCOPE_DENIED", "Message is outside the verified Inbox/Sent scope")
-        attachments = self.attachment_metadata(row)
-        if method == "attachments":
-            return {**context, "attachments": attachments, "attachments_complete": False}
+            fail("SCOPE_DENIED", "Message is outside the verified cache scope")
         if method == "read":
             offset = number(params, "body_offset", 0, 0, 100000000)
             maximum = number(params, "max_chars", 20000, 1, 200000)
-            row = {**row, "body": core.resolve_message_body(directory, index, row["id"])}
-            page = core.read_body_page(directory, {**index, "items": [row]}, row["id"], offset, maximum)
-            text = None if page is None else page["text"]
-            total = None if page is None else page["total_chars"]
-            start = 0 if page is None else page["offset"]
-            next_offset = None if page is None else page["next_offset"]
-            display = {role: ("; ".join(f"{p['name']} <{p['address']}>" for p in row['participants'][role])
-                              if (row.get('participants_status') or {}).get(role) == 'verified'
-                              else None) for role in ('to', 'cc')}
-            return {**context, **self.metadata(row, index), **display,
-                    "attachments": attachments, "body": {"format": "text", "derived_from": "html" if text is not None else None,
-                    "text": text, "available": text is not None, "total_chars": total, "offset": start,
-                    "next_offset": next_offset, "truncated": next_offset is not None, "source_truncated": False,
-                    "status": row["body"]["status"], "diagnosis": row["body"]["diagnosis"]}}
+            return {**context, **self._read(directory, index, row, offset, maximum)}
+        attachments = self.attachment_metadata(row)
+        if method == "attachments":
+            return {**context, "attachments": attachments, "attachments_complete": False}
         position = number(params, "index", 0, 1, 10000)
         if position > len(attachments):
             fail("INVALID_ARGUMENT", "Attachment index is out of range")

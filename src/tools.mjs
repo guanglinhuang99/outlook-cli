@@ -17,6 +17,39 @@ const filters = {
   scan_limit: integer(1, 2000, 500)
 };
 const define = (description, shape) => ({ description, schema: z.strictObject({ ...shape, backend: z.enum(['auto', 'com', 'local', 'mac-cache']).optional().describe('Windows auto/com may start classic Outlook on demand; local never starts Outlook. auto falls back to cached OST/PST only on unavailable/failed startup, with explicit warnings and fallback_reason; com never falls back. macOS uses HxStore cache. IDs are backend-specific; check data_scope and warnings for incomplete/stale cache reads.') }) });
+const bundleFilters = {
+  folder: z.union([z.enum(['inbox', 'sent', 'all', 'drafts', 'deleted', 'junk', 'outbox']), opaqueId]).default('inbox').describe('An allowed folder alias, all verified folders, or an ID from stores or folders. Drafts, Deleted, Junk and Outbox require account scope and verified local folders.'),
+  include_subfolders: z.boolean().default(true),
+  limit: integer(1, 100, 25).describe('At most 25 per page when mode=context.'),
+  cursor: z.string().min(1).max(4096).optional().describe('Opaque cursor from a previous page with the same filters.'),
+  query: z.string().trim().max(500).default(''),
+  field: z.enum(['all', 'subject', 'sender', 'preview']).default('all'),
+  person: z.string().trim().min(1).max(500).optional(),
+  person_role: z.enum(['any', 'sender', 'to', 'cc']).default('any'),
+  search_body: z.boolean().default(false),
+  has_cached_attachments: z.boolean().optional().describe('Filter on attachment entries marked cached_at_snapshot. False does not prove the original message has no attachments.'),
+  unread: z.boolean().optional().describe('Match only verified local unread or read states. Check unread_unknown_count for candidates without reliable state.'),
+  max_chars: integer(1, 100000, 4000),
+  text_budget_chars: integer(1000, 200000, 60000)
+};
+const macWorkflows = {
+  context_bundle: define('List or search locally cached macOS mail across verified folders by Singapore received dates. Use metadata mode for previews, or context mode for selected bodies with a text budget. Follow next_cursor with the same filters.', {
+    ...bundleFilters,
+    mode: z.enum(['metadata', 'context']).default('metadata'),
+    from_date: todayDate.optional().describe('First received date, inclusive.'),
+    to_date: todayDate.optional().describe('Last received date, inclusive.')
+  }),
+  today_bundle: define('Read a page of today\'s locally cached macOS mail using Singapore received dates. A cursor preserves the first page\'s date across midnight. Use metadata mode to skip reading bodies.', {
+    ...bundleFilters,
+    mode: z.enum(['metadata', 'context']).default('context'),
+    date: todayDate.optional()
+  }),
+  messages_bundle: define('Read selected messages from the macOS cache using IDs from the same snapshot. Returns cached bodies and attachment metadata under a combined text budget.', {
+    ids: z.array(opaqueId).min(1).max(25),
+    max_chars: integer(1, 100000, 12000),
+    text_budget_chars: integer(1000, 200000, 60000)
+  })
+};
 export const definitions = {
   health: define('Check Outlook or local-file backend readiness, active backend and cache limitations.', {}),
   stores: define('List Outlook stores with opaque root folder IDs.', {}),
@@ -38,8 +71,18 @@ export const definitions = {
   attachments: define('List attachment metadata for a message, including 1-based attachment indices.', { id: opaqueId }),
   read_attachment: define('Read a bounded chunk of a by-value file attachment as base64. Follow next_offset; sha256 covers the entire file. File limit 10 MiB; embedded Outlook items/OLE unsupported. Does not write a file.', {
     id: opaqueId, index: z.number().int().min(1).max(10000), max_bytes: integer(1, 10485760, 10485760), byte_offset: integer(0, 10485760, 0), chunk_bytes: integer(1, 1048576, 65536)
-  })
+  }),
+  ...macWorkflows
 };
+
+export function isMacWorkflow(method) {
+  return Object.hasOwn(macWorkflows, method);
+}
+
+export function definitionsForPlatform(platform = process.platform) {
+  const entries = Object.entries(definitions);
+  return platform === 'darwin' ? entries : entries.filter(([method]) => !isMacWorkflow(method));
+}
 
 export function validateCall(method, params = {}) {
   if (!Object.hasOwn(definitions, method)) throw Object.assign(new Error(`Unknown operation: ${method}`), { code: 'INVALID_ARGUMENT' });
@@ -48,8 +91,14 @@ export function validateCall(method, params = {}) {
   if (method === 'search' && (!result.data.query && !result.data.person)) {
     throw Object.assign(new Error('search requires query or person'), { code: 'INVALID_ARGUMENT' });
   }
-  if (method === 'search' && result.data.person_role !== 'any' && !result.data.person) {
+  if (result.data.person_role && result.data.person_role !== 'any' && !result.data.person) {
     throw Object.assign(new Error('person_role requires person'), { code: 'INVALID_ARGUMENT' });
+  }
+  if (result.data.mode === 'context' && result.data.limit > 25) {
+    throw Object.assign(new Error('limit must be at most 25 in context mode'), { code: 'INVALID_ARGUMENT' });
+  }
+  if (result.data.from_date && result.data.to_date && result.data.from_date > result.data.to_date) {
+    throw Object.assign(new Error('from_date must not be later than to_date'), { code: 'INVALID_ARGUMENT' });
   }
   if (result.data.after && result.data.before && Date.parse(result.data.after) >= Date.parse(result.data.before)) {
     throw Object.assign(new Error('after must be earlier than before'), { code: 'INVALID_ARGUMENT' });

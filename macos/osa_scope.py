@@ -35,6 +35,9 @@ _FOLDER_NAME = re.compile(r"\.(?:getfolder|getfolderlist)\.", re.I)
 _MESSAGE_NAME = re.compile(
     r"\.(?:getmessage|getmessageheaderbyid|getmessageheaderinfolder)\.", re.I
 )
+_NOTIFICATION_NAME = re.compile(r"\.getnotification\.", re.I)
+_NOTIFICATION_PATH = ("GetNotification", "NotificationBatch", "Notification")
+_NOTIFICATION_CHANGES = {"DeletedMessage", "DeletedFolder", "UpdatedMessageHeader", "NewMessageHeader"}
 _FORBIDDEN_XML = (b"<!doctype", b"<!entity")
 _FORBIDDEN_TAIL_BYTES = 128
 _INTEGER_TEXT = re.compile(r"\A\d+\Z")
@@ -52,7 +55,7 @@ _DOTNET_MAX_SUPPORTED_TICKS_EXCLUSIVE = (
     _DOTNET_MAX_TICKS_EXCLUSIVE
     - 8 * 60 * 60 * _DOTNET_TICKS_PER_SECOND
 )
-_PARSER_VERSION = "osa-metadata-v1"
+_PARSER_VERSION = "osa-metadata-v3"
 _CACHE_DB_VERSION = 1
 _CACHE_MAX_FILES = 4096
 _CACHE_MAX_BYTES = 64 * 1024 * 1024
@@ -341,6 +344,13 @@ class LogParseCache:
 
     @classmethod
     def _valid_message_row(cls, row: dict[str, Any]) -> bool:
+        if "notification_change" in row:
+            fields = {"notification_change", "object_id", "message_id", "folder_id"}
+            return (
+                set(row) == fields | {"sent_time", "unread_count", "log_time"}
+                and all(isinstance(value, str) for value in row.values())
+                and row["notification_change"] in _NOTIFICATION_CHANGES
+            )
         fields = {
             "entry_id", "message_id", "sent_time", "sent_unix", "received_time",
             "received_ticks", "folder_id", "log_time", "log_unix", "source_file",
@@ -348,7 +358,8 @@ class LogParseCache:
             "participants_status",
         }
         count_fields = {"_participant_count_values", "_participant_count_statuses"}
-        if set(row) not in (fields, fields | count_fields):
+        fields.add("unread_count")
+        if set(row) not in (fields, fields | count_fields) or not isinstance(row["unread_count"], str):
             return False
         for field in (
             "entry_id", "message_id", "sent_time", "received_time", "received_ticks",
@@ -1181,6 +1192,16 @@ def _parse_explicit_time_ticks(value: Any) -> int | None:
     )
 
 
+def _consistent_osa_sent_time(rows: Iterable[Mapping[str, Any]]) -> float | None:
+    """Compare exact instants before rounding for display."""
+    ticks = {_parse_explicit_time_ticks(row.get("sent_time")) for row in rows}
+    if len(ticks) != 1 or None in ticks:
+        return None
+    sent = (next(iter(ticks)) - _DOTNET_EPOCH_TICKS) / _DOTNET_TICKS_PER_SECOND
+    upper_ms = (_DOTNET_MAX_SUPPORTED_TICKS_EXCLUSIVE - _DOTNET_EPOCH_TICKS) // 10_000
+    return sent if round(sent * 1000) < upper_ms else None
+
+
 def _received_time_evidence(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Validate direct delivery fields across all identity-matched observations."""
     values: list[int] = []
@@ -1291,6 +1312,8 @@ def _file_kind(path: Path) -> str | None:
         return "folder"
     if _MESSAGE_NAME.search(name):
         return "message"
+    if _NOTIFICATION_NAME.search(name):
+        return "notification"
     return None
 
 
@@ -1361,6 +1384,25 @@ def _log_files(root: Path, evidence: dict[str, Any]) -> list[tuple[str, Path]]:
     return result
 
 
+def _has_unique_children(node: ET.Element, *names: str) -> bool:
+    counts = Counter(_local(child.tag) for child in node)
+    return all(counts[name] == 1 for name in names)
+
+
+def _unread_count(node: ET.Element) -> str:
+    view = _child(node, "ViewId")
+    if (view is None or not _has_unique_children(view, "ImmId")
+            or not _has_unique_children(node, "ImmId", "InternetMessageId", "SentTime", "ViewId", "UnReadCount")):
+        return ""
+    count = _child(node, "UnReadCount")
+    value = (count.text or "").strip() if count is not None and not len(count) else ""
+    return value if value in {"0", "1"} else ""
+
+
+def _in_notification(stack: list[str]) -> bool:
+    return stack[0].casefold() == "response" and tuple(stack[1:4]) == _NOTIFICATION_PATH
+
+
 def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
     before = _file_stat(path)
     if before["size"] > MAX_COMPRESSED_FILE_BYTES:
@@ -1373,6 +1415,7 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
     header_stack: list[dict[str, Any]] = []
     data_stack: list[dict[str, Any]] = []
     role_stack: list[dict[str, Any]] = []
+    notification = kind == "notification"
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as raw:
         with gzip.GzipFile(fileobj=raw) as compressed:
@@ -1472,6 +1515,7 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
                         "sent_unix": _parse_time(_text(element, "SentTime")),
                         "received_time": _text(element, "LastDeliveryTime"),
                         "received_ticks": _text(element, "ReceivedOrRenewTime"),
+                        "unread_count": _unread_count(element),
                         "folder_id": _view_folder_id(element),
                         "log_time": log_time,
                         "log_unix": _parse_time(log_time),
@@ -1480,9 +1524,15 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
                         "_header_sender_status": current_header.get("from_status", "missing"),
                     }
                     current_header["row"] = row
-                    if current_message is not None:
+                    view = _child(element, "ViewId")
+                    eligible = not notification or (
+                        parent == "NewMessage" and view is not None
+                        and _has_unique_children(element, "ImmId", "InternetMessageId", "SentTime", "ViewId")
+                        and _has_unique_children(view, "ImmId")
+                    )
+                    if current_message is not None and eligible:
                         current_message["headers"].append(row)
-                    else:
+                    elif not notification:
                         participants, statuses = _bound_participants(row, None)
                         row["participants"] = participants
                         row["participants_status"] = statuses
@@ -1501,14 +1551,39 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
                         "count_statuses": count_statuses,
                         "complete": complete,
                     }
-                    if current_message is not None:
+                    if current_message is not None and (not notification or (
+                        parent == "NewMessage"
+                        and _has_unique_children(element, "ImmId", "IsPartial", "IsTruncated")
+                    )):
                         current_message["data"].append(data)
                     data_stack.pop()
+                    element.clear()
+                    handled = True
+                elif (notification and len(stack) == 5 and _in_notification(stack)
+                      and tag in _NOTIFICATION_CHANGES):
+                    object_id = _text(element, "ImmId")
+                    if object_id:
+                        message_rows.append({"notification_change": tag, "object_id": object_id,
+                                             "message_id": _text(element, "InternetMessageId"),
+                                             "folder_id": _view_folder_id(element),
+                                             "sent_time": _text(element, "SentTime"),
+                                             "unread_count": _unread_count(element),
+                                             "log_time": log_time})
                     element.clear()
                     handled = True
                 elif tag in ("FlattenedMessage", "NewMessage") and current_message is not None:
                     headers = current_message.get("headers", [])
                     data_rows = current_message.get("data", [])
+                    if notification and not (
+                        len(stack) == 5 and tag == "NewMessage" and _in_notification(stack)
+                        and _has_unique_children(element, "MessageHeader", "MessageData")
+                        and len(headers) == len(data_rows) == 1
+                        and headers[0]["message_id"] and headers[0]["folder_id"]
+                        and _canonical(headers[0]["entry_id"])
+                        and _canonical(headers[0]["entry_id"]) == _canonical(data_rows[0]["imm_id"])
+                        and data_rows[0]["complete"]
+                    ):
+                        headers = []
                     if len(headers) == 1 and len(data_rows) == 1:
                         participant_source = data_rows[0]
                     elif len(headers) == 1 and not data_rows:
@@ -1572,12 +1647,18 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
                         inside_header
                         and (inside_view_id or tag in {
                             "ImmId", "InternetMessageId", "SentTime", "LastDeliveryTime",
-                            "ReceivedOrRenewTime", "ViewId",
+                            "ReceivedOrRenewTime", "ViewId", "UnReadCount",
                         })
+                    )
+                    keep_change_field = notification and _in_notification(stack) and (
+                        (len(stack) == 6 and parent in _NOTIFICATION_CHANGES
+                         and tag in {"ImmId", "InternetMessageId", "ViewId", "SentTime", "UnReadCount"})
+                        or (len(stack) == 7 and stack[4] in _NOTIFICATION_CHANGES
+                            and parent == "ViewId" and tag == "ImmId")
                     )
                     # Keep only fields needed by a View or MessageHeader;
                     # clear unrelated response data, including real body data.
-                    if not inside_view and not keep_header_field:
+                    if not inside_view and not keep_header_field and not keep_change_field:
                         element.clear()
                 stack.pop()
     if not _same_stat(path, before):
@@ -1588,7 +1669,8 @@ def _parse_log(path: Path, kind: str, root: Path) -> tuple[list[dict[str, Any]],
     for row in message_rows:
         if not row["log_time"]:
             row["log_time"] = log_time
-            row["log_unix"] = _parse_time(log_time)
+            if "notification_change" not in row:
+                row["log_unix"] = _parse_time(log_time)
     return folder_rows, message_rows, log_time
 
 
@@ -1609,6 +1691,12 @@ def _folder_name(display_name: str, type_value: str) -> tuple[str, str]:
         return "已发送", "sent_type"
     if _is_type(type_value, 4, "DeletedItems"):
         return "已删除", "deleted_type"
+    if _is_type(type_value, 2, "Drafts"):
+        return "草稿", "drafts_type"
+    if _is_type(type_value, 5, "JunkMail"):
+        return "垃圾邮件", "junk_type"
+    if _is_type(type_value, 14, "ArchiveMsgFolderRoot"):
+        return "联机存档", "archive_root_type"
     if display_name:
         if display_name.casefold().startswith("pii:"):
             return display_name, "redacted"
@@ -1671,6 +1759,33 @@ def _choose_latest(rows: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, b
         return None, True
     candidates.sort(key=lambda row: (row.get("source_file", ""), row.get("folder_id", "")))
     return dict(candidates[-1]), False
+
+
+def _observed_unread(candidates, chosen, method, message_id, changes):
+    if method not in {"exact_entry_id", "exact_entry_id_notification"}:
+        return None, None
+    observed = chosen["log_unix"]
+    observations = [(row.get("log_unix"), row.get("unread_count"),
+                     row.get("log_time"), "osa_message_header") for row in candidates]
+    for change in changes:
+        timestamp = _parse_time(change.get("log_time"))
+        if timestamp is None or timestamp < observed:
+            continue
+        sent = _parse_time(change.get("sent_time"))
+        exact = (change["notification_change"] != "DeletedMessage"
+                 and change["message_id"] == message_id
+                 and _canonical(change["folder_id"]) == _canonical(chosen["folder_id"])
+                 and sent is not None and chosen["sent_unix"] is not None
+                 and abs(sent - chosen["sent_unix"]) < 1.0)
+        observations.append((timestamp, change.get("unread_count") if exact else None,
+                             change["log_time"], "osa_notification"))
+    latest = max(timestamp for timestamp, *_ in observations if timestamp is not None)
+    selected = [(value, timestamp, source) for time, value, timestamp, source in observations if time == latest]
+    values = {value for value, _, _ in selected}
+    if values not in ({"0"}, {"1"}):
+        return None, None
+    value, timestamp, source = max(selected, key=lambda row: (row[2], row[1]))
+    return value == "1", {"observed_at": timestamp, "method": source}
 
 
 def _item_entry_ids(item: Mapping[str, Any]) -> list[str]:
@@ -1774,6 +1889,7 @@ def read_scope(
         "body_read": False,
         "folder_files": 0,
         "message_files": 0,
+        "notification_files": 0,
         "files_scanned": 0,
         "bad_files": 0,
         "unstable_files": 0,
@@ -1789,6 +1905,7 @@ def read_scope(
         "messages_unverified_folder": 0,
         "messages_exact_identity_conflict": 0,
         "messages_exact_time_conflict": 0,
+        "messages_notification_conflict": 0,
         "messages_fallback_input_duplicate": 0,
         "messages_fallback_identity_conflict": 0,
         "messages_no_valid_log_time": 0,
@@ -1821,6 +1938,7 @@ def read_scope(
 
     folder_observations: list[dict[str, Any]] = []
     message_observations: list[dict[str, Any]] = []
+    notification_observations: list[dict[str, Any]] = []
     for kind, path in files:
         source_stat = initial_stats[(kind, _relative_name(path, root))]
         parsed: tuple[list[dict[str, Any]], list[dict[str, Any]], str] | None = None
@@ -1869,6 +1987,9 @@ def read_scope(
         if kind == "folder":
             evidence["folder_files"] += 1
             folder_observations.extend(folder_rows)
+        elif kind == "notification":
+            evidence["notification_files"] += 1
+            notification_observations.extend(message_rows)
         else:
             evidence["message_files"] += 1
             message_observations.extend(message_rows)
@@ -1876,6 +1997,7 @@ def read_scope(
     evidence["files_seen"] = len(files)
     evidence["folder_observations"] = len(folder_observations)
     evidence["message_observations"] = len(message_observations)
+    evidence["notification_observations"] = len(notification_observations)
     end_evidence: dict[str, Any] = {"status": "ok"}
     end_files = _log_files(root, end_evidence)
     end_manifest = _scope_manifest(root, end_files)
@@ -1930,6 +2052,11 @@ def read_scope(
             "is_inbox": is_inbox,
             "is_sent": _is_type(folder_type, 3, "SentItems"),
             "is_deleted": _is_type(folder_type, 4, "DeletedItems"),
+            "is_drafts": _is_type(folder_type, 2, "Drafts"),
+            "is_junk": _is_type(folder_type, 5, "JunkMail"),
+            "is_outbox": bool(re.fullmatch(r"outbox(?: \(\d+\))?", folder_type.strip(), re.I)),
+            "is_mail_root": _is_type(folder_type, 13, "MsgFolderRoot"),
+            "is_archive_root": _is_type(folder_type, 14, "ArchiveMsgFolderRoot"),
             "evidence": {
                 "folder_type": folder_type,
                 "name_status": name_status,
@@ -1953,11 +2080,30 @@ def read_scope(
             by_entry[_canonical(observation["entry_id"])].append(observation)
         if observation.get("message_id"):
             by_message_id[observation["message_id"]].append(observation)
+    notification_by_entry: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    notification_entries_by_mid: dict[str, set[str]] = defaultdict(set)
+    notification_changes_by_entry: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    notification_deleted_folders: set[str] = set()
+    for observation in notification_observations:
+        change = observation.get("notification_change")
+        if change == "DeletedFolder":
+            notification_deleted_folders.add(_canonical(observation["object_id"]))
+            continue
+        if change:
+            entry = _canonical(observation["object_id"])
+            notification_changes_by_entry[entry].append(observation)
+        else:
+            entry = _canonical(observation["entry_id"])
+            notification_by_entry[entry].append(observation)
+        if observation["message_id"]:
+            notification_entries_by_mid[observation["message_id"]].add(entry)
+    notification_deleted_subtree = _descendant_keys(notification_deleted_folders, children)
 
     input_mid_counts = Counter(
         item["message_id"].strip()
         for item in rows
-        if isinstance(item.get("message_id"), str) and item["message_id"].strip()
+        if item.get("time_method") != "missing_header_field_271"
+        and isinstance(item.get("message_id"), str) and item["message_id"].strip()
     )
     messages: dict[str, dict[str, Any]] = {}
     for item in rows:
@@ -1972,18 +2118,27 @@ def read_scope(
         identifier = identifier.strip()
         message_id = message_id.strip()
         exact_ids = _item_entry_ids(item)
+        method = "exact_entry_id"
         exact_matches: list[dict[str, Any]] = []
         matched_entry_keys: set[str] = set()
         for entry_key in exact_ids:
             if by_entry.get(entry_key):
                 matched_entry_keys.add(entry_key)
                 exact_matches.extend(by_entry[entry_key])
-        method = "exact_entry_id"
+        if not exact_matches and len(exact_ids) == 1 and not by_message_id.get(message_id):
+            entry = exact_ids[0]
+            # Notifications supplement a missing primary observation. They
+            # cannot override a primary identity or establish a MID-only match.
+            if notification_entries_by_mid.get(message_id) == {entry}:
+                exact_matches = notification_by_entry[entry]
+                matched_entry_keys.add(entry)
+                method = "exact_entry_id_notification"
         candidates: list[dict[str, Any]] = []
+        osa_sent = None
         if exact_ids:
-            # A known EntryID is authoritative only after the header's own
-            # InternetMessageId and SentTime agree with the index row.  Never
-            # route a conflicting EntryID through the weaker MID fallback.
+            # Require the header's InternetMessageId and verify its SentTime,
+            # even when the HxStore row has no send-time field. An EntryID
+            # conflict cannot use the weaker MID fallback.
             if len(matched_entry_keys) > 1:
                 evidence["messages_unknown"] += 1
                 evidence["messages_exact_identity_conflict"] += 1
@@ -1998,23 +2153,20 @@ def read_scope(
                 evidence["messages_unknown"] += 1
                 evidence["messages_exact_identity_conflict"] += 1
                 continue
-            item_sent = _item_time(item)
-            identity_conflict = any(
-                row.get("message_id", "") != message_id for row in exact_matches
-            )
-            time_conflict = (
-                item_sent is None
-                or any(
-                    (row_sent := _finite_time(row.get("sent_unix"))) is None
-                    or not math.isfinite(row_sent)
-                    or abs(row_sent - item_sent) >= 1.0
-                    for row in exact_matches
-                )
-            )
-            if identity_conflict:
+            if any(row.get("message_id", "") != message_id for row in exact_matches):
                 evidence["messages_unknown"] += 1
                 evidence["messages_exact_identity_conflict"] += 1
                 continue
+            item_sent = _item_time(item)
+            if item_sent is None and item.get("time_method") == "missing_header_field_271":
+                osa_sent = _consistent_osa_sent_time(exact_matches)
+                time_conflict = osa_sent is None
+            else:
+                time_conflict = item_sent is None or any(
+                    (row_sent := _finite_time(row.get("sent_unix"))) is None
+                    or abs(row_sent - item_sent) >= 1.0
+                    for row in exact_matches
+                )
             if time_conflict:
                 evidence["messages_unknown"] += 1
                 evidence["messages_exact_time_conflict"] += 1
@@ -2076,6 +2228,16 @@ def read_scope(
             evidence["messages_unverified_folder"] += 1
             continue
 
+        if method == "exact_entry_id_notification" and (
+            folder_key in notification_deleted_subtree
+            or any(change["notification_change"] == "DeletedMessage"
+                   or change["message_id"] != message_id or _canonical(change["folder_id"]) != folder_key
+                   for change in notification_changes_by_entry.get(exact_ids[0], ()))
+        ):
+            evidence["messages_unknown"] += 1
+            evidence["messages_notification_conflict"] += 1
+            continue
+
         # Deleted descendants remain excluded even if malformed catalog data
         # also places them below another scoped root.
         if folder_key in deleted_subtree:
@@ -2090,6 +2252,10 @@ def read_scope(
         received = _received_time_evidence(candidates)
         participants, participant_status = _latest_participants(candidates)
         participant_counts = _latest_participant_counts(candidates)
+        unread, unread_evidence = _observed_unread(
+            candidates, chosen, method, message_id,
+            notification_changes_by_entry.get(exact_ids[0], ()) if exact_ids else (),
+        )
         evidence[f"messages_received_{received['received_time_status']}"] += 1
         messages[identifier] = {
             "folder_id": public_id_by_key[folder_key],
@@ -2098,6 +2264,8 @@ def read_scope(
             "participants": participants,
             "participants_status": participant_status,
             "participant_counts": participant_counts,
+            "unread": unread,
+            "unread_evidence": unread_evidence,
             "evidence": {
                 "match_method": method if candidates else "none",
                 "scope": scope,
@@ -2110,6 +2278,8 @@ def read_scope(
                 "entry_id_keys": sorted(matched_entry_keys),
             },
         }
+        if osa_sent is not None:
+            messages[identifier]["sent_unix"] = osa_sent
         evidence["messages_mapped"] += 1
 
     if evidence["bad_files"] or evidence["unsafe_xml_files"] or evidence["oversized_files"]:

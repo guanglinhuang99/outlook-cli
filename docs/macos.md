@@ -36,7 +36,7 @@ node bin/outlook.mjs mcp-config
 }
 ```
 
-这套配置暴露与 Windows 相同的 9 个 `outlook_*` 工具，包含 `outlook_today`。端口、令牌鉴权和 Streamable HTTP 与 Windows 共用。`OUTLOOK_LOCAL_STATE_DIR` 必须与启动服务时一致；通常直接复制 `mcp-config` 的输出即可。 自定义服务状态路径的父目录须由当前用户或 root 控制，拒绝可被其他用户替换的共享目录。
+这套配置暴露 9 个通用 `outlook_*` 工具，以及 3 个 macOS 批量工具。端口、令牌鉴权和 Streamable HTTP 与 Windows 共用。`OUTLOOK_LOCAL_STATE_DIR` 必须与启动服务时一致；通常直接复制 `mcp-config` 的输出即可。 自定义服务状态路径的父目录须由当前用户或 root 控制，拒绝可被其他用户替换的共享目录。
 
 服务状态会保留启动时的自定义 profile 保护路径，后续下载命令无需重复设置该环境变量。升级旧版本后先执行 `node bin/outlook.mjs restart`；旧状态缺少保护路径时，下载会要求重启。接收时间筛选版本使用新的目录快照版本，重启后会重新构建索引。MCP 工具可能创建、刷新或清理私有缓存，因此安全注解会标明本地文件写入；这不改变原始 Outlook 邮件只读的约束。
 
@@ -48,6 +48,7 @@ node bin/outlook.mjs mcp-config
 | `OUTLOOK_MAC_PYTHON` | `python3`；可设为 Python 可执行文件绝对路径 |
 | `OUTLOOK_MAC_PROFILE` | 自动发现唯一的 HxStore profile；多个 profile 时要求显式指定绝对目录或 `~/` 路径 |
 | `OUTLOOK_MAC_STATE_DIR` | `~/Library/Caches/outlook-cli/mac-cache`；共享服务的 Python 索引、正文快照、附件导出 |
+| `OUTLOOK_MAC_FOLDER_SCOPE` | `inbox-sent`；共享服务可用 `account` 纳入有明确目录证据的账户和联机存档树。使用独立服务和缓存目录 |
 | `OUTLOOK_LOCAL_STATE_DIR` | `~/Library/Caches/outlook-cli/service`；Node 服务令牌、日志 |
 | `OUTLOOK_LOCAL_PORT` | `17379`；同机多实例应各用不同状态目录和端口 |
 
@@ -55,13 +56,15 @@ node bin/outlook.mjs mcp-config
 
 ## 目录与时间口径
 
-- 只公开目录证据确认的收件箱、已发送及其全部已知子目录；已删除及其子目录、归属不明和存在冲突的邮件均排除。旧快照 ID 还会核对最新本地目录范围，范围变更后须重新列出。
-- `stores` 返回缓存账户分组；用 `root_id` 调用 `folders` 可获得收件箱和已发送根目录，按 `is_inbox` / `is_sent` 识别，再逐级获取子目录。部分原始目录名被 Outlook 脱敏为 `pii:`；返回名称状态，不猜测中文名称或账户名称。
+- 默认公开目录证据确认的收件箱、已发送和已知子目录，排除已删除及其子目录。显式启用 `account` 后，共享服务也公开能沿父链追溯到已验证邮箱或存档根的目录，包括有证据的草稿、已删除、垃圾邮件及自建目录。目录存在只证明可浏览本地记录，缺少对应邮件缓存时列表为空。归属不明及冲突记录均排除。旧快照 ID 仍需通过最新目录范围校验。
+- 主读取日志尚无对应邮件时，完整的 Osa `GetNotification` 新邮件通知可补充目录证据。只有通知里的邮件头与数据身份一致、本地缓存的 EntryID 和 InternetMessageId 均匹配，且通过发送时间和目录校验时，才公开该邮件。已有删除或目录归属冲突的通知记录会使这份补充证据失效。
+- `stores` 返回缓存账户分组；用 `root_id` 调用 `folders` 获取各目录根，再逐级读取子目录。以 `is_inbox`、`is_sent` 和 `folder_type` 识别目录。部分目录名被 Outlook 脱敏为 `pii:`。
 - `inbox` / `sent` 仅在能唯一确定缓存账户时使用。判断包含根目录和全部已知子目录；多个账户有缓存时返回 `FOLDER_AMBIGUOUS`，应选择显式文件夹 ID。
 - `messages`、`search`、`today` 每次查一个文件夹，不递归。遍历全部邮件需逐级调用 `folders`，逐目录跟随 `next_offset`；分页为 offset 模式，跨页邮箱变化可能带来重复或遗漏，按 ID 去重。
 - Mac 与 Windows 一样按接收时间筛选：`date_basis: "received_at"`。读取 Osa `MessageHeader.LastDeliveryTime`，与同一记录的 `ReceivedOrRenewTime` 原始 .NET ticks 核对，并沿用 EntryID / Message-ID 与发送时间的身份验证；不使用日志的响应时间或文件修改时间。`today` 以新加坡时区当天 `[00:00, 次日00:00)` 筛选接收时间。这里的接收时间是 Outlook 最后投递时间，不保证是邮件最初的 SMTP 接收时间。翻页传回结果的 `date` 和 `next_offset`。 共享工具的显式 `date` 范围为 `1970-01-01` 至 `9999-12-30`；使用历史日期时按 `Asia/Singapore` 的对应时区规则筛选。
 - 接收时间缺失、无效或证据冲突时，`received_at` 为 null，`received_time_status` 说明原因；不回退到发送时间。无日期条件仍可检索和读取这些邮件，有日期条件时排除并通过 `received_time_unknown` / `date_filter_incomplete` 提示范围不完整。结果按已验证接收时间倒序，缺失时间置后。接收时间只覆盖本地日志可可靠关联的记录，不保证全部服务器邮件。
-- 字段 271 仍单独保留为 `sent_at`，用于显示与身份核对，不参与邮件日期筛选。该字段按毫秒对齐的 .NET DateTime ticks 解码，保留毫秒用于排序和时间过滤；支持从公元 1 年起、至 UTC `9999-12-31 16:00:00` 之前的格式有效值，上界预留新加坡时区转换空间，没有按当前年份或 2030 年截断。
+- `sent_at` 用于显示与身份核对。HxStore 字段 271 按毫秒对齐的 .NET DateTime ticks 解码，支持从公元 1 年起、至 UTC `9999-12-31 16:00:00` 之前的有效值。字段缺失时，只有 EntryID 与 InternetMessageId 均匹配，且对应 Osa 日志的 `SentTime` 都有效并指向同一时刻，才回填 `sent_at`。邮件日期筛选使用 `received_at`。
+- 共享服务的 `unread` 来自经 EntryID、InternetMessageId、发送时间和目录校验的最新本地 Osa 邮件头或通知。冲突和缺失返回 null。使用 `--unread true` 或 `--unread false` 时，未知状态均排除，并通过 `unread_unknown_count` 和 `unread_filter_incomplete` 回报。目录计数仅统计本地索引，`unread_evidence.observed_at` 是日志观察时间。
 - 只能读取已缓存、且能可靠关联的内容。`captured_at` 是快照生成时间，不是服务器同步时间；`coverage` 说明本地证据范围，不保证服务器邮箱完整。
 - 每次成功刷新后最多保留当前目录快照和共用同一源容器的最近两个历史视图；源快照变化时清理旧源及其视图、正文和附件导出。失败的目录刷新回退源指针并清理未发布视图的容器副本。旧 ID/游标超过保留范围会失效，或在并发刷新清理时返回读取错误，应重新检索；原始 Outlook 缓存不参与清理。任何相关 Osa 日志读取失败时刷新报错，旧目录范围也不再视为有效。
 
@@ -71,7 +74,7 @@ node bin/outlook.mjs mcp-config
 
 `participants_status` 按角色标记 `verified`、`partial`、`missing`、`redacted` 或 `conflict` 等状态；`participants_evidence` 说明 HxStore 来源、解析人数和日志人数。HxStore 人员只有在没有拒绝记录、且人数与最新明确完整的 Osa 观察一致时才标为 `verified`；没有完整日志或部分对象解析失败时，可搜索已确认人员，但标为 `partial`。对象版本冲突不返回该角色名单。`verified` 是本地证据一致，不保证服务端或整个邮箱完整。`person_search_incomplete` 提醒本地证据可能漏项；原始 Exchange 地址不等于已验证的 SMTP 别名。共享 CLI 用 `search --query '预算' --person '张三' --person-role any`，按文件夹分别检索。
 
-常驻进程最多缓存 3 个已验证索引，文件内容/身份/权限变化会使缓存失效；每次请求仍检查 profile、目录权限及原始邮件隔离边界。宽范围搜索只为返回页生成完整元数据，正文继续按需解析。首次加载、Outlook 更新后的索引刷新、进程重启后仍有开销，默认 300 秒的刷新周期没有放宽。升级后的目录快照格式为 5，首次使用需重建目录/人员索引；旧邮件不会按发送日期提前排除。升级已安装 MCP 后须重新连接客户端，让常驻进程加载新代码。
+常驻进程最多缓存 3 个已验证索引，文件内容、身份或权限变化会使缓存失效。宽范围搜索只为返回页生成完整元数据，正文按需解析。默认刷新周期为 300 秒。目录快照格式为 8，升级后首次使用会重建索引。升级已安装 MCP 后须重新连接客户端，让常驻进程加载新代码。
 
 查询在内部复用已验证的索引，只复制实际返回的数据，避免每次搜索复制整个邮箱索引。Osa 日志的解析元数据通过 Python 标准库 SQLite 保存到私有状态目录的 `osa-metadata.sqlite3`，新进程也可复用。缓存最多保留 4096 个文件、64 MiB 序列化元数据，数据库文件另限 68 MiB；不保存正文和附件内容，不需要安装数据库服务。首次使用需要填充缓存。
 
@@ -97,7 +100,7 @@ HxStore 的 LZ4 解压改用批量复制，保留重叠复制语义、CRC 和边
 
 ## 中文正文和附件
 
-已支持本机验证的 type-202 内嵌正文变体 5，以及变体 4/5 的额外字符串池布局。新增布局必须同时通过对象归属、描述符边界、编码和非空摘要一致性校验；摘要缺失或不一致时仍返回不可用，不猜测正文。解析索引版本升级到 20，升级后首次调用会重建索引，避免复用旧版“尚未关联”的正文结果。正文继续按需读取。
+已支持本机验证的 type-202 内嵌正文布局，包括变体 5、变体 4/5 的额外字符串池，以及带四个零填充字节的标准变体 1/4。新增布局必须通过对象归属、描述符边界、编码和摘要一致性校验。摘要缺失或不一致时仍返回不可用。解析索引格式为 22，升级后首次调用会重建索引。正文继续按需读取。
 
 正文通过 Message-ID、EntryID 等精确证据与邮件关联，不用主题相似度猜测。无可靠正文时保留 `body.available: false`、`text: null`、`status` 和 `diagnosis`，区分可确认的缓存缺失与解析尚未关联；空字符串不替代缺失正文。
 
@@ -107,20 +110,37 @@ HxStore 的 LZ4 解压改用批量复制，保留重叠复制语义、CRC 和边
 
 | 参数 | 错误 |
 |---|---|
-| `unread`（包含 false） | `UNSUPPORTED_FILTER` |
 | `search_body: true` | 启用本地正文索引；缺失或 pending 通过 `fulltext` 和 `body_search_incomplete` 明确返回 |
 | `format: "html"` | `UNSUPPORTED_FORMAT` |
-| 已删除、草稿、垃圾邮件、发件箱 | `SCOPE_DENIED` |
+| 已删除、草稿、垃圾邮件、发件箱 | 默认范围返回 `SCOPE_DENIED`。账户范围缺少相应目录证据时返回 `FOLDER_UNAVAILABLE` |
 
 未验证的已读状态、收件人等字段为 null。附件列表只包含识别到的记录，`attachments_complete: false`；不能由列表为空推断原邮件无附件。读取前核对附件指纹，按需复制到服务自己的导出目录，分块返回 base64 与整文件 SHA-256。私有附件导出最多保留 64 个文件、总计 512 MiB，淘汰后可重新从仍有效的原始缓存读取。CLI `download` 校验大小和哈希，使用独占创建拒绝覆盖，单附件上限 10 MiB。
 
 原生 MCP 批量正文读取的 64 MiB 预算计入实际读取的外部正文文件、解码后的 HTML 字节和实际解压的数据块；gzip 解压受剩余预算限制。已恢复的正文缓存命中不消耗该源处理预算，同次读取命中块缓存不重复计费，淘汰后再次解压会再次计费。另设 64 MiB 的批量缓存校验预算，限制重启后首次读取的正文哈希和文本块校验；进程内已校验且指纹未变的内容不重复计费。超出预算的邮件返回明确错误，可改为单封读取。
 
+## 跨目录查询与批量读取
+
+| 原 Apple Mail 工作流 | Outlook CLI | MCP |
+|---|---|---|
+| 查询候选邮件和提取正文 | `context-bundle` | `outlook_context_bundle` |
+| 汇总当日邮件 | `today-bundle` | `outlook_today_bundle` |
+| 按已选 ID 批量取信 | `messages-bundle` | `outlook_messages_bundle` |
+
+`--folder inbox` 默认包含收件箱及已知子目录，`--folder sent` 选择已发送目录树。`--folder all` 查询本实例当前的所有已验证目录。可用 `stores` 或 `folders` 返回的根目录 ID 或文件夹 ID 限定范围。`--include-subfolders false` 只选所指定的目录或目录树根节点。
+
+`context-bundle` 可用 `--query`、`--field subject|sender|preview|all`、`--person`、`--person-role` 和包含首尾两天的 `--from-date` / `--to-date`。`--has-cached-attachments true` 选择索引生成时有附件缓存的记录，`false` 选择没有已验证附件缓存的记录。`--search-body true` 启用字面正文搜索。收到 `retry_required` 时先重试当前查询，再使用 `next_cursor` 翻页。
+
+元数据模式每页最多 100 封。正文模式及选定 ID 批次每次最多 25 封。`--max-chars` 控制每封正文上限，`--text-budget-chars` 控制批次正文总量，单位为 UTF-16。继续翻页时传回 `--cursor` 并保留筛选条件。`today-bundle` 的游标会保留第一页使用的日期。
+
+`complete` 和 `next_cursor` 表示分页状态。正文还需查看 `body_complete`、各条 `body.available`、`body.truncated` 和 `errors`。本地缓存缺失、正文截断和读失败都会保留状态。原始邮件的已读状态与内容始终保持只读。
+
+会话、增量检查点、50 封邮件与指定附件的组合读取、本地知识库及 EventKit 日历的入口见 [Apple Mail 迁移指南](applemail-migration.md)。
+
 ## 保留的原生 Python MCP
 
 已安装原生 Mac MCP 的客户端可继续使用 `python3 /absolute/path/to/outlook-cli/macos/mcp_server.py`。它直接提供 10 个 `outlook_local_*` 工具，不需要 Node 后台服务，可用 `--state`、`--profile`、`--from-date`、`--refresh-seconds` 参数配置，详见 `macos/mcp_server.py --help`。 使用原生安装器且有多个 profile 时，可运行 `python3 macos/install_mcp.py --profile /absolute/path/to/profile`，生成的通用配置会保留该选择。
 
-原生工具提供跨收件箱/已发送目录树搜索、快照游标、批量正文和 `outlook_local_today`；共享 Node 工具沿用 Windows 的单目录、offset 契约。两者工具名、参数和 ID 不相同，请按工具声明调用。现有原生 MCP 配置无需因本次整合改动。
+原生和共享 MCP 都提供 macOS 跨目录及批量正文工具。两者的工具名、参数和 ID 使用各自的声明。通用的 `outlook_messages`、`outlook_search` 和 `outlook_today` 仍使用原有单目录和 offset 参数。
 
 共享服务默认使用独立缓存目录，避免和已安装的旧版原生 MCP 相互覆盖索引。只有相同版本的读取器才应显式共用状态目录；升级原生安装后需重启对应客户端。
 
@@ -145,7 +165,7 @@ Agent 按下面方式减少重复传输和重复摘要：
 
 每页最多 25 封，每封最多 20,000 字符，返回正文最多 500,000 字符；源文件读取和缓存验证各保留 64 MiB 预算。预算不足会逐封报错，可降低分页大小重试。两个 known 列表各最多 5,000 项；调用前需自行限制为不超过 5,000 项的子集，超长请求会被拒绝（遗漏项会重新返回，正确性不受影响）。增量方式每次仍检查整个查询范围，不用“上次发送时间”水位跳过延迟收到的邮件。
 
-该工具只存在于 Mac 原生 MCP；共享 Node/Windows 的 9 个工具接口不变。安装后重新连接 MCP 才能发现新工具。
+`outlook_local_digest` 由 Mac 原生 MCP 提供。安装后重新连接 MCP 才能发现新工具。
 
 本机实测（2026-10-21，按接收时间读取 10 月 15—21 日共 731 封邮件，正文上限同为 12,000 字符）：原搜索＋批量正文的 MCP 返回数据为 16.82 MB，digest 为 8.58 MB，减少 49%；传入全部已处理版本后为 0.27 MB，减少 98.4%。这些是响应字节，不包括客户端发送 known 列表的请求字节。热缓存读取分别为 0.46 秒、0.40 秒和 0.38 秒；digest 在新进程中的第一遍读取为 2.16 秒，另需索引刷新 15.63 秒。精简保留字段、附件名称/状态和正文与原接口逐封一致；319 封正文未缓存、28 封正文截断的标记保持一致。412 条可用正文记录合并为 360 个内容条目，但正文字符仅减少约 0.5%，因为重复正文多为空或很短。这次主要减少元数据冗余及重复摘要输入，尚未重新计时完整模型摘要过程，不能把响应缩小比例当作端到端加速比例。
 

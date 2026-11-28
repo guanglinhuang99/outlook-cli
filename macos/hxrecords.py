@@ -21,6 +21,7 @@ MESSAGE_ID = re.compile(r"<[^<>\s]+@[^<>\s]+>\Z")
 PREFIXES = re.compile(r"^(?:(?:re|fw|fwd|aw|回复|答复|转发)\s*[:：]\s*)+", re.I)
 EPOCH_TICKS = 621355968000000000
 DOTNET_TICKS_PER_SECOND = 10_000_000
+SEND_TIME_FIELD_PREFIX = struct.pack("<H", 271) + b"\0" * 8
 # .NET DateTime ticks cover 0001-01-01 through 9999-12-31.  The local
 # metadata path converts Unix seconds to Asia/Singapore datetime values, so
 # cap UTC at 9999-12-31 16:00:00 exclusive; +08:00 then stays in year 9999.
@@ -44,6 +45,7 @@ INLINE_BODY_EXTRA_POOL_OFFSET = 1730
 INLINE_BODY_EXTRA_POOL_LENGTH = 1734
 INLINE_BODY_CLASS_LENGTH = 1690
 INLINE_BODY_CLASS_OFFSET = 1880
+INLINE_BODY_PADDED_CLASS_OFFSET = 1884
 INLINE_BODY_PAYLOAD_BASE = 1898
 INLINE_BODY_OWNER_OFFSET = 68
 INLINE_BODY_CODEPAGE = 65001
@@ -314,8 +316,13 @@ def parse_inline_body(frame, include_data=True):
     while (start := data.find(ANCHOR, position)) >= 0:
         class_positions.append(start)
         position = start + len(ANCHOR)
-    if class_positions != [INLINE_BODY_CLASS_OFFSET]:
+    # The padded standard layout leaves the descriptor fields in place and
+    # shifts the class and payload together by four zero bytes.
+    padded_layout = (class_positions == [INLINE_BODY_PADDED_CLASS_OFFSET]
+                     and data[INLINE_BODY_CLASS_OFFSET:INLINE_BODY_PADDED_CLASS_OFFSET] == b"\0" * 4)
+    if class_positions != [INLINE_BODY_CLASS_OFFSET] and not padded_layout:
         return None
+    class_offset = class_positions[0]
 
     fields_end = max(
         INLINE_BODY_CODEPAGE_OFFSET + 4,
@@ -323,7 +330,7 @@ def parse_inline_body(frame, include_data=True):
         INLINE_BODY_UNIQUE_DESCRIPTOR + 4,
         INLINE_BODY_EXTRA_POOL_LENGTH + 4,
         INLINE_BODY_CLASS_LENGTH + 4,
-        INLINE_BODY_CLASS_OFFSET + len(ANCHOR),
+        class_offset + len(ANCHOR),
     )
     if len(data) < fields_end:
         return None
@@ -335,6 +342,9 @@ def parse_inline_body(frame, include_data=True):
     variant = struct.unpack_from("<I", data, INLINE_BODY_VARIANT)[0]
     extra_offset = struct.unpack_from("<I", data, INLINE_BODY_EXTRA_POOL_OFFSET)[0]
     extra_length = struct.unpack_from("<I", data, INLINE_BODY_EXTRA_POOL_LENGTH)[0]
+    if padded_layout and (variant not in (INLINE_BODY_STANDARD_VARIANT, INLINE_BODY_EXTRA_VARIANT)
+                          or extra_offset != 0 or extra_length != 0):
+        return None
     # Variant 1/4 standard payloads and variant 1's extra-pool layout are
     # established layouts.  The newer variant 5 standard payload and variant
     # 4/5 extra-pool layouts use the same verified offsets, but their body
@@ -343,8 +353,8 @@ def parse_inline_body(frame, include_data=True):
     if (variant in (INLINE_BODY_STANDARD_VARIANT, INLINE_BODY_EXTRA_VARIANT,
                     INLINE_BODY_VARIANT_5)
             and extra_offset == 0 and extra_length == 0):
-        payload_base = INLINE_BODY_PAYLOAD_BASE
-        requires_preview_match = variant == INLINE_BODY_VARIANT_5
+        payload_base = INLINE_BODY_PAYLOAD_BASE + (class_offset - INLINE_BODY_CLASS_OFFSET)
+        requires_preview_match = padded_layout or variant == INLINE_BODY_VARIANT_5
     elif (variant in (INLINE_BODY_EXTRA_VARIANT, INLINE_BODY_STANDARD_VARIANT,
                       INLINE_BODY_VARIANT_5)
           and extra_offset == INLINE_BODY_EXTRA_OFFSET
@@ -384,7 +394,7 @@ def parse_inline_body(frame, include_data=True):
             "owner_offset": owner_references[0][0],
             "owner_key": frame.key,
             "class": INLINE_BODY_CLASS,
-            "class_offset": INLINE_BODY_CLASS_OFFSET,
+            "class_offset": class_offset,
             "class_length": class_length,
             "codepage": codepage,
             "codepage_offset": INLINE_BODY_CODEPAGE_OFFSET,
@@ -485,7 +495,7 @@ def record_times(data, key):
         value = struct.unpack_from("<Q", data, position)[0]
         if _supported_ticks(value):
             times.add((value - EPOCH_TICKS) / DOTNET_TICKS_PER_SECOND)
-    marker = struct.pack("<H", 271) + b"\0" * 8 + struct.pack("<Q", key)
+    marker = SEND_TIME_FIELD_PREFIX + struct.pack("<Q", key)
     explicit, position = set(), 0
     while (start := data.find(marker, position)) >= 0:
         position = start + len(marker)
@@ -566,6 +576,7 @@ def parse_header(frame):
         "preview_method": preview_method,
         "sent_unix": sent, "latest_tick_unix": modified,
         "time_method": time_method,
+        "has_send_time_field": SEND_TIME_FIELD_PREFIX in data,
         "sender_status": "single_header_address" if sender else "unresolved",
         "entry_ids": sorted(entries),
         "evidence": {"block": frame.block, "frame_offset": frame.offset,

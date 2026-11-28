@@ -2,7 +2,7 @@
 import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { definitions } from '../src/tools.mjs';
+import { definitionsForPlatform } from '../src/tools.mjs';
 
 const configPath = process.argv[2];
 let child;
@@ -59,7 +59,7 @@ try {
   if (!initialized?.capabilities?.tools || !initialized.protocolVersion) throw new Error('MCP initialization did not advertise tools.');
   send({ method: 'notifications/initialized' });
   const list = await request('tools/list');
-  const expected = Object.keys(definitions).map(name => `outlook_${name}`);
+  const expected = definitionsForPlatform().map(([name]) => `outlook_${name}`);
   const cacheWrites = process.platform !== 'win32';
   if (list.tools?.length !== expected.length || !expected.every(name => list.tools.some(tool => (
     tool.name === name

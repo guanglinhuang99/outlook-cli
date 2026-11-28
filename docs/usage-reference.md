@@ -2,21 +2,21 @@
 
 首次使用请先看 [项目首页](../README.md)。本页保留安装参数、后端限制和协议细节。
 
-Windows 和 macOS Outlook 的本机只读服务，共用 **CLI、MCP stdio、MCP Streamable HTTP**。不内置 AI，不需要模型 API Key，不使用 Graph OAuth。邮箱登录及同步仍由 Outlook 完成。
+Windows 和 macOS Outlook 的本机只读服务共用 **CLI、MCP stdio、MCP Streamable HTTP**。邮箱登录及同步由本机 Outlook 完成。可选的 `graph` CLI 使用单独的 Microsoft Graph 授权。[Graph 配置和命令](applemail-migration.md#microsoft-graph-授权与写操作)
 
 源码 v0.3.0 按平台自动选择读取器，共享 9 个 `outlook_*` 工具。已有 Windows COM / OST/PST 用法保持兼容；Mac 的 HxStore 格式由独立 Python 读取器处理，邮件 ID 不跨后端通用。
 
 | 平台 | 默认后端 | 日期筛选依据 | 目录范围 |
 |---|---|---|---|
 | Windows | 经典 Outlook COM，默认按需启动；启动失败时提示并尝试本地 OST/PST | `received_at` | 原有 Outlook / 文件后端范围 |
-| macOS | `mac-cache`，只读本地 HxStore 和 Osa 目录证据 | `received_at`（已验证的 `LastDeliveryTime`） | 已确认的收件箱、已发送及其全部已知子目录；排除已删除及归属不明邮件 |
+| macOS | `mac-cache`，只读本地 HxStore 和 Osa 目录证据 | `received_at`（已验证的 `LastDeliveryTime`） | 默认覆盖已确认的收件箱、已发送及其已知子目录，可显式开启 `account` 范围 |
 
 ### Mac 从源码使用
 
 需要 Node.js 22+、Python 3.11+，以及已在本机同步邮件的 Outlook。无需安装 Windows 解析器。
 
 ```sh
-git clone --branch codex/macos-windows-unified https://github.com/guanglinhuang99/outlook-cli.git
+git clone https://github.com/guanglinhuang99/outlook-cli.git
 cd outlook-cli
 npm ci --ignore-scripts
 node bin/outlook.mjs start
@@ -27,7 +27,7 @@ node bin/outlook.mjs stores
 node bin/outlook.mjs mcp-config
 ```
 
-Mac 使用细节、通用 MCP 配置和原生 Python MCP 兼容入口见 [macOS 说明](macos.md)。共享命令每次查询一个文件夹；用 `stores` → `folders` 逐级遍历子目录。Mac 缓存无法验证的已读状态和 HTML 正文会明确报错；正文搜索需显式启用 `search_body`，状态通过 `fulltext` 和 `body_search_incomplete` 返回。首次建索引可能需要几十秒，索引和附件副本仅写入服务自己的缓存目录，原始邮件只读。
+`messages`、`search` 和 `today` 每次查询一个文件夹。用 `stores` 和 `folders` 逐级遍历，或使用 macOS 的跨目录批量工具。Mac 无法验证的已读状态返回 `null`，正文以文本格式返回。正文搜索需显式启用 `search_body`，状态通过 `fulltext` 和 `body_search_incomplete` 返回。首次建索引可能需要几十秒，索引和附件副本仅写入服务自己的缓存目录。[macOS 使用和配置说明](macos.md)
 
 ## Windows：Outlook 未打开时读取本地数据
 
@@ -190,7 +190,7 @@ COM 模式下，服务应在与 Outlook **相同的 Windows 用户、交互式�
 
 ## 工具和参数
 
-CLI 命令与 MCP 工具一一对应，MCP 工具名增加 `outlook_` 前缀。
+下表列出通用的本地查询命令及其 MCP 工具。macOS 另提供跨目录和批量读取工具。[macOS 批量工具](macos.md#跨目录查询与批量读取)
 
 | CLI / 操作 | MCP 工具 | 功能 |
 |---|---|---|
@@ -204,11 +204,11 @@ CLI 命令与 MCP 工具一一对应，MCP 工具名增加 `outlook_` 前缀。
 | `attachments` | `outlook_attachments` | 附件名称、类型、大小、序号 |
 | `read_attachment` / `download` | `outlook_read_attachment` | 分块读取附件；CLI download 合并并保存文件 |
 
-没有发送、删除、移动、修改已读状态等接口。服务端只读；CLI `download` 会写入用户指定的本机文件，拒绝覆盖已有文件。Outlook 自身仍会正常同步邮箱。
+本地服务和这些 MCP 工具以只读方式访问邮箱。CLI `download` 将附件保存到用户指定的本机路径，拒绝覆盖已有文件。更改服务器邮件状态或发送草稿可使用单独授权的 `graph` 命令。[Graph 写操作](applemail-migration.md#microsoft-graph-授权与写操作)
 
 ### 文件夹和邮件 ID
 
-默认文件夹是 `inbox`。`sent` 表示已发送。Windows 还支持 `drafts`、`deleted`、`junk`、`outbox`；Mac 拒绝这些目录。别名针对默认存储，Mac 多个账户无法唯一确定默认值时会要求显式选择。其他账户和文件夹先调用 `stores`，用返回的 `root_id` 调用 `folders`，逐级取得文件夹 `id`。
+默认文件夹是 `inbox`。`sent` 表示已发送。Windows 支持 `drafts`、`deleted`、`junk` 和 `outbox`。macOS 共享服务需要开启 `account` 范围并验证对应目录。别名针对默认存储，Mac 多个账户无法唯一确定默认值时会要求显式选择。其他账户和文件夹先调用 `stores`，用返回的 `root_id` 调用 `folders`，逐级取得文件夹 `id`。
 
 ID 编码了后端和对象身份，Mac ID 还绑定缓存快照；调用方应原样传回。邮件移动、目录权限范围或存储变化可能导致 ID 失效，需要重新列出获取。它们不是全局永久 ID。
 

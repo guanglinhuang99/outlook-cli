@@ -16,6 +16,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).parent))
 import outlook_service as service
 import test_outlook_local as fixtures
+import test_osa_scope as osa_fixtures
 
 
 class FrozenDatetime(datetime):
@@ -124,6 +125,81 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(all(row['sent_at'].startswith('2000-') for row in page['items']))
         self.assertTrue(all(row['received_at'].startswith('2001-01-01') for row in page['items']))
         self.assertEqual(page['date_basis'], 'received_at')
+
+    def test_multi_root_search_can_select_roots_or_their_descendants(self):
+        self.scope['messages'][self.ids[2]]['folder_id'] = 'sent'
+        snapshot = self.refresh()['snapshot']
+        roots = ('inbox', 'sent')
+        only_roots = self.client._search({'include_subfolders': False}, snapshot=snapshot, root_folders=roots)
+        self.assertEqual({row['folder_id'] for row in only_roots['items']}, {'inbox', 'sent'})
+        descendants = self.client._search({'include_subfolders': True}, snapshot=snapshot, root_folders=roots)
+        self.assertEqual({row['folder_id'] for row in descendants['items']}, {'inbox', 'sent', 'deep'})
+
+    def test_cached_attachment_filter_is_bound_to_the_search_cursor(self):
+        self.scope['messages'][self.ids[2]]['folder_id'] = 'sent'
+        snapshot = self.refresh()['snapshot']
+        linked = self.client._search({'has_cached_attachments': True}, snapshot=snapshot)
+        self.assertEqual([row['id'] for row in linked['items']], [self.ids[2]])
+        page = self.client._search({'has_cached_attachments': False, 'limit': 1}, snapshot=snapshot)
+        self.assertIsNotNone(page['next_cursor'])
+        with self.assertRaisesRegex(ValueError, 'another snapshot or query'):
+            self.client._search({'has_cached_attachments': True, 'limit': 1, 'cursor': page['next_cursor']})
+
+    def test_missing_send_field_backfill_reaches_received_date_search_and_read(self):
+        first = fixtures.mail_frame(
+            0xABC,
+            before=('sender@example.com', '张伟🧪'),
+            after=('中文主题甲', '<first@example.test>', fixtures.PREVIEW, '中文主题甲'),
+            tail=self.fixture.entry_first,
+        )
+        second = fixtures.mail_frame(
+            0xABD,
+            before=('other@example.com', '王小明😀'),
+            after=('中文主题乙', '<second@example.test>', fixtures.GZIP_PREVIEW, '中文主题乙'),
+            tail=fixtures.verified_ticks(0xABD, 946_684_820.0001) + self.fixture.entry_second,
+        )
+        headers = {f.key: f.data for f in service.core.iter_frames(self.fixture.block) if f.kind == 201}
+        self.fixture.block.data = self.fixture.block.data.replace(headers[0xABC], first, 1)
+        self.fixture.block.data = self.fixture.block.data.replace(headers[0xABD], second, 1)
+        self.fixture.source_cache.write_bytes(b'synthetic source with absent and invalid send-time fields')
+        log_dir = self.fixture.profile / 'Osa' / 'OutlookServiceApiLogs_test'
+        log_dir.mkdir(parents=True)
+        received = datetime(1999, 12, 31, 16, 1, tzinfo=timezone.utc)
+        received_ticks = 621355968000000000 + int(received.timestamp()) * 10000000
+        log = (
+            '<Response><LogTime>2000-01-01T01:00:00Z</LogTime>'
+            + osa_fixtures.folder_view('INBOX', 'ROOT', 'Inbox', 'Inbox (1)')
+            + '</Response>'
+        )
+        (log_dir / 'x.GetFolder.1.res.xmlgz').write_bytes(gzip.compress(log.encode()))
+        log = (
+            '<Response><LogTime>2000-01-01T01:00:00Z</LogTime>'
+            + osa_fixtures.message_header(
+                self.fixture.entry_first.hex(), '<first@example.test>', '1999-12-31T15:59:00Z',
+                'INBOX', '1999-12-31T16:01:00Z', received_ticks,
+            )
+            + osa_fixtures.message_header(
+                self.fixture.entry_second.hex(), '<second@example.test>', '1999-12-31T15:59:00Z',
+                'INBOX', '1999-12-31T16:01:00Z', received_ticks,
+            )
+            + '</Response>'
+        )
+        (log_dir / 'x.GetMessage.1.res.xmlgz').write_bytes(gzip.compress(log.encode()))
+
+        with patch.object(sys.modules['osa_scope'], 'read_scope', osa_fixtures.osa_scope.read_scope):
+            result = self.refresh()
+            page = self.client.call('outlook_local_search', {'from_date': '2000-01-01', 'to_date': '2000-01-01'})
+            self.assertEqual(result['osa_sent_time_backfilled'], 1)
+            self.assertEqual(result['source_exclusions']['unresolved_times_excluded'], 1)
+            self.assertEqual(page['date_basis'], 'received_at')
+            self.assertEqual(page['total_matched'], 1)
+            item = page['items'][0]
+            self.assertEqual(item['time_method'], 'osa_sent_time_exact_identity')
+            self.assertEqual(item['sent_at'], '1999-12-31T23:59:00+08:00')
+            self.assertEqual(item['received_at'], '2000-01-01T00:01:00+08:00')
+            message = self.client.call('outlook_local_read', {'id': item['id']})
+            self.assertEqual(message['body']['status'], 'cached_html')
+            self.assertTrue(message['body']['text'])
 
     def test_delayed_received_mail_can_read_body_after_received_filter(self):
         received = datetime(2001, 1, 1, tzinfo=timezone.utc).timestamp()

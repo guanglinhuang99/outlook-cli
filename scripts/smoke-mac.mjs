@@ -46,7 +46,7 @@ async function run() {
   const selection = { folder: inbox.id };
   const list = await call('messages', { ...selection, limit: 200 });
   assert.ok(list.messages.length > 0, 'Inbox must have a cached test message');
-  assert.ok(list.messages.every(row => row.unread === null));
+  assert.ok(list.messages.every(row => row.unread === null || typeof row.unread === 'boolean'));
   const sample = list.messages[0];
   assert.ok(sample.received_at, "Newest Inbox sample must have verified receipt time");
   stage = 'today';
@@ -111,8 +111,12 @@ async function run() {
   report.body_pagination = available;
   report.missing_body_reported = absent;
   stage = 'scope_and_capabilities';
-  await assert.rejects(call('messages', { folder: 'deleted' }), { code: 'SCOPE_DENIED' });
-  await assert.rejects(call('messages', { unread: false }), { code: 'UNSUPPORTED_FILTER' });
+  if (health.data_scope === 'verified_inbox_sent_cache') {
+    await assert.rejects(call('messages', { folder: 'deleted' }), { code: 'SCOPE_DENIED' });
+  }
+  const unread = await call('messages', { ...selection, unread: true });
+  assert.ok(unread.messages.every(row => row.unread === true && row.unread_evidence));
+  assert.equal(unread.unread_filter_incomplete, unread.unread_unknown_count > 0);
   await assert.rejects(call('read', { id: sample.id, format: 'html' }), { code: 'UNSUPPORTED_FORMAT' });
   report.scope_and_capabilities = true;
   stage = 'attachments';
@@ -161,13 +165,29 @@ async function run() {
     try {
       await client.connect(transport);
       const tools = await client.listTools();
-      assert.equal(tools.tools.length, 9);
+      assert.equal(tools.tools.length, 12);
       const mail = await client.callTool({ name: 'outlook_today', arguments: { ...selection, limit: 1 } });
       assert.equal(mail.isError, undefined);
       assert.equal(mail.structuredContent.date_basis, 'received_at');
       const body = await client.callTool({ name: 'outlook_read', arguments: { id: sample.id, max_chars: 100 } });
       assert.equal(body.isError, undefined);
       assert.ok(Object.hasOwn(body.structuredContent.body, 'available'));
+      const bundle = await client.callTool({ name: 'outlook_messages_bundle', arguments: { ids: [sample.id], max_chars: 100 } });
+      assert.equal(bundle.isError, undefined);
+      assert.equal(bundle.structuredContent.items[0]?.id, sample.id);
+      const date = sample.received_at.slice(0, 10);
+      const context = await client.callTool({ name: 'outlook_context_bundle', arguments: {
+        ...selection, include_subfolders: false, from_date: date, to_date: date, limit: 1
+      } });
+      assert.equal(context.isError, undefined);
+      assert.equal(context.structuredContent.date_basis, 'received_at');
+      assert.equal(context.structuredContent.items[0]?.id, sample.id);
+      const todayBundle = await client.callTool({ name: 'outlook_today_bundle', arguments: {
+        ...selection, include_subfolders: false, date, mode: 'metadata', limit: 1
+      } });
+      assert.equal(todayBundle.isError, undefined);
+      assert.equal(todayBundle.structuredContent.date, date);
+      assert.equal(todayBundle.structuredContent.items[0]?.id, sample.id);
       report[`mcp_${type}`] = true;
     } finally { await client.close(); }
   }

@@ -1,4 +1,4 @@
-"""Inbox and Sent scoped, immutable views over the read-only Outlook cache parser."""
+"""Folder-scoped immutable views over the read-only Outlook cache parser."""
 from __future__ import annotations
 
 from collections import Counter, OrderedDict
@@ -21,7 +21,7 @@ import outlook_local as core
 from osa_scope import LogParseCache
 from fulltext_index import FullTextIndex
 
-VIEW_VERSION = 5
+VIEW_VERSION = 8
 RETAINED_VIEWS = 3
 MAX_EXPORT_FILES = 64
 MAX_EXPORT_BYTES = 512 * 1024**2
@@ -39,20 +39,26 @@ COVERAGE = ("Locally recoverable cache only; Inbox and Sent Items with all known
             "Unresolved folder membership is excluded. Folder membership is the latest "
             "reliable local observation, not a live server guarantee. Dates use verified last delivery time "
             "in Asia/Singapore; missing bodies and attachments remain explicit.")
+ACCOUNT_COVERAGE = ("Locally recoverable cache in proven mailbox and archive folder trees, "
+                    "plus verified Inbox/Sent trees. Membership is a local observation. "
+                    "Dates use verified last delivery time in Asia/Singapore. "
+                    "Unresolved membership, missing bodies and missing attachments limit coverage.")
 
 
-def folder_tree(folders):
-    """Keep only unambiguous nodes with a proven parent chain to an Inbox or Sent root."""
+def folder_tree(folders, account=False):
+    """Keep only unambiguous nodes with a proven parent chain to an allowed root."""
+    bindings = ("parent_id", "is_inbox", "is_sent", "is_deleted", "is_drafts", "is_junk",
+                "is_outbox", "is_mail_root", "is_archive_root", "name")
     nodes, conflicts = {}, set()
     for folder in folders:
         identifier = folder["id"]
         if identifier in nodes and any(nodes[identifier].get(k) != folder.get(k)
-                                       for k in ("parent_id", "is_inbox", "is_sent", "is_deleted", "name")):
+                                       for k in bindings):
             conflicts.add(identifier)
         nodes[identifier] = dict(folder)
     for identifier in conflicts:
         nodes.pop(identifier, None)
-    blocked = {key for key, node in nodes.items() if node.get("is_deleted") is True}
+    blocked = set() if account else {key for key, node in nodes.items() if node.get("is_deleted") is True}
     while True:
         children = {key for key, node in nodes.items() if node.get("parent_id") in blocked}
         if children.issubset(blocked):
@@ -61,24 +67,40 @@ def folder_tree(folders):
     nodes = {key: node for key, node in nodes.items() if key not in blocked}
     allowed = {}
     for identifier, folder in nodes.items():
-        chain, seen, cursor = [], set(), identifier
+        chain, seen, cursor, default_root = [], set(), identifier, None
+        account_root = None
         while cursor in nodes and cursor not in seen:
             seen.add(cursor)
             node = nodes[cursor]
             chain.append(node)
-            if node.get("is_deleted") is True:
-                break
-            if node.get("is_inbox") is True or node.get("is_sent") is True:
-                allowed[identifier] = {**folder, "path": "/".join(n["name"] for n in reversed(chain)),
-                                       "depth": len(chain) - 1, "scope_root_id": cursor}
+            if default_root is None and (node.get("is_inbox") is True or node.get("is_sent") is True):
+                default_root = len(chain)
+                if not account:
+                    break
+            if account and (node.get("is_mail_root") is True or node.get("is_archive_root") is True):
+                account_root = cursor
+                if node.get("is_mail_root") is True:
+                    chain.pop()
                 break
             cursor = node.get("parent_id")
+        if account_root is None:
+            if default_root is None or (account and cursor in seen):
+                continue
+            chain = chain[:default_root]
+        if chain:
+            allowed[identifier] = {**folder, "path": "/".join(n["name"] for n in reversed(chain)),
+                                   "depth": len(chain) - 1, "scope_root_id": chain[-1]["id"],
+                                   **({"account_root_id": account_root} if account else {})}
     return allowed
 
 
 class MailService:
-    def __init__(self, state, profile=None, from_date="2000-01-01", refresh_seconds=300):
+    def __init__(self, state, profile=None, from_date="2000-01-01", refresh_seconds=300, folder_scope="inbox-sent"):
         date.fromisoformat(from_date)
+        if folder_scope not in {"inbox-sent", "account"}:
+            raise ValueError("OUTLOOK_MAC_FOLDER_SCOPE must be inbox-sent or account")
+        self.account_scope = folder_scope == "account"
+        self.scope_policy = "verified-account-cache" if self.account_scope else "inbox-sent-exclude-deleted"
         self.state = Path(state).expanduser().resolve()
         self.profile = profile
         self.from_date = from_date
@@ -143,6 +165,7 @@ class MailService:
 
     def _validate_index(self, snapshot, view, index, profile, *, verify_checksum):
         if (index.get("view_version") != VIEW_VERSION or index.get("snapshot") != snapshot
+                or index.get("scope_policy") != self.scope_policy
                 or index.get("schema_version") != core.VERSION):
             raise ValueError("unsupported or mismatched scoped snapshot")
         if verify_checksum:
@@ -243,21 +266,22 @@ class MailService:
             # associating delivery evidence: a much older mail may arrive today.
             core.make_snapshot(SimpleNamespace(
                 state=str(self.state), profile=str(profile), from_date="0001-01-01",
-                freeze_bodies=False,
+                freeze_bodies=False, include_osa_candidates=True,
             ))
             _, base = core.load_index(self.state)
+            source_rows = base["items"] + base.pop("osa_sent_candidates")
             from osa_scope import read_scope
             try:
-                scope = read_scope(profile, base["items"], parse_cache=self._osa_parse_cache)
-                folders = folder_tree(scope["folders"])
+                scope = read_scope(profile, source_rows, parse_cache=self._osa_parse_cache)
+                folders = folder_tree(scope["folders"], account=self.account_scope)
                 if not folders:
-                    raise ValueError("no verified Inbox or Sent folder tree is available in the local cache; previous view retained")
+                    raise ValueError("no verified folder tree is available in the local cache; previous view retained")
             except (OSError, ValueError):
                 self._prune_failed_sources(previous_base)
                 raise
             items, outside, unknown = [], 0, 0
             cutoff = core.day_start(requested)
-            for row in base["items"]:
+            for row in source_rows:
                 membership = scope["messages"].get(row["id"])
                 if (membership is None or not membership.get("folder_id") or
                         membership.get("folder_status") not in VERIFIED_MEMBERSHIP):
@@ -270,30 +294,46 @@ class MailService:
                 received = membership.get("received_unix")
                 if received is not None and received < cutoff:
                     continue
+                if row["sent_unix"] is None:
+                    sent = membership.get("sent_unix")
+                    if sent is None:
+                        unknown += 1
+                        continue
+                    row = {**row, "sent_unix": sent, "time_method": "osa_sent_time_exact_identity"}
                 items.append({**row, "received_unix": received,
                               **core.merge_participants(row, membership),
+                              "unread": membership.get("unread"),
+                              "unread_evidence": membership.get("unread_evidence"),
                               "received_time_status": membership.get("received_time_status", "missing"),
                               "received_time_method": membership.get("received_time_method"),
                               "folder_id": identifier, "folder_path": folders[identifier]["path"],
                               "folder_status": membership["folder_status"],
                               "folder_evidence": membership.get("evidence", {}),
-                              "mailbox_state": "inbox_or_sent_latest_local_observation"})
+                              "mailbox_state": ("account_folder_latest_local_observation" if self.account_scope
+                                                else "inbox_or_sent_latest_local_observation")})
                 # Keep object-key/version diagnostics in the source snapshot,
                 # without copying the full contact collection twice per view.
                 items[-1].pop("hx_participants", None)
             items.sort(key=core.received_sort_key)
             folder_rows = sorted(folders.values(), key=lambda f: (f["scope_root_id"], f["path"], f["id"]))
             cached_message_counts = Counter(row["folder_id"] for row in items)
+            unread_counts = Counter(row["folder_id"] for row in items if row["unread"] is True)
+            unknown_unread = Counter(row["folder_id"] for row in items if row["unread"] is None)
             for folder in folder_rows:
                 folder["cached_messages"] = cached_message_counts[folder["id"]]
+                folder["known_unread_count"] = unread_counts[folder["id"]]
+                folder["unread_unknown_count"] = unknown_unread[folder["id"]]
             summary = {"scope_from_date": requested, "timezone": "Asia/Singapore", "date_basis": "received_at",
                        "messages": len(items), "folders": len(folder_rows),
                        "received_time_known": sum(r["received_unix"] is not None for r in items),
                        "received_time_unknown": sum(r["received_unix"] is None for r in items),
+                       "unread_state_known": len(items) - sum(unknown_unread.values()),
+                       "unread_state_unknown": sum(unknown_unread.values()),
                        "inbox_roots": sum(bool(f.get("is_inbox")) for f in folder_rows),
                        "sent_roots": sum(bool(f.get("is_sent")) for f in folder_rows),
                        "outside_scope_excluded": outside, "unresolved_folder_excluded": unknown,
-                       "source_messages": len(base["items"]),
+                       "source_messages": len(source_rows),
+                       "osa_sent_time_backfilled": sum(r["time_method"] == "osa_sent_time_exact_identity" for r in items),
                        "cached_bodies": sum(r["body"]["status"] == "cached_html" for r in items),
                        "deferred_bodies": sum(r["body"]["status"] == "deferred" for r in items),
                        "linked_attachments": sum(len(r["attachments"]) for r in items),
@@ -305,10 +345,10 @@ class MailService:
                            "identity_conflicts_excluded", "time_conflicts_excluded", "unresolved_times_excluded",
                            "unparsed_header_frames", "attachment_conflicts_excluded")},
                        "container": base["summary"].get("container"),
-                       "coverage": COVERAGE}
+                       "coverage": ACCOUNT_COVERAGE if self.account_scope else COVERAGE}
             index = {**base, "view_version": VIEW_VERSION, "source_snapshot": base["snapshot"],
                      "items": items, "folders": folder_rows,
-                     "scope_policy": "inbox-sent-exclude-deleted", "scope_fingerprint": scope["fingerprint"],
+                     "scope_policy": self.scope_policy, "scope_fingerprint": scope["fingerprint"],
                      "scope_evidence": scope["evidence"], "summary": summary}
             index.pop("snapshot")
             snapshot = core.sha(json.dumps(index, sort_keys=True, ensure_ascii=False).encode())[:24]
@@ -507,7 +547,7 @@ class MailService:
 
     def _status(self):
         if not (self.state / "CURRENT_SCOPE").exists():
-            return {"ready": False, "scope": "Inbox and Sent Items, including descendants; excluding Deleted Items",
+            return {"ready": False, "scope": ACCOUNT_COVERAGE if self.account_scope else COVERAGE,
                     "state": str(self.state), "next_step": "call outlook_local_refresh or outlook_local_search"}
         try:
             _, index = self._load(copy_index=False)
@@ -558,24 +598,30 @@ class MailService:
         result["folder_evidence"] = core.find_message(index, identifier)["folder_evidence"]
         return result
 
-    def _search(self, arguments):
+    def _search(self, arguments, *, snapshot=None, root_folders=None):
         cursor = arguments.get("cursor")
-        snapshot, raw_cursor = None, None
+        raw_cursor = None
         folder_id = arguments.get("folder_id")
         descendants = arguments.get("include_subfolders", True)
-        folder_signature = core.sha(json.dumps([folder_id, descendants]).encode())[:16]
+        scope = [folder_id, descendants]
+        if root_folders is not None:
+            scope.append(sorted(root_folders))
+        folder_signature = core.sha(json.dumps(scope).encode())[:16]
         if cursor:
             parts = cursor.split(".", 3)
             if len(parts) != 4 or parts[0] != "v1" or parts[2] != folder_signature:
                 raise ValueError("cursor belongs to another folder filter or is invalid")
-            _, snapshot, _, raw_cursor = parts
+            _, cursor_snapshot, _, raw_cursor = parts
+            if snapshot is not None and snapshot != cursor_snapshot:
+                raise ValueError("cursor and folder belong to different snapshots")
+            snapshot = cursor_snapshot
         directory, index = self._current(snapshot)
         folders = {folder["id"]: folder for folder in index["folders"]}
         filtered = index
-        if folder_id is not None:
-            if folder_id not in folders:
-                raise ValueError("folder is outside the verified Inbox and Sent scope")
-            allowed = {folder_id}
+        if folder_id is not None or root_folders is not None:
+            allowed = {folder_id} if root_folders is None else set(root_folders)
+            if not allowed.issubset(folders):
+                raise ValueError("folder is outside the verified cache scope")
             if descendants:
                 changed = True
                 while changed:
@@ -587,6 +633,8 @@ class MailService:
                                   person=arguments.get("person"), person_role=arguments.get("person_role", "any"),
                                   from_date=arguments.get("from_date"), to_date=arguments.get("to_date"),
                                   limit=arguments.get("limit", 20), cursor=raw_cursor,
+                                  has_cached_attachments=arguments.get("has_cached_attachments"),
+                                  unread=arguments.get("unread"),
                                   search_body=arguments.get("search_body", False))
         fulltext = None
         if options.search_body and options.query:
